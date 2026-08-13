@@ -1059,7 +1059,7 @@ function printTicket(t){
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 40px;
-    margin-top: 40px;
+    margin-top: 20px;
   }
   .sig-block {
     display: flex;
@@ -1084,7 +1084,7 @@ function printTicket(t){
     letter-spacing: 0.5px;
   }
   .print-footer {
-    margin-top: 40px;
+    margin-top: 20px;
     padding-top: 12px;
     border-top: 1px solid #E8EDE8;
     display: flex;
@@ -1130,16 +1130,14 @@ function printTicket(t){
       <span class="label">Rig / Lease</span>
       <span class="value">${escHtml(t.rig||'—')}</span>
     </div>
-    <div>
+    ${t.returnDate ? `<div>
       <span class="label">Return Date</span>
-      <span class="value">${t.returnDate ? fmtDate(t.returnDate) : '—'}</span>
-    </div>
+      <span class="value">${fmtDate(t.returnDate)}</span>
+    </div>` : ''}
     ${(()=>{
       const pad = getActivePad(t);
       if(!pad) return '';
-      const billed = Array.isArray(pad.billedWells) ? pad.billedWells.length : 0;
-      return '<div><span class="label">Pad / Location</span><span class="value">' + escHtml(pad.name) + '</span></div>' +
-             '<div><span class="label">Wells Billed</span><span class="value">' + billed + ' of ' + (pad.totalWells||0) + '</span></div>';
+      return '<div><span class="label">Pad / Location</span><span class="value">' + escHtml(pad.name) + '</span></div>';
     })()}
   </div>
 
@@ -3992,55 +3990,109 @@ async function runSignatureCaptureMode(ticketId, apiUrl){
   if(!ticket){
     app.innerHTML = `
       <div style="max-width:480px; margin:60px auto; text-align:center; font-family:'Inter',sans-serif; padding:24px;">
-        <h2 style="font-family:'Oswald',sans-serif; text-transform:uppercase;">Ticket Not Found</h2>
-        <p style="color:var(--ink-soft);">This link may be out of date, or the ticket may have been removed. Please ask for a new link.</p>
+        <div style="background:#14181A; padding:14px 20px; border-radius:8px 8px 0 0; border-bottom:4px solid #33D63A;">
+          <div style="color:#F4F7F4; font-family:'Oswald',sans-serif; font-size:16px; letter-spacing:1px;">FLOW-TECH SYSTEMS LLC</div>
+        </div>
+        <div style="background:#FAFCF9; border:1px solid #E8EDE8; border-radius:0 0 8px 8px; padding:24px;">
+          <h2 style="font-family:'Oswald',sans-serif; text-transform:uppercase; margin-top:0;">Ticket Not Found</h2>
+          <p style="color:#5B6660;">This link may be out of date, or the ticket may have been removed. Please contact Flow-Tech Systems for a new link.</p>
+          <p style="color:#5B6660; font-family:'IBM Plex Mono',monospace; font-size:12px;">985-860-9919 · chrisbull@flow-techsystemsllc.com</p>
+        </div>
       </div>
     `;
     return;
   }
 
-  const equipRows = ticket.equipment.map(e=>`
-    <tr>
-      <td>${escHtml(e.name)}</td>
-      <td>${escHtml(e.serial||'—')}</td>
-      <td style="text-align:center;">${e.qty}</td>
+  const equipRows = ticket.equipment.map((e,i)=>`
+    <tr style="${i%2===1?'background:#FAFCF9;':''}">
+      <td style="padding:9px 10px; font-size:13px; border-bottom:1px solid #E8EDE8;">${escHtml(e.name)}</td>
+      <td style="padding:9px 10px; font-size:12px; border-bottom:1px solid #E8EDE8; font-family:'IBM Plex Mono',monospace; color:#5B6660;">${escHtml(e.serial||'—')}</td>
+      <td style="padding:9px 10px; font-size:13px; border-bottom:1px solid #E8EDE8;">${e.bandColor?`<span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:${e.bandColor.toLowerCase()==='purple'?'#7B2D8E':e.bandColor.toLowerCase()==='blue'?'#2E5FA3':e.bandColor.toLowerCase()==='silver'?'#B0B0B0':e.bandColor.toLowerCase()==='red'?'#C0392B':e.bandColor.toLowerCase()==='green'?'#1E8A29':e.bandColor.toLowerCase()==='orange'?'#E67E22':'#888'}; vertical-align:middle; margin-right:6px;"></span>${escHtml(e.bandColor)}`:'—'}</td>
+      <td style="padding:9px 10px; font-size:13px; border-bottom:1px solid #E8EDE8; text-align:center;">${e.qty}</td>
     </tr>
   `).join('');
 
+  const totalItems = ticket.equipment.reduce((s,e)=>s+(Number(e.qty)||1), 0);
+
   app.innerHTML = `
-    <div style="max-width:600px; margin:0 auto; padding:24px; font-family:'Inter',sans-serif;">
-      <div style="border-bottom:4px solid var(--amber); padding-bottom:14px; margin-bottom:18px;">
-        <h1 style="font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; font-size:20px; margin:0;">Delivery Confirmation</h1>
-        <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--ink-soft); margin-top:4px;">Ticket #${escHtml(ticket.ticketNumber||'—')}</div>
+    <div style="max-width:600px; margin:0 auto; font-family:'Inter',sans-serif; background:#fff; min-height:100vh;">
+      <!-- Header -->
+      <div style="background:#14181A; padding:18px 24px; border-bottom:4px solid #33D63A;">
+        <div style="display:flex; align-items:center; justify-content:space-between;">
+          <div>
+            <div style="color:#F4F7F4; font-family:'Oswald',sans-serif; font-size:18px; font-weight:600; letter-spacing:1px;">FLOW-TECH SYSTEMS LLC</div>
+            <div style="color:#9FB3A5; font-family:'IBM Plex Mono',monospace; font-size:10px; letter-spacing:0.5px; margin-top:2px;">985-860-9919 · chrisbull@flow-techsystemsllc.com</div>
+          </div>
+          <div style="background:#33D63A; color:#14181A; font-family:'IBM Plex Mono',monospace; font-size:14px; font-weight:600; padding:6px 14px; border-radius:6px; letter-spacing:1px;">#${escHtml(ticket.ticketNumber||'—')}</div>
+        </div>
       </div>
 
-      <div style="font-size:14px; margin-bottom:16px;">
-        <div><strong>Customer:</strong> ${escHtml(ticket.customer||'—')}</div>
-        <div><strong>Rig / Lease:</strong> ${escHtml(ticket.rig||'—')}</div>
-        <div><strong>Delivery Date:</strong> ${fmtDate(ticket.deliveryDate)}</div>
+      <div style="padding:24px;">
+        <!-- Title -->
+        <h1 style="font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:2px; font-size:20px; margin:0 0 4px 0; color:#14181A;">Delivery Confirmation</h1>
+        <div style="font-size:12px; color:#5B6660; margin-bottom:20px;">Please review the equipment below and sign to confirm delivery.</div>
+
+        <!-- Ticket Info -->
+        <div style="background:#FAFCF9; border:1px solid #E8EDE8; border-radius:8px; padding:14px 18px; margin-bottom:20px;">
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:4px 24px;">
+            <div>
+              <span style="color:#5B6660; font-family:'IBM Plex Mono',monospace; font-size:10px; text-transform:uppercase; letter-spacing:0.5px; display:block;">Customer / Operator</span>
+              <span style="font-size:14px; font-weight:500;">${escHtml(ticket.customer||'—')}</span>
+            </div>
+            <div>
+              <span style="color:#5B6660; font-family:'IBM Plex Mono',monospace; font-size:10px; text-transform:uppercase; letter-spacing:0.5px; display:block;">Delivery Date</span>
+              <span style="font-size:14px; font-weight:500;">${fmtDate(ticket.deliveryDate)}</span>
+            </div>
+            <div style="margin-top:8px;">
+              <span style="color:#5B6660; font-family:'IBM Plex Mono',monospace; font-size:10px; text-transform:uppercase; letter-spacing:0.5px; display:block;">Rig / Lease</span>
+              <span style="font-size:14px; font-weight:500;">${escHtml(ticket.rig||'—')}</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Equipment Table -->
+        <div style="margin-bottom:20px;">
+          <div style="font-family:'Oswald',sans-serif; font-size:11px; text-transform:uppercase; letter-spacing:1px; color:#5B6660; margin-bottom:6px;">Equipment · ${totalItems} item${totalItems!==1?'s':''}</div>
+          <table style="width:100%; border-collapse:collapse; border-radius:8px; overflow:hidden;">
+            <thead>
+              <tr>
+                <th style="text-align:left; font-family:'IBM Plex Mono',monospace; font-size:10px; text-transform:uppercase; letter-spacing:0.5px; background:#14181A; color:#F4F7F4; padding:9px 10px;">Equipment</th>
+                <th style="text-align:left; font-family:'IBM Plex Mono',monospace; font-size:10px; text-transform:uppercase; letter-spacing:0.5px; background:#14181A; color:#F4F7F4; padding:9px 10px;">Serial #</th>
+                <th style="text-align:left; font-family:'IBM Plex Mono',monospace; font-size:10px; text-transform:uppercase; letter-spacing:0.5px; background:#14181A; color:#F4F7F4; padding:9px 10px;">Band</th>
+                <th style="text-align:center; font-family:'IBM Plex Mono',monospace; font-size:10px; text-transform:uppercase; letter-spacing:0.5px; background:#14181A; color:#F4F7F4; padding:9px 10px;">Qty</th>
+              </tr>
+            </thead>
+            <tbody>${equipRows}</tbody>
+          </table>
+        </div>
+
+        <!-- Photo -->
+        <div style="margin-bottom:20px;">
+          <div style="font-family:'Oswald',sans-serif; font-size:11px; text-transform:uppercase; letter-spacing:1px; color:#5B6660; margin-bottom:6px;">Photo of Delivered Equipment <span style="font-family:'Inter',sans-serif; text-transform:none; letter-spacing:0; font-size:11px;">(optional)</span></div>
+          <p style="font-size:12px; color:#5B6660; margin:0 0 10px 0;">On a phone, this opens your camera directly.</p>
+          <input type="file" accept="image/*" capture="environment" id="sign-mode-photo-input" style="display:none;">
+          <div id="sign-mode-photo-preview" style="margin-bottom:10px;"></div>
+          <button style="background:none; border:1.5px solid #5B6660; color:#5B6660; padding:8px 16px; border-radius:6px; font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; font-size:12px; cursor:pointer;" id="sign-mode-photo-btn">Take / Choose Photo</button>
+        </div>
+
+        <!-- Signatures -->
+        <div style="margin-bottom:20px;">
+          <div style="font-family:'Oswald',sans-serif; font-size:11px; text-transform:uppercase; letter-spacing:1px; color:#5B6660; margin-bottom:8px;">Delivered By</div>
+          <canvas id="sign-mode-delivered" width="320" height="120" style="width:100%; max-width:400px; border:1.5px solid #D3DED4; border-radius:6px; background:#FAFCF9; touch-action:none;"></canvas>
+          <button style="background:none; border:none; color:#5B6660; font-size:11px; text-decoration:underline; cursor:pointer; padding:6px 0;" id="sign-mode-clear-delivered">Clear</button>
+        </div>
+
+        <div style="margin-bottom:20px;">
+          <div style="font-family:'Oswald',sans-serif; font-size:11px; text-transform:uppercase; letter-spacing:1px; color:#5B6660; margin-bottom:8px;">Received By</div>
+          <canvas id="sign-mode-received" width="320" height="120" style="width:100%; max-width:400px; border:1.5px solid #D3DED4; border-radius:6px; background:#FAFCF9; touch-action:none;"></canvas>
+          <button style="background:none; border:none; color:#5B6660; font-size:11px; text-decoration:underline; cursor:pointer; padding:6px 0;" id="sign-mode-clear-received">Clear</button>
+        </div>
+
+        <div id="sign-mode-status" style="font-size:13px; color:#5B6660; margin-bottom:12px;"></div>
+        <button style="background:#33D63A; color:#14181A; border:none; padding:14px 28px; border-radius:6px; font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; font-size:15px; font-weight:600; cursor:pointer; width:100%;" id="sign-mode-submit">Submit Signature</button>
+
+        <div style="text-align:center; margin-top:16px; font-family:'IBM Plex Mono',monospace; font-size:10px; color:#8A8F94;">Flow-Tech Systems LLC · Equipment Tracker</div>
       </div>
-
-      <table class="equip-table" style="margin-bottom:24px;">
-        <thead><tr><th>Equipment</th><th>Serial #</th><th style="text-align:center;">Qty</th></tr></thead>
-        <tbody>${equipRows}</tbody>
-      </table>
-
-      <label style="display:block; margin-bottom:8px; font-weight:600;">Photo of Delivered Equipment (optional)</label>
-      <p style="font-size:12px; color:var(--ink-soft); margin-top:-4px; margin-bottom:10px;">On a phone, this opens your camera directly.</p>
-      <input type="file" accept="image/*" capture="environment" id="sign-mode-photo-input" style="display:none;">
-      <div id="sign-mode-photo-preview" style="margin-bottom:10px;"></div>
-      <button class="ghost-btn" id="sign-mode-photo-btn" style="margin-bottom:20px;">Take / Choose Photo</button>
-
-      <label style="display:block; margin-bottom:8px; font-weight:600;">Delivered By</label>
-      <canvas id="sign-mode-delivered" width="320" height="120" class="signature-canvas" style="width:100%; max-width:400px;"></canvas>
-      <button class="ghost-btn" id="sign-mode-clear-delivered" style="margin:8px 0 20px 0; font-size:11px; padding:5px 10px;">Clear</button>
-
-      <label style="display:block; margin-bottom:8px; font-weight:600;">Received By</label>
-      <canvas id="sign-mode-received" width="320" height="120" class="signature-canvas" style="width:100%; max-width:400px;"></canvas>
-      <button class="ghost-btn" id="sign-mode-clear-received" style="margin:8px 0 20px 0; font-size:11px; padding:5px 10px;">Clear</button>
-
-      <div id="sign-mode-status" style="font-size:13px; color:var(--ink-soft); margin-bottom:12px;"></div>
-      <button class="primary-btn" id="sign-mode-submit">Submit Signature</button>
     </div>
   `;
 
@@ -4125,8 +4177,13 @@ async function runSignatureCaptureMode(ticketId, apiUrl){
       });
       app.innerHTML = `
         <div style="max-width:480px; margin:60px auto; text-align:center; font-family:'Inter',sans-serif; padding:24px;">
-          <h2 style="font-family:'Oswald',sans-serif; text-transform:uppercase; color:#1E8A29;">Signature Submitted</h2>
-          <p style="color:var(--ink-soft);">Thank you - ticket #${escHtml(ticket.ticketNumber||'')} has been updated. You may close this page.</p>
+          <div style="background:#14181A; padding:14px 20px; border-radius:8px 8px 0 0; border-bottom:4px solid #33D63A;">
+            <div style="color:#F4F7F4; font-family:'Oswald',sans-serif; font-size:16px; letter-spacing:1px;">FLOW-TECH SYSTEMS LLC</div>
+          </div>
+          <div style="background:#FAFCF9; border:1px solid #E8EDE8; border-radius:0 0 8px 8px; padding:24px;">
+            <h2 style="font-family:'Oswald',sans-serif; text-transform:uppercase; color:#1E8A29; margin-top:0;">Signature Submitted</h2>
+            <p style="color:#5B6660;">Thank you — ticket #${escHtml(ticket.ticketNumber||'')} has been confirmed. You may close this page.</p>
+          </div>
         </div>
       `;
     }catch(e){
