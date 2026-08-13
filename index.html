@@ -1113,26 +1113,34 @@ function printTicket(t){
     </div>
     <div class="ticket-badge">#${escHtml(t.ticketNumber||'—')}</div>
   </div>
+  <div style="font-family:'IBM Plex Mono',monospace; font-size:10px; color:#5B6660; margin-bottom:4px;">985-860-9919 &middot; chrisbull@flow-techsystemsllc.com</div>
 
   <h1>Delivery Ticket</h1>
 
   <div class="meta-grid">
     <div>
-      <span class="label">Status</span>
-      <span class="value"><span class="status ${isOut?'':'returned'}">${isOut?'Out':'Returned'}</span></span>
+      <span class="label">Customer / Operator</span>
+      <span class="value">${escHtml(t.customer||'—')}</span>
     </div>
     <div>
       <span class="label">Delivery Date</span>
       <span class="value">${fmtDate(t.deliveryDate)}</span>
     </div>
     <div>
-      <span class="label">Customer / Operator</span>
-      <span class="value">${escHtml(t.customer||'—')}</span>
-    </div>
-    <div>
       <span class="label">Rig / Lease</span>
       <span class="value">${escHtml(t.rig||'—')}</span>
     </div>
+    <div>
+      <span class="label">Return Date</span>
+      <span class="value">${t.returnDate ? fmtDate(t.returnDate) : '—'}</span>
+    </div>
+    ${(()=>{
+      const pad = getActivePad(t);
+      if(!pad) return '';
+      const billed = Array.isArray(pad.billedWells) ? pad.billedWells.length : 0;
+      return '<div><span class="label">Pad / Location</span><span class="value">' + escHtml(pad.name) + '</span></div>' +
+             '<div><span class="label">Wells Billed</span><span class="value">' + billed + ' of ' + (pad.totalWells||0) + '</span></div>';
+    })()}
   </div>
 
   <table>
@@ -1150,10 +1158,12 @@ function printTicket(t){
     <div class="sig-block">
       ${t.signatureDelivered?`<img src="${t.signatureDelivered}" class="sig-image">`:'<div class="sig-blank"></div>'}
       <div class="sig-line">Delivered By</div>
+      <div style="font-size:10px; color:#5B6660; margin-top:8px;">Print Name: ___________________________________</div>
     </div>
     <div class="sig-block">
       ${t.signatureReceived?`<img src="${t.signatureReceived}" class="sig-image">`:'<div class="sig-blank"></div>'}
       <div class="sig-line">Received By</div>
+      <div style="font-size:10px; color:#5B6660; margin-top:8px;">Print Name: ___________________________________</div>
     </div>
   </div>
 
@@ -1391,7 +1401,7 @@ function saveSyncUrl(url){
   try{
     if(url) localStorage.setItem(SYNC_URL_KEY, url);
     else localStorage.removeItem(SYNC_URL_KEY);
-  }catch(e){}
+  }catch(e){ showStorageWarning('sync URL', e); }
 }
 
 // Pull the latest data from the shared Google Sheet backend and overwrite
@@ -1580,7 +1590,7 @@ async function backupTicketMedia(ticketId){
   }
   if(changed){
     t.updatedAt = nowIso();
-    try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(tickets)); }catch(e){}
+    try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(tickets)); }catch(e){ showStorageWarning('media backup', e); }
     // Push so the URLs travel to the other device and to the sheet.
     if(syncUrl) pushToCloud();
   }
@@ -2810,6 +2820,19 @@ function colorSwatch(name){
   return `<span style="display:inline-block; width:11px; height:11px; border-radius:50%; background:${hex}; border:1px solid rgba(0,0,0,0.25); margin-right:6px; vertical-align:middle;"></span>`;
 }
 
+// Shows a visible warning banner when a localStorage write fails — this
+// prevents the silent data loss scenario where the app looks like it saved
+// but nothing actually persisted. The banner stays until dismissed.
+function showStorageWarning(context, err){
+  console.error('Storage write failed (' + context + '):', err);
+  if(document.getElementById('storage-warning-banner')) return; // already showing
+  var banner = document.createElement('div');
+  banner.id = 'storage-warning-banner';
+  banner.style.cssText = 'position:fixed; top:0; left:0; right:0; background:#B5432A; color:#fff; padding:12px 20px; z-index:99999; font-family:Inter,sans-serif; font-size:14px; display:flex; justify-content:space-between; align-items:center;';
+  banner.innerHTML = '<span><strong>⚠ Save failed</strong> — your data may not have been saved. Your browser storage may be full or blocked. Back up your data now.</span><button onclick="this.parentElement.remove()" style="background:none; border:1px solid #fff; color:#fff; padding:4px 12px; border-radius:4px; cursor:pointer; margin-left:12px; font-size:12px;">Dismiss</button>';
+  document.body.prepend(banner);
+}
+
 function escHtml(s){
   return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
@@ -3011,13 +3034,13 @@ function attachHandlers(){
         // saveX() helper separately - each of those also triggers its own
         // cloud push, and doing seven of them back-to-back both wastes
         // requests and widens the window for the race described above.
-        try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(tickets)); }catch(e){}
-        try{ localStorage.setItem(CATALOG_KEY, JSON.stringify(equipmentCatalog)); }catch(e){}
-        try{ localStorage.setItem(EQUIPMENT_OWNED_KEY, JSON.stringify(equipmentOwned)); }catch(e){}
-        try{ localStorage.setItem(COLOR_CATALOG_KEY, JSON.stringify(colorCatalog)); }catch(e){}
-        try{ localStorage.setItem(RIG_CATALOG_KEY, JSON.stringify(rigCatalog)); }catch(e){}
-        try{ localStorage.setItem(CUSTOMER_CATALOG_KEY, JSON.stringify(customerCatalog)); }catch(e){}
-        try{ localStorage.setItem(TEMPLATE_KEY, JSON.stringify(templateCatalog)); }catch(e){}
+        try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(tickets)); }catch(e){ showStorageWarning('tickets', e); }
+        try{ localStorage.setItem(CATALOG_KEY, JSON.stringify(equipmentCatalog)); }catch(e){ showStorageWarning('catalog', e); }
+        try{ localStorage.setItem(EQUIPMENT_OWNED_KEY, JSON.stringify(equipmentOwned)); }catch(e){ showStorageWarning('owned', e); }
+        try{ localStorage.setItem(COLOR_CATALOG_KEY, JSON.stringify(colorCatalog)); }catch(e){ showStorageWarning('colors', e); }
+        try{ localStorage.setItem(RIG_CATALOG_KEY, JSON.stringify(rigCatalog)); }catch(e){ showStorageWarning('rigs', e); }
+        try{ localStorage.setItem(CUSTOMER_CATALOG_KEY, JSON.stringify(customerCatalog)); }catch(e){ showStorageWarning('customers', e); }
+        try{ localStorage.setItem(TEMPLATE_KEY, JSON.stringify(templateCatalog)); }catch(e){ showStorageWarning('templates', e); }
 
         // One single push with the fully-imported state, then resume
         // auto-sync once it's safely landed.
