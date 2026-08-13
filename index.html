@@ -4227,8 +4227,14 @@ async function runReturnCaptureMode(ticketId, apiUrl){
   if(!ticket){
     app.innerHTML = `
       <div style="max-width:480px; margin:60px auto; text-align:center; font-family:'Inter',sans-serif; padding:24px;">
-        <h2 style="font-family:'Oswald',sans-serif; text-transform:uppercase;">Ticket Not Found</h2>
-        <p style="color:var(--ink-soft);">This link may be out of date, or the ticket may have been removed. Please ask for a new link.</p>
+        <div style="background:#14181A; padding:14px 20px; border-radius:8px 8px 0 0; border-bottom:4px solid #33D63A;">
+          <div style="color:#F4F7F4; font-family:'Oswald',sans-serif; font-size:16px; letter-spacing:1px;">FLOW-TECH SYSTEMS LLC</div>
+        </div>
+        <div style="background:#FAFCF9; border:1px solid #E8EDE8; border-radius:0 0 8px 8px; padding:24px;">
+          <h2 style="font-family:'Oswald',sans-serif; text-transform:uppercase; margin-top:0;">Ticket Not Found</h2>
+          <p style="color:#5B6660;">This link may be out of date, or the ticket may have been removed. Please contact Flow-Tech Systems for a new link.</p>
+          <p style="color:#5B6660; font-family:'IBM Plex Mono',monospace; font-size:12px;">985-860-9919 · chrisbull@flow-techsystemsllc.com</p>
+        </div>
       </div>
     `;
     return;
@@ -4236,47 +4242,87 @@ async function runReturnCaptureMode(ticketId, apiUrl){
 
   const conditionOptions = ['Good','Damaged','Missing'];
   const equipRows = ticket.equipment.map((e,i)=>`
-    <div style="border-bottom:1.5px dashed #D3DED4; padding:10px 0;">
-      <div style="font-weight:600; font-size:14px;">${escHtml(e.name)} ${e.qty>1?('× '+e.qty):''}${e.serial?` <span style="color:#5B6660; font-family:'IBM Plex Mono',monospace; font-size:11px;">(S/N ${escHtml(e.serial)})</span>`:''}</div>
-      <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap; align-items:center;">
+    <div style="border-bottom:1px solid #E8EDE8; padding:12px 0; ${i%2===1?'background:#FAFCF9;':''}">
+      <div style="display:flex; align-items:center; gap:8px; padding:0 4px;">
+        <div style="flex:1;">
+          <div style="font-weight:600; font-size:13px; color:#14181A;">${escHtml(e.name)} ${e.qty>1?('× '+e.qty):''}</div>
+          ${e.serial?`<div style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#5B6660;">S/N ${escHtml(e.serial)}</div>`:''}
+          ${e.bandColor?`<div style="font-size:11px; color:#5B6660;"><span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:${e.bandColor.toLowerCase()==='purple'?'#7B2D8E':e.bandColor.toLowerCase()==='blue'?'#2E5FA3':e.bandColor.toLowerCase()==='silver'?'#B0B0B0':e.bandColor.toLowerCase()==='red'?'#C0392B':e.bandColor.toLowerCase()==='green'?'#1E8A29':'#888'}; vertical-align:middle; margin-right:4px;"></span>${escHtml(e.bandColor)} band</div>`:''}
+        </div>
+      </div>
+      <div style="display:flex; gap:10px; margin-top:8px; flex-wrap:wrap; align-items:center; padding:0 4px;">
         ${conditionOptions.map(opt=>`
-          <label style="font-size:12px; display:flex; align-items:center; gap:4px; cursor:pointer;">
+          <label style="font-size:12px; display:flex; align-items:center; gap:4px; cursor:pointer; padding:4px 8px; border:1px solid ${opt==='Good'?'#D3DED4':opt==='Damaged'?'#F0C8C2':'#E8E0C8'}; border-radius:4px; background:${opt==='Good'?'#F0F8F0':opt==='Damaged'?'#FFF5F4':'#FFFDF5'};">
             <input type="radio" name="cond-${i}" value="${opt}" ${opt==='Good'?'checked':''} data-return-cond="${i}">
             ${opt}
           </label>
         `).join('')}
       </div>
-      <input type="text" placeholder="Notes (optional)" data-return-notes="${i}" style="margin-top:6px; width:100%; font-size:12px; padding:6px 8px; border:1.5px solid #D3DED4; border-radius:5px;">
+      <input type="text" placeholder="Notes (optional)" data-return-notes="${i}" style="margin-top:8px; width:calc(100% - 8px); font-size:12px; padding:7px 10px; border:1.5px solid #D3DED4; border-radius:5px; margin-left:4px;">
     </div>
   `).join('');
 
+  const totalItems = ticket.equipment.reduce((s,e)=>s+(Number(e.qty)||1), 0);
+
   app.innerHTML = `
-    <div style="max-width:600px; margin:0 auto; padding:24px; font-family:'Inter',sans-serif;">
-      <div style="border-bottom:4px solid var(--amber); padding-bottom:14px; margin-bottom:18px;">
-        <h1 style="font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; font-size:20px; margin:0;">Return Confirmation</h1>
-        <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--ink-soft); margin-top:4px;">Ticket #${escHtml(ticket.ticketNumber||'—')}</div>
+    <div style="max-width:600px; margin:0 auto; font-family:'Inter',sans-serif; background:#fff; min-height:100vh;">
+      <!-- Header -->
+      <div style="background:#14181A; padding:18px 24px; border-bottom:4px solid #33D63A;">
+        <div style="display:flex; align-items:center; justify-content:space-between;">
+          <div>
+            <div style="color:#F4F7F4; font-family:'Oswald',sans-serif; font-size:18px; font-weight:600; letter-spacing:1px;">FLOW-TECH SYSTEMS LLC</div>
+            <div style="color:#9FB3A5; font-family:'IBM Plex Mono',monospace; font-size:10px; letter-spacing:0.5px; margin-top:2px;">985-860-9919 · chrisbull@flow-techsystemsllc.com</div>
+          </div>
+          <div style="background:#33D63A; color:#14181A; font-family:'IBM Plex Mono',monospace; font-size:14px; font-weight:600; padding:6px 14px; border-radius:6px; letter-spacing:1px;">#${escHtml(ticket.ticketNumber||'—')}</div>
+        </div>
       </div>
 
-      <div style="font-size:14px; margin-bottom:16px;">
-        <div><strong>Customer:</strong> ${escHtml(ticket.customer||'—')}</div>
-        <div><strong>Rig / Lease:</strong> ${escHtml(ticket.rig||'—')}</div>
+      <div style="padding:24px;">
+        <!-- Title -->
+        <h1 style="font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:2px; font-size:20px; margin:0 0 4px 0; color:#14181A;">Return Confirmation</h1>
+        <div style="font-size:12px; color:#5B6660; margin-bottom:20px;">Confirm the condition of each item being picked up and sign below.</div>
+
+        <!-- Ticket Info -->
+        <div style="background:#FAFCF9; border:1px solid #E8EDE8; border-radius:8px; padding:14px 18px; margin-bottom:20px;">
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:4px 24px;">
+            <div>
+              <span style="color:#5B6660; font-family:'IBM Plex Mono',monospace; font-size:10px; text-transform:uppercase; letter-spacing:0.5px; display:block;">Customer / Operator</span>
+              <span style="font-size:14px; font-weight:500;">${escHtml(ticket.customer||'—')}</span>
+            </div>
+            <div>
+              <span style="color:#5B6660; font-family:'IBM Plex Mono',monospace; font-size:10px; text-transform:uppercase; letter-spacing:0.5px; display:block;">Rig / Lease</span>
+              <span style="font-size:14px; font-weight:500;">${escHtml(ticket.rig||'—')}</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Equipment Condition Check -->
+        <div style="margin-bottom:20px;">
+          <div style="font-family:'Oswald',sans-serif; font-size:11px; text-transform:uppercase; letter-spacing:1px; color:#5B6660; margin-bottom:6px;">Equipment Condition · ${totalItems} item${totalItems!==1?'s':''}</div>
+          ${equipRows}
+        </div>
+
+        <!-- Photo -->
+        <div style="margin-bottom:20px;">
+          <div style="font-family:'Oswald',sans-serif; font-size:11px; text-transform:uppercase; letter-spacing:1px; color:#5B6660; margin-bottom:6px;">Photo of Returned Equipment <span style="font-family:'Inter',sans-serif; text-transform:none; letter-spacing:0; font-size:11px;">(especially if damaged)</span></div>
+          <p style="font-size:12px; color:#5B6660; margin:0 0 10px 0;">On a phone, this opens your camera directly.</p>
+          <input type="file" accept="image/*" capture="environment" id="return-mode-photo-input" style="display:none;">
+          <div id="return-mode-photo-preview" style="margin-bottom:10px;"></div>
+          <button style="background:none; border:1.5px solid #5B6660; color:#5B6660; padding:8px 16px; border-radius:6px; font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; font-size:12px; cursor:pointer;" id="return-mode-photo-btn">Take / Choose Photo</button>
+        </div>
+
+        <!-- Signature -->
+        <div style="margin-bottom:20px;">
+          <div style="font-family:'Oswald',sans-serif; font-size:11px; text-transform:uppercase; letter-spacing:1px; color:#5B6660; margin-bottom:8px;">Received Back By</div>
+          <canvas id="return-mode-sig" width="320" height="120" style="width:100%; max-width:400px; border:1.5px solid #D3DED4; border-radius:6px; background:#FAFCF9; touch-action:none;"></canvas>
+          <button style="background:none; border:none; color:#5B6660; font-size:11px; text-decoration:underline; cursor:pointer; padding:6px 0;" id="return-mode-clear-sig">Clear</button>
+        </div>
+
+        <div id="return-mode-status" style="font-size:13px; color:#5B6660; margin-bottom:12px;"></div>
+        <button style="background:#33D63A; color:#14181A; border:none; padding:14px 28px; border-radius:6px; font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; font-size:15px; font-weight:600; cursor:pointer; width:100%;" id="return-mode-submit">Submit Return Confirmation</button>
+
+        <div style="text-align:center; margin-top:16px; font-family:'IBM Plex Mono',monospace; font-size:10px; color:#8A8F94;">Flow-Tech Systems LLC · Equipment Tracker</div>
       </div>
-
-      <p style="font-size:13px; color:var(--ink-soft); margin-bottom:6px;">Confirm the condition of each item being picked up:</p>
-      <div style="margin-bottom:20px;">${equipRows}</div>
-
-      <label style="display:block; margin-bottom:8px; font-weight:600;">Photo of Returned Equipment (optional)</label>
-      <p style="font-size:12px; color:var(--ink-soft); margin-top:-4px; margin-bottom:10px;">Especially useful if anything's damaged or missing - on a phone, this opens your camera directly.</p>
-      <input type="file" accept="image/*" capture="environment" id="return-mode-photo-input" style="display:none;">
-      <div id="return-mode-photo-preview" style="margin-bottom:10px;"></div>
-      <button class="ghost-btn" id="return-mode-photo-btn" style="margin-bottom:20px;">Take / Choose Photo</button>
-
-      <label style="display:block; margin-bottom:8px; font-weight:600;">Received Back By</label>
-      <canvas id="return-mode-sig" width="320" height="120" class="signature-canvas" style="width:100%; max-width:400px;"></canvas>
-      <button class="ghost-btn" id="return-mode-clear-sig" style="margin:8px 0 20px 0; font-size:11px; padding:5px 10px;">Clear</button>
-
-      <div id="return-mode-status" style="font-size:13px; color:var(--ink-soft); margin-bottom:12px;"></div>
-      <button class="primary-btn" id="return-mode-submit">Submit Return Confirmation</button>
     </div>
   `;
 
@@ -4341,8 +4387,13 @@ async function runReturnCaptureMode(ticketId, apiUrl){
       });
       app.innerHTML = `
         <div style="max-width:480px; margin:60px auto; text-align:center; font-family:'Inter',sans-serif; padding:24px;">
-          <h2 style="font-family:'Oswald',sans-serif; text-transform:uppercase; color:#1E8A29;">Return Confirmed</h2>
-          <p style="color:var(--ink-soft);">Thank you - ticket #${escHtml(ticket.ticketNumber||'')} has been updated. You may close this page.</p>
+          <div style="background:#14181A; padding:14px 20px; border-radius:8px 8px 0 0; border-bottom:4px solid #33D63A;">
+            <div style="color:#F4F7F4; font-family:'Oswald',sans-serif; font-size:16px; letter-spacing:1px;">FLOW-TECH SYSTEMS LLC</div>
+          </div>
+          <div style="background:#FAFCF9; border:1px solid #E8EDE8; border-radius:0 0 8px 8px; padding:24px;">
+            <h2 style="font-family:'Oswald',sans-serif; text-transform:uppercase; color:#1E8A29; margin-top:0;">Return Confirmed</h2>
+            <p style="color:#5B6660;">Thank you — ticket #${escHtml(ticket.ticketNumber||'')} has been confirmed. You may close this page.</p>
+          </div>
         </div>
       `;
     }catch(e){
@@ -4351,9 +4402,14 @@ async function runReturnCaptureMode(ticketId, apiUrl){
       queuePendingSubmission(apiUrl, requestBody);
       app.innerHTML = `
         <div style="max-width:480px; margin:60px auto; text-align:center; font-family:'Inter',sans-serif; padding:24px;">
-          <h2 style="font-family:'Oswald',sans-serif; text-transform:uppercase; color:var(--amber);">Saved - Will Send Automatically</h2>
-          <p style="color:var(--ink-soft);">No connection right now, but your return confirmation for ticket #${escHtml(ticket.ticketNumber||'')} has been saved on this device. It'll send automatically as soon as you're back online - you can close this page or leave it open.</p>
-          <p id="retry-status" style="color:var(--ink-soft); font-size:13px; margin-top:16px;"></p>
+          <div style="background:#14181A; padding:14px 20px; border-radius:8px 8px 0 0; border-bottom:4px solid #E6A817;">
+            <div style="color:#F4F7F4; font-family:'Oswald',sans-serif; font-size:16px; letter-spacing:1px;">FLOW-TECH SYSTEMS LLC</div>
+          </div>
+          <div style="background:#FAFCF9; border:1px solid #E8EDE8; border-radius:0 0 8px 8px; padding:24px;">
+            <h2 style="font-family:'Oswald',sans-serif; text-transform:uppercase; color:#E6A817; margin-top:0;">Saved — Will Send Automatically</h2>
+            <p style="color:#5B6660;">No connection right now, but your return confirmation for ticket #${escHtml(ticket.ticketNumber||'')} has been saved on this device. It will send automatically as soon as you're back online.</p>
+            <p id="retry-status" style="color:#5B6660; font-size:13px; margin-top:16px;"></p>
+          </div>
         </div>
       `;
       startPendingSubmissionRetry((result)=>{
