@@ -752,6 +752,16 @@ const LOGO_SVG_MARKUP = `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="ht
 </svg>`;
 let appSettings = { overdueThresholdDays: 30 };
 let qbArData = null; // { connected, totalAR, overdueAR, invoiceCount, fetchedAt } or null before first fetch
+let qbRevenueData = null; // { connected, startDate, totalRevenue, invoiceCount, invoices[], fetchedAt } or null before first fetch
+let qbRevenueLoading = false; // guards against firing a second fetch while one is already in flight
+
+// QuickBooks customers that are really pass-through vendors - the invoice is
+// written to them, but the work was done for somebody else. Revenue billed
+// through these gets split back out to the real operator on the Reports tab.
+// Add a name here (spelled exactly as QuickBooks has it) if another vendor
+// arrangement ever starts.
+const PASS_THROUGH_CUSTOMERS = ['West Texas Premix Pits'];
+
 let syncStatus = 'idle'; // idle | saving | loading | ok | error
 let pushInProgress = false; // true while a push is in flight — blocks auto-pull to prevent race conditions
 let showSyncPanel = false;
@@ -1416,6 +1426,26 @@ async function fetchQuickBooksAR(){
     console.error('QuickBooks AR fetch failed', e);
     qbArData = { connected: false, error: 'Could not reach QuickBooks right now.' };
   }
+  render();
+}
+
+// Pulls this year's invoices from QuickBooks for the Revenue by Customer
+// section on the Reports tab. Heavier than the AR call (it returns every
+// invoice, not just a total), so it only runs when the Reports tab is
+// actually open rather than on every dashboard visit.
+async function fetchQuickBooksRevenue(force){
+  if(!syncUrl) return;
+  if(qbRevenueLoading) return;
+  if(qbRevenueData && !force) return; // already have it this session
+  qbRevenueLoading = true;
+  try{
+    const res = await fetch(`${syncUrl}?action=qbrevenue`, { method: 'GET' });
+    qbRevenueData = await res.json();
+  }catch(e){
+    console.error('QuickBooks revenue fetch failed', e);
+    qbRevenueData = { connected: false, error: 'Could not reach QuickBooks right now.' };
+  }
+  qbRevenueLoading = false;
   render();
 }
 
@@ -2656,6 +2686,173 @@ function renderInventory(){
   `;
 }
 
+/* ── REVENUE BY CUSTOMER (QUICKBOOKS) ──────────────────────────────
+   QuickBooks knows who got invoiced. The tracker knows who the work was
+   actually for. This joins the two, so revenue billed through a
+   pass-through vendor still lands under the operator that drilled it.
+
+   The join key is text: a rig or pad name appearing anywhere on the
+   invoice - document number, memo, private note, or a line description.
+   Anything that can't be matched goes to "Unattributed" rather than being
+   quietly folded into a customer it might not belong to. If that number
+   is large, the fix is putting the rig or pad name on the invoice in
+   QuickBooks, not changing the math here.
+*/
+
+function normalizeForMatch(s){
+  return String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+}
+
+// Builds a rig-name and pad-name lookup pointing at the operator behind
+// each one, drawn from ticket history. Later tickets win, so if a rig
+// moves to a different operator the current one is what gets used.
+function buildOperatorLookup(){
+  const sorted = tickets.slice().sort((a,b)=>String(a.deliveryDate||'').localeCompare(String(b.deliveryDate||'')));
+  const byKey = {};
+  sorted.forEach(t=>{
+    const operator = t.customer || '';
+    if(!operator) return;
+    if(t.rig){
+      const k = normalizeForMatch(t.rig);
+      if(k.length >= 3) byKey[k] = { key:k, operator, label:t.rig, kind:'rig' };
+    }
+    if(Array.isArray(t.pads)){
+      t.pads.forEach(p=>{
+        if(!p || !p.name) return;
+        const k = normalizeForMatch(p.name);
+        if(k.length >= 3) byKey[k] = { key:k, operator, label:p.name, kind:'pad' };
+      });
+    }
+  });
+  // Longest keys first, so a specific pad name wins over a shorter name
+  // that happens to be a substring of it.
+  return Object.keys(byKey).map(k=>byKey[k]).sort((a,b)=>b.key.length - a.key.length);
+}
+
+function attributeInvoice(inv, lookup){
+  const haystack = normalizeForMatch([inv.docNumber, inv.memo, inv.privateNote, inv.lines].join(' '));
+  if(!haystack) return null;
+  for(let i=0;i<lookup.length;i++){
+    if(haystack.indexOf(lookup[i].key) !== -1) return lookup[i];
+  }
+  return null;
+}
+
+function renderRevenueByCustomer(){
+  if(!syncUrl) return '';
+
+  const heading = `<h2 class="section-title" style="margin-top:24px;">Revenue by Customer (QuickBooks)</h2>`;
+  const box = (inner)=>`${heading}<div style="background:#fff; border:1.5px solid #E8EDE8; border-radius:8px; padding:16px;">${inner}</div>`;
+
+  if(!qbRevenueData){
+    return box(`<div style="font-size:13px; color:#5B6660;">Loading revenue from QuickBooks...</div>`);
+  }
+  if(!qbRevenueData.connected){
+    return box(`<div style="font-size:13px; color:#5B6660;">QuickBooks isn't connected yet - revenue will show here once it is.${qbRevenueData.error?`<div style="color:#B5432A; margin-top:6px;">${escHtml(qbRevenueData.error)}</div>`:''}</div>`);
+  }
+  if(qbRevenueData.error){
+    return box(`<div style="font-size:13px; color:#B5432A;">QuickBooks error: ${escHtml(qbRevenueData.error)}</div>`);
+  }
+
+  const invoices = Array.isArray(qbRevenueData.invoices) ? qbRevenueData.invoices : [];
+  if(invoices.length === 0){
+    return box(`<div style="font-size:13px; color:#5B6660;">No invoices dated ${escHtml(qbRevenueData.startDate||'this year')} or later.</div>`);
+  }
+
+  const lookup = buildOperatorLookup();
+  const groups = {};   // operator/customer name -> { total, count, viaVendor, direct }
+  let unattributed = { total:0, count:0 };
+  let vendorTotal = 0;
+
+  invoices.forEach(inv=>{
+    const billedTo = inv.customer || 'Unknown';
+    const isPassThrough = PASS_THROUGH_CUSTOMERS.some(v=>normalizeForMatch(v) === normalizeForMatch(billedTo));
+
+    if(isPassThrough){
+      vendorTotal += inv.amount || 0;
+      const match = attributeInvoice(inv, lookup);
+      if(!match){
+        unattributed.total += inv.amount || 0;
+        unattributed.count++;
+        return;
+      }
+      const name = match.operator;
+      if(!groups[name]) groups[name] = { total:0, count:0, viaVendor:0, direct:0, vendors:{} };
+      groups[name].total += inv.amount || 0;
+      groups[name].count++;
+      groups[name].viaVendor += inv.amount || 0;
+      groups[name].vendors[billedTo] = true;
+    } else {
+      if(!groups[billedTo]) groups[billedTo] = { total:0, count:0, viaVendor:0, direct:0, vendors:{} };
+      groups[billedTo].total += inv.amount || 0;
+      groups[billedTo].count++;
+      groups[billedTo].direct += inv.amount || 0;
+    }
+  });
+
+  const entries = Object.keys(groups).map(k=>[k, groups[k]]).sort((a,b)=>b[1].total - a[1].total);
+  const grandTotal = qbRevenueData.totalRevenue || 0;
+  const maxTotal = entries.length ? entries[0][1].total : 0;
+
+  let rows = '';
+  entries.forEach(([name, g])=>{
+    const barWidth = maxTotal > 0 ? Math.min(100, Math.round((g.total / maxTotal) * 100)) : 0;
+    const vendorNames = Object.keys(g.vendors);
+    let tag = '';
+    if(g.viaVendor > 0 && g.direct > 0){
+      tag = `<div style="font-size:11px; color:#5B6660; margin-top:2px;">${fmtMoney(g.direct)} direct &middot; ${fmtMoney(g.viaVendor)} via ${escHtml(vendorNames.join(', '))}</div>`;
+    } else if(g.viaVendor > 0){
+      tag = `<div style="font-size:11px; color:#5B6660; margin-top:2px;">via ${escHtml(vendorNames.join(', '))}</div>`;
+    }
+    rows += `<div style="padding:10px 0; border-bottom:1px solid #E8EDE8;">
+      <div style="display:grid; grid-template-columns:1fr 60px 100px; gap:8px; font-size:13px; align-items:center;">
+        <div><div style="font-weight:600;">${escHtml(name)}</div>${tag}</div>
+        <div style="text-align:center; color:#5B6660;">${g.count}</div>
+        <div style="text-align:right; font-weight:600;">${fmtMoney(g.total)}</div>
+      </div>
+      <div style="background:#E8EDE8; border-radius:4px; height:6px; overflow:hidden; margin-top:8px;">
+        <div style="height:100%; width:${barWidth}%; background:#33D63A; border-radius:4px; min-width:2px;"></div>
+      </div>
+    </div>`;
+  });
+
+  if(unattributed.count > 0){
+    rows += `<div style="display:grid; grid-template-columns:1fr 60px 100px; gap:8px; padding:10px 0; border-bottom:1px solid #E8EDE8; font-size:13px; align-items:center;">
+      <div>
+        <div style="font-weight:600; color:#8A6D10;">Unattributed</div>
+        <div style="font-size:11px; color:#8A6D10;">Billed through ${escHtml(PASS_THROUGH_CUSTOMERS.join(', '))} with no rig or pad name on the invoice</div>
+      </div>
+      <div style="text-align:center; color:#8A6D10;">${unattributed.count}</div>
+      <div style="text-align:right; font-weight:600; color:#8A6D10;">${fmtMoney(unattributed.total)}</div>
+    </div>`;
+  }
+
+  const fetchedTime = qbRevenueData.fetchedAt ? new Date(qbRevenueData.fetchedAt).toLocaleTimeString(undefined,{hour:'numeric',minute:'2-digit'}) : '';
+  const startLabel = qbRevenueData.startDate ? qbRevenueData.startDate.substring(0,4) : '';
+
+  return `
+    ${heading}
+    <div class="summary-cards" style="grid-template-columns:repeat(3,1fr);">
+      <div class="summary-card"><div class="num">${fmtMoney(grandTotal)}</div><div class="lbl">Invoiced ${escHtml(startLabel)} YTD</div></div>
+      <div class="summary-card"><div class="num">${qbRevenueData.invoiceCount||0}</div><div class="lbl">Invoices</div></div>
+      <div class="summary-card"><div class="num">${fmtMoney(vendorTotal)}</div><div class="lbl">Through Vendor</div></div>
+    </div>
+    <div style="background:#fff; border:1.5px solid #E8EDE8; border-radius:8px; padding:16px;">
+      <div style="display:grid; grid-template-columns:1fr 60px 100px; gap:8px; padding-bottom:8px; border-bottom:2px solid #E8EDE8; font-size:11px; text-transform:uppercase; letter-spacing:0.5px; color:#5B6660;">
+        <div>Operator</div><div style="text-align:center;">Inv</div><div style="text-align:right;">Revenue</div>
+      </div>
+      ${rows}
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; margin-top:12px; flex-wrap:wrap;">
+        <div style="font-size:11px; color:#5B6660;">
+          Live from QuickBooks${fetchedTime?' as of '+fetchedTime:''}. Vendor-billed work is credited to the operator by matching rig and pad names on the invoice.
+          ${qbRevenueData.truncated?'<span style="color:#B5432A;"> Showing the first 10,000 invoices only.</span>':''}
+        </div>
+        <button class="ghost-btn" id="refresh-qb-revenue-btn" style="font-size:12px;">Refresh</button>
+      </div>
+    </div>
+  `;
+}
+
 function renderReports(){
   const now = new Date();
   const thisMonth = now.getFullYear() + '-' + String(now.getMonth()+1).padStart(2,'0');
@@ -2826,7 +3023,9 @@ function renderReports(){
       <div class="summary-card"><div class="num">${avgDaysOnPad}</div><div class="lbl">Avg Days on Pad</div></div>
     </div>
 
-    <h2 class="section-title">Wells Billed by Month</h2>
+    ${renderRevenueByCustomer()}
+
+    <h2 class="section-title" style="margin-top:24px;">Wells Billed by Month</h2>
     <div style="background:#fff; border:1.5px solid #E8EDE8; border-radius:8px; padding:16px;">
       ${monthTableRows}
     </div>
@@ -3178,8 +3377,16 @@ function attachHandlers(){
       render();
       if((currentTab === 'tickets' || currentTab === 'byrig' || currentTab === 'dashboard' || currentTab === 'inventory') && syncUrl) pullFromCloud(true);
       if(currentTab === 'dashboard' && syncUrl) fetchQuickBooksAR();
+      if(currentTab === 'reports' && syncUrl) fetchQuickBooksRevenue();
     };
   });
+
+  const refreshRevBtn = document.getElementById('refresh-qb-revenue-btn');
+  if(refreshRevBtn) refreshRevBtn.onclick = ()=>{
+    qbRevenueData = null;
+    render();
+    fetchQuickBooksRevenue(true);
+  };
 
   const syncToggleBtn = document.getElementById('toggle-sync-panel');
   if(syncToggleBtn) syncToggleBtn.onclick = ()=>{
@@ -4269,6 +4476,7 @@ async function init(){
     await pullFromCloud(true);
     startAutoSync();
     if(currentTab === 'dashboard') fetchQuickBooksAR();
+    if(currentTab === 'reports') fetchQuickBooksRevenue();
   }
 }
 
