@@ -759,9 +759,37 @@ let showUnattributedDetail = false; // expands the diagnostic list under the Una
 // QuickBooks customers that are really pass-through vendors - the invoice is
 // written to them, but the work was done for somebody else. Revenue billed
 // through these gets split back out to the real operator on the Reports tab.
-// Add a name here (spelled exactly as QuickBooks has it) if another vendor
-// arrangement ever starts.
-const PASS_THROUGH_CUSTOMERS = ['West Texas Premix Pits'];
+//
+// This is NOT hardcoded any more, because the name has to match whatever
+// QuickBooks actually calls the customer, right down to a trailing "LLC" -
+// and guessing at that from the outside is a losing game. Instead every
+// customer row on the Reports tab has a "split by operator" button, and
+// clicking it stores that exact name here. The list below is only the
+// starting default for a device that has never set one.
+const DEFAULT_PASS_THROUGH = ['West Texas Premix Pits'];
+const PASS_THROUGH_KEY = 'flowtech_equipment_tracker_passthrough';
+let passThroughCustomers = null; // lazily loaded from localStorage
+
+function loadPassThroughCustomers(){
+  try{
+    const raw = localStorage.getItem(PASS_THROUGH_KEY);
+    passThroughCustomers = raw ? JSON.parse(raw) : DEFAULT_PASS_THROUGH.slice();
+  }catch(e){
+    passThroughCustomers = DEFAULT_PASS_THROUGH.slice();
+  }
+  if(!Array.isArray(passThroughCustomers)) passThroughCustomers = DEFAULT_PASS_THROUGH.slice();
+}
+
+function getPassThroughList(){
+  if(passThroughCustomers === null) loadPassThroughCustomers();
+  return passThroughCustomers;
+}
+
+function savePassThroughCustomers(){
+  try{
+    localStorage.setItem(PASS_THROUGH_KEY, JSON.stringify(getPassThroughList()));
+  }catch(e){ showStorageWarning('vendor billing settings', e); }
+}
 
 let syncStatus = 'idle'; // idle | saving | loading | ok | error
 let pushInProgress = false; // true while a push is in flight — blocks auto-pull to prevent race conditions
@@ -2746,6 +2774,19 @@ function parentCustomerName(name){
   return String(name||'').split(':')[0].trim();
 }
 
+// Deliberately forgiving: a stored "West Texas Premix Pits" still matches a
+// QuickBooks customer named "West Texas Premix Pits LLC", and vice versa.
+// Exact-name matching is what made this quietly fail before.
+function isPassThroughCustomer(name){
+  const n = normalizeForMatch(parentCustomerName(name));
+  if(!n) return false;
+  return getPassThroughList().some(v=>{
+    const vn = normalizeForMatch(v);
+    if(!vn) return false;
+    return n === vn || n.indexOf(vn) !== -1 || vn.indexOf(n) !== -1;
+  });
+}
+
 function attributeInvoice(inv, lookup){
   const haystack = normalizeForMatch(invoiceSearchText(inv));
   if(!haystack) return null;
@@ -2786,7 +2827,7 @@ function renderRevenueByCustomer(){
     // Compare on the parent name so sub-customer jobs like
     // "West Texas Premix Pits:H&P 517" still register as vendor-billed.
     const parent = parentCustomerName(billedTo);
-    const isPassThrough = PASS_THROUGH_CUSTOMERS.some(v=>normalizeForMatch(v) === normalizeForMatch(parent));
+    const isPassThrough = isPassThroughCustomer(billedTo);
 
     if(isPassThrough){
       vendorTotal += inv.amount || 0;
@@ -2828,9 +2869,17 @@ function renderRevenueByCustomer(){
     } else if(g.viaVendor > 0){
       tag = `<div style="font-size:11px; color:#5B6660; margin-top:2px;">via ${escHtml(vendorNames.join(', '))}</div>`;
     }
+    // Any row that came straight from QuickBooks (rather than being derived
+    // by splitting a vendor) can itself be marked as a pass-through vendor.
+    // This is how you tell the app the real spelling of a vendor name
+    // without anybody having to guess it.
+    const splitBtn = g.direct > 0
+      ? `<button data-split-vendor="${escAttr(name)}" style="background:none; border:none; padding:0; margin-left:8px; color:#2E7D32; font-size:11px; text-decoration:underline; cursor:pointer; font-family:inherit;">split by operator</button>`
+      : '';
+
     rows += `<div style="padding:10px 0; border-bottom:1px solid #E8EDE8;">
       <div style="display:grid; grid-template-columns:1fr 60px 100px; gap:8px; font-size:13px; align-items:center;">
-        <div><div style="font-weight:600;">${escHtml(name)}</div>${tag}</div>
+        <div><div style="font-weight:600;">${escHtml(name)}${splitBtn}</div>${tag}</div>
         <div style="text-align:center; color:#5B6660;">${g.count}</div>
         <div style="text-align:right; font-weight:600;">${fmtMoney(g.total)}</div>
       </div>
@@ -2874,7 +2923,7 @@ function renderRevenueByCustomer(){
       <div style="display:grid; grid-template-columns:1fr 60px 100px; gap:8px; font-size:13px; align-items:center;">
         <div>
           <div style="font-weight:600; color:#8A6D10;">Unattributed</div>
-          <div style="font-size:11px; color:#8A6D10;">Billed through ${escHtml(PASS_THROUGH_CUSTOMERS.join(', '))}, no rig or pad name recognized
+          <div style="font-size:11px; color:#8A6D10;">Billed through ${escHtml(getPassThroughList().join(', '))}, no rig or pad name recognized
             <button id="toggle-unattributed-detail" style="background:none; border:none; padding:0 0 0 4px; color:#8A6D10; font-size:11px; text-decoration:underline; cursor:pointer; font-family:inherit;">${showUnattributedDetail?'hide':'show me why'}</button>
           </div>
         </div>
@@ -2888,6 +2937,16 @@ function renderRevenueByCustomer(){
   const fetchedTime = qbRevenueData.fetchedAt ? new Date(qbRevenueData.fetchedAt).toLocaleTimeString(undefined,{hour:'numeric',minute:'2-digit'}) : '';
   const startLabel = qbRevenueData.startDate ? qbRevenueData.startDate.substring(0,4) : '';
 
+  // Shows which names are currently being treated as pass-through vendors,
+  // and gives a way back out. Without this, marking a customer by mistake
+  // would make its row vanish with no obvious way to undo it.
+  const activeVendors = getPassThroughList();
+  const vendorChips = activeVendors.length ? `
+    <div style="margin-top:12px; padding-top:10px; border-top:1px solid #E8EDE8; font-size:11px; color:#5B6660;">
+      Splitting by operator:
+      ${activeVendors.map(v=>`<span style="display:inline-block; background:#EEF4EE; border:1px solid #D6E2D6; border-radius:12px; padding:2px 8px; margin:2px 4px 2px 0;">${escHtml(v)}<button data-unsplit-vendor="${escAttr(v)}" title="Stop splitting this one" style="background:none; border:none; padding:0 0 0 6px; color:#8A6D10; cursor:pointer; font-family:inherit; font-size:12px;">&times;</button></span>`).join('')}
+    </div>` : '';
+
   return `
     ${heading}
     <div class="summary-cards" style="grid-template-columns:repeat(3,1fr);">
@@ -2900,6 +2959,7 @@ function renderRevenueByCustomer(){
         <div>Operator</div><div style="text-align:center;">Inv</div><div style="text-align:right;">Revenue</div>
       </div>
       ${rows}
+      ${vendorChips}
       <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; margin-top:12px; flex-wrap:wrap;">
         <div style="font-size:11px; color:#5B6660;">
           Live from QuickBooks${fetchedTime?' as of '+fetchedTime:''}. Vendor-billed work is credited to the operator by matching rig and pad names on the invoice.
@@ -3436,6 +3496,26 @@ function attachHandlers(){
       if((currentTab === 'tickets' || currentTab === 'byrig' || currentTab === 'dashboard' || currentTab === 'inventory') && syncUrl) pullFromCloud(true);
       if(currentTab === 'dashboard' && syncUrl) fetchQuickBooksAR();
       if(currentTab === 'reports' && syncUrl) fetchQuickBooksRevenue();
+    };
+  });
+
+  document.querySelectorAll('[data-split-vendor]').forEach(btn=>{
+    btn.onclick = ()=>{
+      const name = btn.dataset.splitVendor;
+      const list = getPassThroughList();
+      if(!list.some(v=>normalizeForMatch(v) === normalizeForMatch(name))) list.push(name);
+      savePassThroughCustomers();
+      showUnattributedDetail = true; // open the diagnostic straight away so it's obvious what matched
+      render();
+    };
+  });
+
+  document.querySelectorAll('[data-unsplit-vendor]').forEach(btn=>{
+    btn.onclick = ()=>{
+      const name = btn.dataset.unsplitVendor;
+      passThroughCustomers = getPassThroughList().filter(v=>normalizeForMatch(v) !== normalizeForMatch(name));
+      savePassThroughCustomers();
+      render();
     };
   });
 
