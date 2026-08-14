@@ -1639,12 +1639,25 @@ async function pullFromCloud(silent){
     if(Array.isArray(data.customerCatalog) && data.customerCatalog.length) customerCatalog = data.customerCatalog;
     if(Array.isArray(data.templateCatalog) && data.templateCatalog.length) templateCatalog = data.templateCatalog;
     if(data.appSettings && typeof data.appSettings === 'object'){
+      // Only tear down the cached revenue breakdown if the rules behind it
+      // actually changed. Nulling it on every pull looked harmless but
+      // wasn't: the background sync runs every 30 seconds, so sitting on the
+      // Reports tab would blank the section and leave it stuck on "Loading"
+      // forever, because nothing re-requests it outside a tab switch.
+      const rulesBefore = JSON.stringify([appSettings.passThroughCustomers || null, appSettings.invoiceRules || null]);
       appSettings = {...appSettings, ...data.appSettings};
-      // Drop the resolved copies so the next read picks up whatever just
-      // came down from the other device instead of this session's cache.
-      passThroughCustomers = null;
-      invoiceRules = null;
-      qbRevenueData = null; // the breakdown depends on those rules - refetch
+      const rulesAfter = JSON.stringify([appSettings.passThroughCustomers || null, appSettings.invoiceRules || null]);
+
+      if(rulesBefore !== rulesAfter){
+        // Drop the resolved copies so the next read picks up whatever just
+        // came down from the other device instead of this session's cache.
+        passThroughCustomers = null;
+        invoiceRules = null;
+        qbRevenueData = null;
+        // ...and actually go get it again, rather than waiting for the user
+        // to leave the tab and come back.
+        if(currentTab === 'reports' && syncUrl) fetchQuickBooksRevenue(true);
+      }
     }
     localStorage.setItem(STORAGE_KEY, JSON.stringify(tickets));
     localStorage.setItem(CATALOG_KEY, JSON.stringify(equipmentCatalog));
@@ -3800,7 +3813,13 @@ function attachHandlers(){
       colorCatalog: colorCatalog,
       rigCatalog: rigCatalog,
       customerCatalog: customerCatalog,
-      templateCatalog: templateCatalog
+      templateCatalog: templateCatalog,
+      // These two were missing, which meant a restore quietly came back
+      // without your archived rigs and without any of your settings - the
+      // overdue threshold, the vendor split list, the invoice number rules.
+      // You'd only find out on the day you actually needed the backup.
+      archivedRigs: archivedRigs,
+      appSettings: appSettings
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -3903,6 +3922,19 @@ function attachHandlers(){
         if(Array.isArray(parsed.templateCatalog) && parsed.templateCatalog.length){
           templateCatalog = parsed.templateCatalog;
         }
+        // Restored for real now. Older backup files simply won't carry these
+        // keys, and that's fine - the current values stay untouched.
+        if(Array.isArray(parsed.archivedRigs)){
+          archivedRigs = parsed.archivedRigs;
+        }
+        if(parsed.appSettings && typeof parsed.appSettings === 'object'){
+          appSettings = {...appSettings, ...parsed.appSettings};
+          // Force the vendor list and invoice rules to be re-read from the
+          // settings that just came in, instead of this session's copies.
+          passThroughCustomers = null;
+          invoiceRules = null;
+          qbRevenueData = null;
+        }
 
         // Write everything to local storage directly (fast, synchronous,
         // no network round-trips in between) rather than calling each
@@ -3916,6 +3948,8 @@ function attachHandlers(){
         try{ localStorage.setItem(RIG_CATALOG_KEY, JSON.stringify(rigCatalog)); }catch(e){ showStorageWarning('rigs', e); }
         try{ localStorage.setItem(CUSTOMER_CATALOG_KEY, JSON.stringify(customerCatalog)); }catch(e){ showStorageWarning('customers', e); }
         try{ localStorage.setItem(TEMPLATE_KEY, JSON.stringify(templateCatalog)); }catch(e){ showStorageWarning('templates', e); }
+        try{ localStorage.setItem(ARCHIVED_RIGS_KEY, JSON.stringify(archivedRigs)); }catch(e){ showStorageWarning('archived rigs', e); }
+        try{ localStorage.setItem(SETTINGS_KEY, JSON.stringify(appSettings)); }catch(e){ showStorageWarning('settings', e); }
 
         // One single push with the fully-imported state, then resume
         // auto-sync once it's safely landed.
