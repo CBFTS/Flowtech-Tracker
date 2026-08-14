@@ -754,6 +754,7 @@ let appSettings = { overdueThresholdDays: 30 };
 let qbArData = null; // { connected, totalAR, overdueAR, invoiceCount, fetchedAt } or null before first fetch
 let qbRevenueData = null; // { connected, startDate, totalRevenue, invoiceCount, invoices[], fetchedAt } or null before first fetch
 let qbRevenueLoading = false; // guards against firing a second fetch while one is already in flight
+let showUnattributedDetail = false; // expands the diagnostic list under the Unattributed row on Reports
 
 // QuickBooks customers that are really pass-through vendors - the invoice is
 // written to them, but the work was done for somebody else. Revenue billed
@@ -2729,8 +2730,24 @@ function buildOperatorLookup(){
   return Object.keys(byKey).map(k=>byKey[k]).sort((a,b)=>b.key.length - a.key.length);
 }
 
+// Everything the server could find on the invoice that might carry a rig or
+// pad name, as one string. Falls back to the older per-field shape so a
+// stale cached response from the previous version still works.
+function invoiceSearchText(inv){
+  if(inv.searchText) return inv.searchText;
+  return [inv.docNumber, inv.memo, inv.privateNote, inv.lines, inv.customer].filter(Boolean).join(' | ');
+}
+
+// QuickBooks writes a sub-customer (a job) as "Parent:Child". For deciding
+// whether an invoice went through a pass-through vendor, only the parent
+// matters - the child half is usually the rig, which is exactly what the
+// matcher wants to read.
+function parentCustomerName(name){
+  return String(name||'').split(':')[0].trim();
+}
+
 function attributeInvoice(inv, lookup){
-  const haystack = normalizeForMatch([inv.docNumber, inv.memo, inv.privateNote, inv.lines].join(' '));
+  const haystack = normalizeForMatch(invoiceSearchText(inv));
   if(!haystack) return null;
   for(let i=0;i<lookup.length;i++){
     if(haystack.indexOf(lookup[i].key) !== -1) return lookup[i];
@@ -2761,12 +2778,15 @@ function renderRevenueByCustomer(){
 
   const lookup = buildOperatorLookup();
   const groups = {};   // operator/customer name -> { total, count, viaVendor, direct }
-  let unattributed = { total:0, count:0 };
+  let unattributed = { total:0, count:0, items:[] };
   let vendorTotal = 0;
 
   invoices.forEach(inv=>{
     const billedTo = inv.customer || 'Unknown';
-    const isPassThrough = PASS_THROUGH_CUSTOMERS.some(v=>normalizeForMatch(v) === normalizeForMatch(billedTo));
+    // Compare on the parent name so sub-customer jobs like
+    // "West Texas Premix Pits:H&P 517" still register as vendor-billed.
+    const parent = parentCustomerName(billedTo);
+    const isPassThrough = PASS_THROUGH_CUSTOMERS.some(v=>normalizeForMatch(v) === normalizeForMatch(parent));
 
     if(isPassThrough){
       vendorTotal += inv.amount || 0;
@@ -2774,6 +2794,7 @@ function renderRevenueByCustomer(){
       if(!match){
         unattributed.total += inv.amount || 0;
         unattributed.count++;
+        unattributed.items.push(inv);
         return;
       }
       const name = match.operator;
@@ -2781,12 +2802,15 @@ function renderRevenueByCustomer(){
       groups[name].total += inv.amount || 0;
       groups[name].count++;
       groups[name].viaVendor += inv.amount || 0;
-      groups[name].vendors[billedTo] = true;
+      groups[name].vendors[parent] = true;
     } else {
-      if(!groups[billedTo]) groups[billedTo] = { total:0, count:0, viaVendor:0, direct:0, vendors:{} };
-      groups[billedTo].total += inv.amount || 0;
-      groups[billedTo].count++;
-      groups[billedTo].direct += inv.amount || 0;
+      // Group direct customers by parent too, so a customer with jobs under
+      // it lands on one line instead of scattering into one row per job.
+      const key = parent || billedTo;
+      if(!groups[key]) groups[key] = { total:0, count:0, viaVendor:0, direct:0, vendors:{} };
+      groups[key].total += inv.amount || 0;
+      groups[key].count++;
+      groups[key].direct += inv.amount || 0;
     }
   });
 
@@ -2817,13 +2841,47 @@ function renderRevenueByCustomer(){
   });
 
   if(unattributed.count > 0){
-    rows += `<div style="display:grid; grid-template-columns:1fr 60px 100px; gap:8px; padding:10px 0; border-bottom:1px solid #E8EDE8; font-size:13px; align-items:center;">
-      <div>
-        <div style="font-weight:600; color:#8A6D10;">Unattributed</div>
-        <div style="font-size:11px; color:#8A6D10;">Billed through ${escHtml(PASS_THROUGH_CUSTOMERS.join(', '))} with no rig or pad name on the invoice</div>
+    // Expandable detail: shows the actual text pulled off each unmatched
+    // invoice next to the rig and pad names being matched against. If the
+    // rig name is visible in that text but still isn't matching, the names
+    // are spelled differently in QuickBooks than in the tracker - and this
+    // is where you can see it side by side.
+    let detail = '';
+    if(showUnattributedDetail){
+      let items = '';
+      unattributed.items.slice(0, 25).forEach(inv=>{
+        const raw = invoiceSearchText(inv);
+        items += `<div style="padding:8px 0; border-top:1px dashed #E6D080;">
+          <div style="display:flex; justify-content:space-between; gap:10px; font-size:12px; font-weight:600; color:#5C4A08;">
+            <span>${escHtml(inv.docNumber || '(no invoice #)')} &middot; ${escHtml(inv.date||'')}</span>
+            <span>${fmtMoney(inv.amount||0)}</span>
+          </div>
+          <div style="font-size:11px; color:#5B6660; margin-top:3px; word-break:break-word;">${raw ? escHtml(raw) : '<em>No text found on this invoice at all.</em>'}</div>
+        </div>`;
+      });
+      const moreNote = unattributed.items.length > 25
+        ? `<div style="font-size:11px; color:#8A6D10; padding-top:8px;">Showing the first 25 of ${unattributed.items.length}.</div>` : '';
+      const knownNames = lookup.slice(0, 40).map(l=>l.label);
+      detail = `<div style="background:#FFF8E6; border:1px solid #E6D080; border-radius:6px; padding:10px 12px; margin-top:8px;">
+        ${items}${moreNote}
+        <div style="font-size:11px; color:#5B6660; margin-top:10px; padding-top:8px; border-top:1px solid #E6D080;">
+          <strong>Matching against ${lookup.length} name${lookup.length!==1?'s':''} from your tickets:</strong> ${escHtml(knownNames.join(', '))}${lookup.length>40?' ...':''}
+        </div>
+      </div>`;
+    }
+
+    rows += `<div style="padding:10px 0; border-bottom:1px solid #E8EDE8;">
+      <div style="display:grid; grid-template-columns:1fr 60px 100px; gap:8px; font-size:13px; align-items:center;">
+        <div>
+          <div style="font-weight:600; color:#8A6D10;">Unattributed</div>
+          <div style="font-size:11px; color:#8A6D10;">Billed through ${escHtml(PASS_THROUGH_CUSTOMERS.join(', '))}, no rig or pad name recognized
+            <button id="toggle-unattributed-detail" style="background:none; border:none; padding:0 0 0 4px; color:#8A6D10; font-size:11px; text-decoration:underline; cursor:pointer; font-family:inherit;">${showUnattributedDetail?'hide':'show me why'}</button>
+          </div>
+        </div>
+        <div style="text-align:center; color:#8A6D10;">${unattributed.count}</div>
+        <div style="text-align:right; font-weight:600; color:#8A6D10;">${fmtMoney(unattributed.total)}</div>
       </div>
-      <div style="text-align:center; color:#8A6D10;">${unattributed.count}</div>
-      <div style="text-align:right; font-weight:600; color:#8A6D10;">${fmtMoney(unattributed.total)}</div>
+      ${detail}
     </div>`;
   }
 
@@ -3380,6 +3438,12 @@ function attachHandlers(){
       if(currentTab === 'reports' && syncUrl) fetchQuickBooksRevenue();
     };
   });
+
+  const toggleUnattrBtn = document.getElementById('toggle-unattributed-detail');
+  if(toggleUnattrBtn) toggleUnattrBtn.onclick = ()=>{
+    showUnattributedDetail = !showUnattributedDetail;
+    render();
+  };
 
   const refreshRevBtn = document.getElementById('refresh-qb-revenue-btn');
   if(refreshRevBtn) refreshRevBtn.onclick = ()=>{
