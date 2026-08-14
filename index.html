@@ -755,6 +755,7 @@ let qbArData = null; // { connected, totalAR, overdueAR, invoiceCount, fetchedAt
 let qbRevenueData = null; // { connected, startDate, totalRevenue, invoiceCount, invoices[], fetchedAt } or null before first fetch
 let qbRevenueLoading = false; // guards against firing a second fetch while one is already in flight
 let showUnattributedDetail = false; // expands the diagnostic list under the Unattributed row on Reports
+let showInvoiceRules = false; // expands the invoice-number rules editor on Reports
 
 // QuickBooks customers that are really pass-through vendors - the invoice is
 // written to them, but the work was done for somebody else. Revenue billed
@@ -789,6 +790,94 @@ function savePassThroughCustomers(){
   try{
     localStorage.setItem(PASS_THROUGH_KEY, JSON.stringify(getPassThroughList()));
   }catch(e){ showStorageWarning('vendor billing settings', e); }
+}
+
+// Invoice-number rules. The most reliable signal for who an invoice belongs
+// to turns out to be the invoice number itself - FBE and GEN are Firebird,
+// SZC is Silverzone - so these are checked BEFORE any rig or pad name
+// matching. A prefix is a deliberate labeling decision; memo text is
+// whatever somebody happened to type that day.
+const INVOICE_RULES_KEY = 'flowtech_equipment_tracker_invoicerules';
+const DEFAULT_INVOICE_RULES = [
+  { prefix:'FBE', operator:'Firebird' },
+  { prefix:'GEN', operator:'Firebird' },
+  { prefix:'SZC', operator:'Silverzone' }
+];
+let invoiceRules = null; // lazily loaded from localStorage
+
+// Every customer name the tracker already knows about, so a rule points at
+// the same spelling the rest of the Reports tab uses instead of inventing a
+// near-duplicate row.
+function knownOperatorNames(){
+  const set = {};
+  (customerCatalog||[]).forEach(c=>{
+    const n = (typeof c === 'string') ? c : (c && c.name);
+    if(n) set[n] = true;
+  });
+  (tickets||[]).forEach(t=>{ if(t.customer) set[t.customer] = true; });
+  return Object.keys(set).sort();
+}
+
+// Maps a short label like "Firebird" onto the full name already in use
+// ("Firebird Resources"), so seeding the defaults doesn't split one
+// customer across two rows.
+function bestOperatorMatch(needle){
+  const n = normalizeForMatch(needle);
+  if(!n) return needle;
+  const names = knownOperatorNames();
+  let hit = names.find(x=>normalizeForMatch(x) === n);
+  if(hit) return hit;
+  hit = names.find(x=>{
+    const xn = normalizeForMatch(x);
+    return xn.indexOf(n) !== -1 || n.indexOf(xn) !== -1;
+  });
+  return hit || needle;
+}
+
+function loadInvoiceRules(){
+  let stored = null;
+  try{
+    const raw = localStorage.getItem(INVOICE_RULES_KEY);
+    stored = raw ? JSON.parse(raw) : null;
+  }catch(e){ stored = null; }
+
+  if(Array.isArray(stored)){
+    invoiceRules = stored;
+  } else {
+    // First run on this device - seed the defaults, snapping each one to the
+    // customer name already in the tracker.
+    invoiceRules = DEFAULT_INVOICE_RULES.map(r=>({
+      prefix: r.prefix,
+      operator: bestOperatorMatch(r.operator)
+    }));
+  }
+}
+
+function getInvoiceRules(){
+  if(invoiceRules === null) loadInvoiceRules();
+  return invoiceRules;
+}
+
+function saveInvoiceRules(){
+  try{
+    localStorage.setItem(INVOICE_RULES_KEY, JSON.stringify(getInvoiceRules()));
+  }catch(e){ showStorageWarning('invoice number rules', e); }
+}
+
+// Longest matching prefix wins, so a narrow rule can override a broad one
+// (e.g. "GENX" beating "GEN") without needing any ordering discipline.
+function matchInvoiceRule(inv){
+  const doc = String(inv.docNumber||'').trim().toUpperCase();
+  if(!doc) return null;
+  let best = null;
+  getInvoiceRules().forEach(r=>{
+    const p = String(r.prefix||'').trim().toUpperCase();
+    if(!p || !r.operator) return;
+    if(doc.indexOf(p) === 0 && (!best || p.length > best.prefix.length)){
+      best = { prefix:p, operator:r.operator };
+    }
+  });
+  return best;
 }
 
 let syncStatus = 'idle'; // idle | saving | loading | ok | error
@@ -2829,8 +2918,24 @@ function renderRevenueByCustomer(){
     const parent = parentCustomerName(billedTo);
     const isPassThrough = isPassThroughCustomer(billedTo);
 
+    if(isPassThrough) vendorTotal += inv.amount || 0;
+
+    // An invoice-number rule is an explicit decision about who the work
+    // belongs to, so it beats everything else - including which customer
+    // QuickBooks has the invoice written against.
+    const rule = matchInvoiceRule(inv);
+    if(rule){
+      const name = rule.operator;
+      if(!groups[name]) groups[name] = { total:0, count:0, viaVendor:0, direct:0, byRule:0, vendors:{}, prefixes:{} };
+      groups[name].total += inv.amount || 0;
+      groups[name].count++;
+      groups[name].byRule += inv.amount || 0;
+      groups[name].prefixes[rule.prefix] = true;
+      if(isPassThrough) groups[name].vendors[parent] = true;
+      return;
+    }
+
     if(isPassThrough){
-      vendorTotal += inv.amount || 0;
       const match = attributeInvoice(inv, lookup);
       if(!match){
         unattributed.total += inv.amount || 0;
@@ -2839,7 +2944,7 @@ function renderRevenueByCustomer(){
         return;
       }
       const name = match.operator;
-      if(!groups[name]) groups[name] = { total:0, count:0, viaVendor:0, direct:0, vendors:{} };
+      if(!groups[name]) groups[name] = { total:0, count:0, viaVendor:0, direct:0, byRule:0, vendors:{}, prefixes:{} };
       groups[name].total += inv.amount || 0;
       groups[name].count++;
       groups[name].viaVendor += inv.amount || 0;
@@ -2848,7 +2953,7 @@ function renderRevenueByCustomer(){
       // Group direct customers by parent too, so a customer with jobs under
       // it lands on one line instead of scattering into one row per job.
       const key = parent || billedTo;
-      if(!groups[key]) groups[key] = { total:0, count:0, viaVendor:0, direct:0, vendors:{} };
+      if(!groups[key]) groups[key] = { total:0, count:0, viaVendor:0, direct:0, byRule:0, vendors:{}, prefixes:{} };
       groups[key].total += inv.amount || 0;
       groups[key].count++;
       groups[key].direct += inv.amount || 0;
@@ -2863,12 +2968,14 @@ function renderRevenueByCustomer(){
   entries.forEach(([name, g])=>{
     const barWidth = maxTotal > 0 ? Math.min(100, Math.round((g.total / maxTotal) * 100)) : 0;
     const vendorNames = Object.keys(g.vendors);
-    let tag = '';
-    if(g.viaVendor > 0 && g.direct > 0){
-      tag = `<div style="font-size:11px; color:#5B6660; margin-top:2px;">${fmtMoney(g.direct)} direct &middot; ${fmtMoney(g.viaVendor)} via ${escHtml(vendorNames.join(', '))}</div>`;
-    } else if(g.viaVendor > 0){
-      tag = `<div style="font-size:11px; color:#5B6660; margin-top:2px;">via ${escHtml(vendorNames.join(', '))}</div>`;
-    }
+    const prefixNames = Object.keys(g.prefixes||{});
+    const bits = [];
+    if(g.byRule > 0) bits.push(`${fmtMoney(g.byRule)} by invoice # (${escHtml(prefixNames.join(', '))})`);
+    if(g.viaVendor > 0) bits.push(`${fmtMoney(g.viaVendor)} via ${escHtml(vendorNames.join(', '))}`);
+    if(g.direct > 0 && bits.length) bits.push(`${fmtMoney(g.direct)} direct`);
+    const tag = bits.length
+      ? `<div style="font-size:11px; color:#5B6660; margin-top:2px;">${bits.join(' &middot; ')}</div>`
+      : '';
     // Any row that came straight from QuickBooks (rather than being derived
     // by splitting a vendor) can itself be marked as a pass-through vendor.
     // This is how you tell the app the real spelling of a vendor name
@@ -2940,6 +3047,36 @@ function renderRevenueByCustomer(){
   // Shows which names are currently being treated as pass-through vendors,
   // and gives a way back out. Without this, marking a customer by mistake
   // would make its row vanish with no obvious way to undo it.
+  // Editable invoice-number rules. Kept collapsed by default so the section
+  // stays a report rather than a settings screen, but one click away because
+  // these are the rules doing most of the attribution work.
+  const rules = getInvoiceRules();
+  const operatorOptions = knownOperatorNames();
+  let rulesPanel = '';
+  if(showInvoiceRules){
+    let ruleRows = '';
+    rules.forEach((r,i)=>{
+      const opts = operatorOptions.map(n=>`<option value="${escAttr(n)}"${normalizeForMatch(n)===normalizeForMatch(r.operator)?' selected':''}>${escHtml(n)}</option>`).join('');
+      const missing = r.operator && !operatorOptions.some(n=>normalizeForMatch(n)===normalizeForMatch(r.operator));
+      ruleRows += `<div style="display:flex; align-items:center; gap:8px; padding:6px 0; flex-wrap:wrap;">
+        <span style="font-size:11px; color:#5B6660;">Invoice # starts with</span>
+        <input data-rule-prefix="${i}" value="${escAttr(r.prefix||'')}" style="width:80px; padding:4px 6px; border:1px solid #D6E2D6; border-radius:4px; font-size:12px; text-transform:uppercase; font-family:inherit;">
+        <span style="font-size:11px; color:#5B6660;">&rarr;</span>
+        <select data-rule-operator="${i}" style="padding:4px 6px; border:1px solid #D6E2D6; border-radius:4px; font-size:12px; font-family:inherit;">
+          ${missing?`<option value="${escAttr(r.operator)}" selected>${escHtml(r.operator)} (not in tracker)</option>`:''}
+          ${opts}
+        </select>
+        <button data-rule-remove="${i}" title="Remove this rule" style="background:none; border:none; color:#B5432A; cursor:pointer; font-size:14px; padding:0 4px; font-family:inherit;">&times;</button>
+      </div>`;
+    });
+    if(!rules.length) ruleRows = `<div style="font-size:12px; color:#5B6660; padding:6px 0;">No rules yet.</div>`;
+    rulesPanel = `<div style="background:#F7FAF7; border:1px solid #D6E2D6; border-radius:6px; padding:10px 12px; margin-top:10px;">
+      ${ruleRows}
+      <button id="add-invoice-rule" class="ghost-btn" style="font-size:12px; margin-top:6px;">Add rule</button>
+      <div style="font-size:11px; color:#5B6660; margin-top:8px;">Matched against the start of the QuickBooks invoice number, ignoring case. Checked before rig and pad names, and before which customer the invoice is written to.</div>
+    </div>`;
+  }
+
   const activeVendors = getPassThroughList();
   const vendorChips = activeVendors.length ? `
     <div style="margin-top:12px; padding-top:10px; border-top:1px solid #E8EDE8; font-size:11px; color:#5B6660;">
@@ -2959,6 +3096,11 @@ function renderRevenueByCustomer(){
         <div>Operator</div><div style="text-align:center;">Inv</div><div style="text-align:right;">Revenue</div>
       </div>
       ${rows}
+      <div style="margin-top:12px; padding-top:10px; border-top:1px solid #E8EDE8; font-size:11px; color:#5B6660;">
+        ${rules.length} invoice number rule${rules.length!==1?'s':''} active
+        <button id="toggle-invoice-rules" style="background:none; border:none; padding:0 0 0 4px; color:#2E7D32; font-size:11px; text-decoration:underline; cursor:pointer; font-family:inherit;">${showInvoiceRules?'hide':'edit'}</button>
+      </div>
+      ${rulesPanel}
       ${vendorChips}
       <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; margin-top:12px; flex-wrap:wrap;">
         <div style="font-size:11px; color:#5B6660;">
@@ -3516,6 +3658,43 @@ function attachHandlers(){
       passThroughCustomers = getPassThroughList().filter(v=>normalizeForMatch(v) !== normalizeForMatch(name));
       savePassThroughCustomers();
       render();
+    };
+  });
+
+  const toggleRulesBtn = document.getElementById('toggle-invoice-rules');
+  if(toggleRulesBtn) toggleRulesBtn.onclick = ()=>{
+    showInvoiceRules = !showInvoiceRules;
+    render();
+  };
+
+  const addRuleBtn = document.getElementById('add-invoice-rule');
+  if(addRuleBtn) addRuleBtn.onclick = ()=>{
+    getInvoiceRules().push({ prefix:'', operator: (knownOperatorNames()[0] || '') });
+    saveInvoiceRules();
+    render();
+  };
+
+  document.querySelectorAll('[data-rule-prefix]').forEach(inp=>{
+    inp.onchange = ()=>{
+      const i = Number(inp.dataset.rulePrefix);
+      const list = getInvoiceRules();
+      if(list[i]){ list[i].prefix = inp.value.trim().toUpperCase(); saveInvoiceRules(); render(); }
+    };
+  });
+
+  document.querySelectorAll('[data-rule-operator]').forEach(sel=>{
+    sel.onchange = ()=>{
+      const i = Number(sel.dataset.ruleOperator);
+      const list = getInvoiceRules();
+      if(list[i]){ list[i].operator = sel.value; saveInvoiceRules(); render(); }
+    };
+  });
+
+  document.querySelectorAll('[data-rule-remove]').forEach(btn=>{
+    btn.onclick = ()=>{
+      const i = Number(btn.dataset.ruleRemove);
+      const list = getInvoiceRules();
+      if(i >= 0 && i < list.length){ list.splice(i,1); saveInvoiceRules(); render(); }
     };
   });
 
