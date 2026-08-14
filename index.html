@@ -1879,6 +1879,7 @@ function renderDashboard(){
 
   return `
     <h2 class="section-title">Dashboard</h2>
+    ${renderActionAlerts()}
     <div class="summary-cards" style="grid-template-columns:repeat(3,1fr);">
       <div class="summary-card"><div class="num">${outTickets.length}</div><div class="lbl">Jobs Out</div></div>
       <div class="summary-card"><div class="num">${totalOutItems}</div><div class="lbl">Items Out</div></div>
@@ -1889,6 +1890,89 @@ function renderDashboard(){
     <h2 class="section-title">Current Jobs, By Operator</h2>
     ${jobGroups}
   `;
+}
+
+function renderActionAlerts(){
+  const outTickets = tickets.filter(t=>!t.returnDate);
+  const alerts = [];
+
+  outTickets.forEach(t=>{
+    if(!Array.isArray(t.pads) || t.pads.length === 0) return;
+    const pad = getActivePad(t);
+    if(!pad) return;
+    const billed = Array.isArray(pad.billedWells) ? pad.billedWells.length : 0;
+    const total = pad.totalWells || 0;
+    const complete = billed >= total && total > 0;
+    const daysSince = daysSinceLastBilled(pad);
+    const padStartDays = daysBetween(pad.startDate, todayStr());
+
+    if(complete){
+      alerts.push({
+        type: 'move',
+        rig: t.rig || 'Unassigned',
+        customer: t.customer || '—',
+        pad: pad.name,
+        billed, total,
+        message: 'All wells billed — rig move needed',
+        ticketId: t.id
+      });
+    } else if(billed > 0 && daysSince !== null && daysSince > 21){
+      alerts.push({
+        type: 'billing',
+        rig: t.rig || 'Unassigned',
+        customer: t.customer || '—',
+        pad: pad.name,
+        billed, total,
+        message: `Last billed ${daysSince} days ago`,
+        ticketId: t.id
+      });
+    }
+  });
+
+  if(alerts.length === 0) return '';
+
+  const moveAlerts = alerts.filter(a=>a.type==='move');
+  const billingAlerts = alerts.filter(a=>a.type==='billing');
+
+  let html = '<div style="margin-bottom:16px;">';
+
+  if(moveAlerts.length > 0){
+    html += `<div style="background:#FCEBEA; border:1.5px solid #E8A5A0; border-radius:8px; padding:14px 18px; margin-bottom:10px;">`;
+    html += `<div style="display:flex; align-items:center; gap:8px; margin-bottom:10px;">`;
+    html += `<span style="font-size:18px;">⚠</span>`;
+    html += `<span style="font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; font-size:13px; color:#B5432A; font-weight:600;">Rig move needed · ${moveAlerts.length} rig${moveAlerts.length!==1?'s':''}</span>`;
+    html += `</div>`;
+    moveAlerts.forEach(a=>{
+      html += `<div style="display:flex; justify-content:space-between; align-items:center; padding:8px 0; border-top:1px solid #E8A5A0; cursor:pointer;" data-goto-rig="${escAttr(a.rig)}">`;
+      html += `<div>`;
+      html += `<div style="font-weight:600; font-size:14px; color:#7A1F1F;">${escHtml(a.rig)}</div>`;
+      html += `<div style="font-size:12px; color:#B5432A;">${escHtml(a.customer)} · ${escHtml(a.pad)} · ${a.billed}/${a.total} billed</div>`;
+      html += `</div>`;
+      html += `<button class="ghost-btn" data-rig-move="${a.ticketId}" style="font-size:11px; padding:6px 12px; border-color:#B5432A; color:#B5432A;">Rig Move</button>`;
+      html += `</div>`;
+    });
+    html += `</div>`;
+  }
+
+  if(billingAlerts.length > 0){
+    html += `<div style="background:#FFF8E6; border:1.5px solid #E6D080; border-radius:8px; padding:14px 18px; margin-bottom:10px;">`;
+    html += `<div style="display:flex; align-items:center; gap:8px; margin-bottom:10px;">`;
+    html += `<span style="font-size:18px;">⚠</span>`;
+    html += `<span style="font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; font-size:13px; color:#8A6D10; font-weight:600;">Billing attention · ${billingAlerts.length} rig${billingAlerts.length!==1?'s':''}</span>`;
+    html += `</div>`;
+    billingAlerts.forEach(a=>{
+      html += `<div style="display:flex; justify-content:space-between; align-items:center; padding:8px 0; border-top:1px solid #E6D080;">`;
+      html += `<div>`;
+      html += `<div style="font-weight:600; font-size:14px; color:#5C4A08;">${escHtml(a.rig)}</div>`;
+      html += `<div style="font-size:12px; color:#8A6D10;">${escHtml(a.customer)} · ${escHtml(a.pad)} · ${a.billed}/${a.total} billed · ${a.message}</div>`;
+      html += `</div>`;
+      html += `</div>`;
+    });
+    html += `</div>`;
+  }
+
+  html += '</div>';
+  return html;
 }
 
 function renderQuickBooksARSection(){
@@ -3056,6 +3140,13 @@ function attachHandlers(){
   }
 
   if(currentTab === 'dashboard'){
+    document.querySelectorAll('[data-goto-rig]').forEach(row=>{
+      row.onclick = ()=>{
+        rigSearchTerm = row.dataset.gotoRig;
+        currentTab = 'byrig';
+        render();
+      };
+    });
     document.querySelectorAll('[data-goto-ticket]').forEach(row=>{
       row.onclick = ()=>{
         const t = tickets.find(x=>x.id===row.dataset.gotoTicket);
