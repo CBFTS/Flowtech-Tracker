@@ -1732,6 +1732,7 @@ function render(){
         <button data-tab="tickets" class="${currentTab==='tickets'?'active':''}"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="2.5" width="14" height="15" rx="1.5"/><line x1="6" y1="6.5" x2="14" y2="6.5"/><line x1="6" y1="10" x2="14" y2="10"/><line x1="6" y1="13.5" x2="11" y2="13.5"/></svg>Tickets</button>
         <button data-tab="byrig" class="${currentTab==='byrig'?'active':''}"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M10 17.5s6-5.6 6-10A6 6 0 1 0 4 7.5c0 4.4 6 10 6 10Z"/><circle cx="10" cy="7.5" r="2"/></svg>Rig Tracker</button>
         <button data-tab="inventory" class="${currentTab==='inventory'?'active':''}"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2.5 6.5 10 2.5l7.5 4v7l-7.5 4-7.5-4Z"/><path d="M2.5 6.5 10 10.5l7.5-4"/><line x1="10" y1="10.5" x2="10" y2="17.5"/></svg>Inventory Out</button>
+        <button data-tab="reports" class="${currentTab==='reports'?'active':''}"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 17V6l4-3h6l4 3v11"/><line x1="7" y1="9" x2="7" y2="15"/><line x1="10" y1="7" x2="10" y2="15"/><line x1="13" y1="11" x2="13" y2="15"/></svg>Reports</button>
         <button id="toggle-sync-panel" style="margin-left:auto;">${syncUrl?syncStatusLabel():'Cloud Sync: Off'}</button>
       </nav>
     </header>
@@ -1743,6 +1744,7 @@ function render(){
   else if(currentTab === 'tickets') html += renderTicketsList();
   else if(currentTab === 'byrig') html += renderByRig();
   else if(currentTab === 'inventory') html += renderInventory();
+  else if(currentTab === 'reports') html += renderReports();
 
   html += `</main>
     <nav class="mobile-bottom-nav">
@@ -1751,6 +1753,7 @@ function render(){
       <button data-tab="tickets" class="${currentTab==='tickets'?'active':''}"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="2.5" width="14" height="15" rx="1.5"/><line x1="6" y1="6.5" x2="14" y2="6.5"/><line x1="6" y1="10" x2="14" y2="10"/><line x1="6" y1="13.5" x2="11" y2="13.5"/></svg><span>Tickets</span></button>
       <button data-tab="byrig" class="${currentTab==='byrig'?'active':''}"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M10 17.5s6-5.6 6-10A6 6 0 1 0 4 7.5c0 4.4 6 10 6 10Z"/><circle cx="10" cy="7.5" r="2"/></svg><span>Rigs</span></button>
       <button data-tab="inventory" class="${currentTab==='inventory'?'active':''}"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2.5 6.5 10 2.5l7.5 4v7l-7.5 4-7.5-4Z"/><path d="M2.5 6.5 10 10.5l7.5-4"/><line x1="10" y1="10.5" x2="10" y2="17.5"/></svg><span>Inventory</span></button>
+      <button data-tab="reports" class="${currentTab==='reports'?'active':''}"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 17V6l4-3h6l4 3v11"/><line x1="7" y1="9" x2="7" y2="15"/><line x1="10" y1="7" x2="10" y2="15"/><line x1="13" y1="11" x2="13" y2="15"/></svg><span>Reports</span></button>
     </nav>
   </div>`;
   app.innerHTML = html;
@@ -2650,6 +2653,220 @@ function renderInventory(){
     </div>
     <h2 class="section-title">Inventory Currently Out, By Equipment</h2>
     ${noMatches ? `<p style="font-size:13px; color:var(--ink-soft);">No equipment matches "${escHtml(inventorySearchTerm)}".</p>` : groups}
+  `;
+}
+
+function renderReports(){
+  const now = new Date();
+  const thisMonth = now.getFullYear() + '-' + String(now.getMonth()+1).padStart(2,'0');
+  const thisYear = now.getFullYear();
+  const thisQuarterStart = new Date(thisYear, Math.floor(now.getMonth()/3)*3, 1);
+  const thisQuarterLabel = 'Q' + (Math.floor(now.getMonth()/3)+1) + ' ' + thisYear;
+
+  // Collect all wells billed across all tickets
+  const allWells = [];
+  const allPads = [];
+  const customerStats = {};
+  const rigStats = {};
+
+  tickets.forEach(t=>{
+    if(!Array.isArray(t.pads)) return;
+    t.pads.forEach(pad=>{
+      const billed = Array.isArray(pad.billedWells) ? pad.billedWells : [];
+      const padDays = pad.completedDate && pad.startDate ? daysBetween(pad.startDate, pad.completedDate) : (pad.startDate ? daysBetween(pad.startDate, todayStr()) : 0);
+      
+      allPads.push({
+        customer: t.customer || 'Unknown',
+        rig: t.rig || 'Unknown',
+        name: pad.name || '—',
+        totalWells: pad.totalWells || 0,
+        billedCount: billed.length,
+        status: pad.status || 'active',
+        startDate: pad.startDate || '',
+        completedDate: pad.completedDate || '',
+        days: padDays
+      });
+
+      billed.forEach(w=>{
+        allWells.push({
+          date: w.date || '',
+          label: w.label || '',
+          customer: t.customer || 'Unknown',
+          rig: t.rig || 'Unknown',
+          pad: pad.name || '—'
+        });
+      });
+
+      // Customer stats
+      const cust = t.customer || 'Unknown';
+      if(!customerStats[cust]) customerStats[cust] = { wells: 0, pads: 0, totalDays: 0, completedPads: 0, activeRigs: new Set() };
+      customerStats[cust].wells += billed.length;
+      customerStats[cust].pads++;
+      if(!t.returnDate) customerStats[cust].activeRigs.add(t.rig);
+      if(pad.status === 'complete' && padDays > 0){
+        customerStats[cust].totalDays += padDays;
+        customerStats[cust].completedPads++;
+      }
+
+      // Rig stats
+      const rig = t.rig || 'Unknown';
+      if(!rigStats[rig]) rigStats[rig] = { wells: 0, pads: 0, totalDays: 0, completedPads: 0, customer: cust };
+      rigStats[rig].wells += billed.length;
+      rigStats[rig].pads++;
+      rigStats[rig].customer = cust;
+      if(pad.status === 'complete' && padDays > 0){
+        rigStats[rig].totalDays += padDays;
+        rigStats[rig].completedPads++;
+      }
+    });
+  });
+
+  // Summary numbers
+  const wellsThisMonth = allWells.filter(w=>w.date && w.date.startsWith(thisMonth)).length;
+  const wellsThisQuarter = allWells.filter(w=>{
+    if(!w.date) return false;
+    const d = new Date(w.date + 'T00:00:00');
+    return d >= thisQuarterStart && d <= now;
+  }).length;
+  const wellsAllTime = allWells.length;
+  const completedPads = allPads.filter(p=>p.status==='complete');
+  const avgDaysOnPad = completedPads.length > 0 ? Math.round(completedPads.reduce((s,p)=>s+p.days,0) / completedPads.length) : '—';
+  const activeRigCount = tickets.filter(t=>!t.returnDate).length;
+
+  // Wells billed by month
+  const monthMap = {};
+  allWells.forEach(w=>{
+    if(!w.date) return;
+    const m = w.date.substring(0,7);
+    monthMap[m] = (monthMap[m]||0) + 1;
+  });
+  const months = Object.keys(monthMap).sort();
+  const monthNames = {
+    '01':'Jan','02':'Feb','03':'Mar','04':'Apr','05':'May','06':'Jun',
+    '07':'Jul','08':'Aug','09':'Sep','10':'Oct','11':'Nov','12':'Dec'
+  };
+
+  let monthTableRows = '';
+  if(months.length > 0){
+    months.forEach(m=>{
+      const parts = m.split('-');
+      const label = monthNames[parts[1]] + ' ' + parts[0];
+      const count = monthMap[m];
+      const barWidth = Math.min(100, Math.round((count / Math.max(...Object.values(monthMap))) * 100));
+      monthTableRows += `<div style="display:flex; align-items:center; gap:12px; padding:8px 0; border-bottom:1px solid #E8EDE8;">
+        <div style="width:90px; font-size:13px; color:#5B6660;">${label}</div>
+        <div style="flex:1; background:#E8EDE8; border-radius:4px; height:20px; overflow:hidden;">
+          <div style="height:100%; width:${barWidth}%; background:#33D63A; border-radius:4px; min-width:2px;"></div>
+        </div>
+        <div style="width:30px; text-align:right; font-weight:600; font-size:14px;">${count}</div>
+      </div>`;
+    });
+  } else {
+    monthTableRows = '<div style="padding:16px 0; color:#5B6660; font-size:13px;">No wells billed yet. Data will appear as you bill wells on the Rig Tracker tab.</div>';
+  }
+
+  // Customer breakdown table
+  const custEntries = Object.entries(customerStats).sort((a,b)=>b[1].wells - a[1].wells);
+  let custTableRows = '';
+  custEntries.forEach(([name, stats])=>{
+    const avgDays = stats.completedPads > 0 ? Math.round(stats.totalDays / stats.completedPads) : '—';
+    custTableRows += `<div style="display:grid; grid-template-columns:1fr 60px 60px 70px 70px; gap:8px; padding:10px 0; border-bottom:1px solid #E8EDE8; font-size:13px; align-items:center;">
+      <div style="font-weight:600;">${escHtml(name)}</div>
+      <div style="text-align:center;">${stats.activeRigs.size}</div>
+      <div style="text-align:center;">${stats.wells}</div>
+      <div style="text-align:center;">${stats.pads}</div>
+      <div style="text-align:center;">${avgDays}${avgDays!=='—'?' d':''}</div>
+    </div>`;
+  });
+
+  // Rig efficiency table
+  const rigEntries = Object.entries(rigStats).sort((a,b)=>b[1].wells - a[1].wells);
+  let rigTableRows = '';
+  rigEntries.forEach(([name, stats])=>{
+    const avgDays = stats.completedPads > 0 ? Math.round(stats.totalDays / stats.completedPads) : '—';
+    rigTableRows += `<div style="display:grid; grid-template-columns:1fr 1fr 60px 60px 70px; gap:8px; padding:10px 0; border-bottom:1px solid #E8EDE8; font-size:13px; align-items:center;">
+      <div style="font-weight:600;">${escHtml(name)}</div>
+      <div style="color:#5B6660;">${escHtml(stats.customer)}</div>
+      <div style="text-align:center;">${stats.wells}</div>
+      <div style="text-align:center;">${stats.pads}</div>
+      <div style="text-align:center;">${avgDays}${avgDays!=='—'?' d':''}</div>
+    </div>`;
+  });
+
+  // Pad history (completed pads first, then active)
+  const sortedPads = [...allPads].sort((a,b)=>{
+    if(a.status==='complete' && b.status!=='complete') return -1;
+    if(a.status!=='complete' && b.status==='complete') return 1;
+    return (b.completedDate||b.startDate||'').localeCompare(a.completedDate||a.startDate||'');
+  });
+
+  let padHistoryRows = '';
+  sortedPads.forEach(p=>{
+    const isComplete = p.status === 'complete';
+    const statusBadge = isComplete 
+      ? `<span style="background:#D4EDDA; color:#155724; font-size:11px; padding:2px 8px; border-radius:4px;">Complete</span>`
+      : `<span style="background:#FFF3CD; color:#856404; font-size:11px; padding:2px 8px; border-radius:4px;">Active</span>`;
+    padHistoryRows += `<div style="display:grid; grid-template-columns:1fr 1fr 1fr 60px 60px 50px; gap:8px; padding:10px 0; border-bottom:1px solid #E8EDE8; font-size:13px; align-items:center;">
+      <div style="font-weight:600;">${escHtml(p.customer)}</div>
+      <div>${escHtml(p.rig)}</div>
+      <div>${escHtml(p.name)}</div>
+      <div style="text-align:center;">${p.billedCount}/${p.totalWells}</div>
+      <div style="text-align:center;">${p.days > 0 ? p.days + 'd' : '—'}</div>
+      <div style="text-align:center;">${statusBadge}</div>
+    </div>`;
+  });
+
+  return `
+    <h2 class="section-title">Reports</h2>
+
+    <div class="summary-cards" style="grid-template-columns:repeat(4,1fr);">
+      <div class="summary-card"><div class="num">${wellsThisMonth}</div><div class="lbl">Wells This Month</div></div>
+      <div class="summary-card"><div class="num">${wellsThisQuarter}</div><div class="lbl">Wells ${thisQuarterLabel}</div></div>
+      <div class="summary-card"><div class="num">${wellsAllTime}</div><div class="lbl">Wells All Time</div></div>
+      <div class="summary-card"><div class="num">${avgDaysOnPad}</div><div class="lbl">Avg Days on Pad</div></div>
+    </div>
+
+    <h2 class="section-title">Wells Billed by Month</h2>
+    <div style="background:#fff; border:1.5px solid #E8EDE8; border-radius:8px; padding:16px;">
+      ${monthTableRows}
+    </div>
+
+    <h2 class="section-title" style="margin-top:24px;">Customer Breakdown</h2>
+    <div style="background:#fff; border:1.5px solid #E8EDE8; border-radius:8px; padding:16px;">
+      <div style="display:grid; grid-template-columns:1fr 60px 60px 70px 70px; gap:8px; padding:0 0 8px 0; border-bottom:2px solid #14181A; font-size:11px; color:#5B6660; text-transform:uppercase; letter-spacing:0.5px;">
+        <div>Customer</div>
+        <div style="text-align:center;">Rigs</div>
+        <div style="text-align:center;">Wells</div>
+        <div style="text-align:center;">Pads</div>
+        <div style="text-align:center;">Avg Days</div>
+      </div>
+      ${custTableRows || '<div style="padding:16px 0; color:#5B6660; font-size:13px;">No data yet.</div>'}
+    </div>
+
+    <h2 class="section-title" style="margin-top:24px;">Rig Efficiency</h2>
+    <div style="background:#fff; border:1.5px solid #E8EDE8; border-radius:8px; padding:16px;">
+      <div style="display:grid; grid-template-columns:1fr 1fr 60px 60px 70px; gap:8px; padding:0 0 8px 0; border-bottom:2px solid #14181A; font-size:11px; color:#5B6660; text-transform:uppercase; letter-spacing:0.5px;">
+        <div>Rig</div>
+        <div>Customer</div>
+        <div style="text-align:center;">Wells</div>
+        <div style="text-align:center;">Pads</div>
+        <div style="text-align:center;">Avg Days</div>
+      </div>
+      ${rigTableRows || '<div style="padding:16px 0; color:#5B6660; font-size:13px;">No data yet.</div>'}
+    </div>
+
+    <h2 class="section-title" style="margin-top:24px;">Pad History</h2>
+    <div style="background:#fff; border:1.5px solid #E8EDE8; border-radius:8px; padding:16px;">
+      <div style="display:grid; grid-template-columns:1fr 1fr 1fr 60px 60px 50px; gap:8px; padding:0 0 8px 0; border-bottom:2px solid #14181A; font-size:11px; color:#5B6660; text-transform:uppercase; letter-spacing:0.5px;">
+        <div>Customer</div>
+        <div>Rig</div>
+        <div>Pad</div>
+        <div style="text-align:center;">Wells</div>
+        <div style="text-align:center;">Days</div>
+        <div style="text-align:center;">Status</div>
+      </div>
+      ${padHistoryRows || '<div style="padding:16px 0; color:#5B6660; font-size:13px;">No pad data yet.</div>'}
+    </div>
   `;
 }
 
