@@ -756,6 +756,7 @@ let qbRevenueData = null; // { connected, startDate, totalRevenue, invoiceCount,
 let qbRevenueLoading = false; // guards against firing a second fetch while one is already in flight
 let showUnattributedDetail = false; // expands the diagnostic list under the Unattributed row on Reports
 let showInvoiceRules = false; // expands the invoice-number rules editor on Reports
+let showPadHistory = false; // Pad History table on Reports starts collapsed - it grows without bound
 
 // QuickBooks customers that are really pass-through vendors - the invoice is
 // written to them, but the work was done for somebody else. Revenue billed
@@ -3314,8 +3315,11 @@ function renderReports(){
       ${rigTableRows || '<div style="padding:16px 0; color:#5B6660; font-size:13px;">No data yet.</div>'}
     </div>
 
-    <h2 class="section-title" style="margin-top:24px;">Pad History</h2>
-    <div style="background:#fff; border:1.5px solid #E8EDE8; border-radius:8px; padding:16px;">
+    <h2 class="section-title" style="margin-top:24px; display:flex; align-items:center; justify-content:space-between; gap:10px;">
+      <span>Pad History</span>
+      <button id="toggle-pad-history" style="background:none; border:none; padding:0; color:#2E7D32; font-size:12px; text-transform:none; letter-spacing:0; text-decoration:underline; cursor:pointer; font-family:inherit;">${showPadHistory?'hide':`show ${sortedPads.length} pad${sortedPads.length!==1?'s':''}`}</button>
+    </h2>
+    ${showPadHistory ? `<div style="background:#fff; border:1.5px solid #E8EDE8; border-radius:8px; padding:16px;">
       <div style="display:grid; grid-template-columns:1fr 1fr 1fr 60px 60px 50px; gap:8px; padding:0 0 8px 0; border-bottom:2px solid #14181A; font-size:11px; color:#5B6660; text-transform:uppercase; letter-spacing:0.5px;">
         <div>Customer</div>
         <div>Rig</div>
@@ -3325,7 +3329,7 @@ function renderReports(){
         <div style="text-align:center;">Status</div>
       </div>
       ${padHistoryRows || '<div style="padding:16px 0; color:#5B6660; font-size:13px;">No pad data yet.</div>'}
-    </div>
+    </div>` : ''}
   `;
 }
 
@@ -3660,6 +3664,12 @@ function attachHandlers(){
       render();
     };
   });
+
+  const togglePadHistBtn = document.getElementById('toggle-pad-history');
+  if(togglePadHistBtn) togglePadHistBtn.onclick = ()=>{
+    showPadHistory = !showPadHistory;
+    render();
+  };
 
   const toggleRulesBtn = document.getElementById('toggle-invoice-rules');
   if(toggleRulesBtn) toggleRulesBtn.onclick = ()=>{
