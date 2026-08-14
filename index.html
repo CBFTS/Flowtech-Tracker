@@ -768,18 +768,37 @@ let showPadHistory = false; // Pad History table on Reports starts collapsed - i
 // customer row on the Reports tab has a "split by operator" button, and
 // clicking it stores that exact name here. The list below is only the
 // starting default for a device that has never set one.
+// These now live in appSettings rather than a standalone localStorage key,
+// so they travel with cloud sync. Before, each device kept its own list -
+// which meant the same QuickBooks data produced a different Revenue by
+// Customer breakdown on each phone, and a much larger Unattributed bucket
+// on whichever device hadn't been set up. The old key is still read once,
+// so a device that already had a list keeps it.
 const DEFAULT_PASS_THROUGH = ['West Texas Premix Pits'];
-const PASS_THROUGH_KEY = 'flowtech_equipment_tracker_passthrough';
-let passThroughCustomers = null; // lazily loaded from localStorage
+const PASS_THROUGH_KEY = 'flowtech_equipment_tracker_passthrough'; // legacy - migration only
+let passThroughCustomers = null; // resolved once per session from appSettings
 
 function loadPassThroughCustomers(){
+  // Synced value wins.
+  if(Array.isArray(appSettings.passThroughCustomers)){
+    passThroughCustomers = appSettings.passThroughCustomers.slice();
+    return;
+  }
+  // One-time migration off the old per-device key.
   try{
     const raw = localStorage.getItem(PASS_THROUGH_KEY);
-    passThroughCustomers = raw ? JSON.parse(raw) : DEFAULT_PASS_THROUGH.slice();
-  }catch(e){
-    passThroughCustomers = DEFAULT_PASS_THROUGH.slice();
-  }
-  if(!Array.isArray(passThroughCustomers)) passThroughCustomers = DEFAULT_PASS_THROUGH.slice();
+    const stored = raw ? JSON.parse(raw) : null;
+    if(Array.isArray(stored)){
+      passThroughCustomers = stored;
+      appSettings.passThroughCustomers = stored.slice();
+      saveAppSettings(); // pushes it up so the other device gets it too
+      return;
+    }
+  }catch(e){ /* fall through to defaults */ }
+  // Never set anywhere. Use the default in memory but DON'T persist it -
+  // otherwise a fresh device would push a bare default over a real list
+  // that the other device had already configured.
+  passThroughCustomers = DEFAULT_PASS_THROUGH.slice();
 }
 
 function getPassThroughList(){
@@ -788,9 +807,8 @@ function getPassThroughList(){
 }
 
 function savePassThroughCustomers(){
-  try{
-    localStorage.setItem(PASS_THROUGH_KEY, JSON.stringify(getPassThroughList()));
-  }catch(e){ showStorageWarning('vendor billing settings', e); }
+  appSettings.passThroughCustomers = getPassThroughList().slice();
+  saveAppSettings();
 }
 
 // Invoice-number rules. The most reliable signal for who an invoice belongs
@@ -836,6 +854,13 @@ function bestOperatorMatch(needle){
 }
 
 function loadInvoiceRules(){
+  // Synced value wins - a rule set up on one device shows up on the other.
+  if(Array.isArray(appSettings.invoiceRules)){
+    invoiceRules = appSettings.invoiceRules.map(r=>({ prefix:r.prefix, operator:r.operator }));
+    return;
+  }
+
+  // One-time migration off the old per-device key.
   let stored = null;
   try{
     const raw = localStorage.getItem(INVOICE_RULES_KEY);
@@ -844,14 +869,19 @@ function loadInvoiceRules(){
 
   if(Array.isArray(stored)){
     invoiceRules = stored;
-  } else {
-    // First run on this device - seed the defaults, snapping each one to the
-    // customer name already in the tracker.
-    invoiceRules = DEFAULT_INVOICE_RULES.map(r=>({
-      prefix: r.prefix,
-      operator: bestOperatorMatch(r.operator)
-    }));
+    appSettings.invoiceRules = stored.map(r=>({ prefix:r.prefix, operator:r.operator }));
+    saveAppSettings(); // pushes it up so the other device gets it too
+    return;
   }
+
+  // Never set anywhere. Seed the defaults in memory, snapped to the customer
+  // name already in the tracker - but DON'T persist them. Writing seeds here
+  // would let a fresh device push starter rules over a real set the other
+  // device had already tuned.
+  invoiceRules = DEFAULT_INVOICE_RULES.map(r=>({
+    prefix: r.prefix,
+    operator: bestOperatorMatch(r.operator)
+  }));
 }
 
 function getInvoiceRules(){
@@ -860,9 +890,8 @@ function getInvoiceRules(){
 }
 
 function saveInvoiceRules(){
-  try{
-    localStorage.setItem(INVOICE_RULES_KEY, JSON.stringify(getInvoiceRules()));
-  }catch(e){ showStorageWarning('invoice number rules', e); }
+  appSettings.invoiceRules = getInvoiceRules().map(r=>({ prefix:r.prefix, operator:r.operator }));
+  saveAppSettings();
 }
 
 // Longest matching prefix wins, so a narrow rule can override a broad one
@@ -1609,7 +1638,14 @@ async function pullFromCloud(silent){
     if(Array.isArray(data.archivedRigs)) archivedRigs = data.archivedRigs;
     if(Array.isArray(data.customerCatalog) && data.customerCatalog.length) customerCatalog = data.customerCatalog;
     if(Array.isArray(data.templateCatalog) && data.templateCatalog.length) templateCatalog = data.templateCatalog;
-    if(data.appSettings && typeof data.appSettings === 'object') appSettings = {...appSettings, ...data.appSettings};
+    if(data.appSettings && typeof data.appSettings === 'object'){
+      appSettings = {...appSettings, ...data.appSettings};
+      // Drop the resolved copies so the next read picks up whatever just
+      // came down from the other device instead of this session's cache.
+      passThroughCustomers = null;
+      invoiceRules = null;
+      qbRevenueData = null; // the breakdown depends on those rules - refetch
+    }
     localStorage.setItem(STORAGE_KEY, JSON.stringify(tickets));
     localStorage.setItem(CATALOG_KEY, JSON.stringify(equipmentCatalog));
     localStorage.setItem(EQUIPMENT_OWNED_KEY, JSON.stringify(equipmentOwned));
