@@ -931,6 +931,25 @@ function nowIso(){ return new Date().toISOString(); }
 let pendingDeletes = [];
 
 // ── PAD / WELL BILLING HELPERS ──────────────────────────────────────
+// Prompts that re-ask instead of accepting an empty box. A blank answer
+// used to be treated as a real one, which silently created pads with no
+// name and wells with a date and nothing else. Cancel still means cancel.
+function promptRequired(question, retryNote){
+  let v = prompt(question);
+  while(v !== null && !v.trim()){
+    v = prompt(retryNote + '\n\nEnter a value, or press Cancel to stop.');
+  }
+  return v === null ? null : v.trim();
+}
+function promptWellCount(){
+  let raw = prompt('How many wells on this pad?');
+  while(raw !== null){
+    const n = parseInt(raw, 10);
+    if(n > 0) return n;
+    raw = prompt('Enter the number of wells as a whole number greater than 0.\n\nOr press Cancel to stop.');
+  }
+  return null;
+}
 // Each ticket can carry a history of pads the iron has visited. The
 // active pad is where the equipment is right now; completed pads are
 // history. Each pad tracks total wells vs how many have been billed.
@@ -2696,8 +2715,11 @@ function renderByRig(){
       }
       if(billed > 0){
         padHtml += `<div style="margin-top:6px; font-size:12px; color:var(--ink-soft);">`;
-        activePad.billedWells.forEach(w=>{
-          padHtml += `<span style="display:inline-block; background:var(--paper-2); border-radius:3px; padding:2px 6px; margin:2px 4px 2px 0;">${fmtDate(w.date)}${w.label?' — '+escHtml(w.label):''}</span>`;
+        activePad.billedWells.forEach((w, wi)=>{
+          padHtml += `<span style="display:inline-flex; align-items:center; gap:5px; background:var(--paper-2); border-radius:3px; padding:2px 4px 2px 6px; margin:2px 4px 2px 0;">`;
+          padHtml += `${fmtDate(w.date)}${w.label?' — '+escHtml(w.label):''}`;
+          padHtml += `<button data-unbill-well="${primaryTicket.id}" data-well-index="${wi}" title="Remove this billed well" style="background:none; border:none; padding:0 2px; margin:0; cursor:pointer; color:var(--ink-soft); font-size:13px; line-height:1; font-family:inherit;">&times;</button>`;
+          padHtml += `</span>`;
         });
         padHtml += `</div>`;
       }
@@ -4539,10 +4561,32 @@ function attachHandlers(){
         if(!t) return;
         const pad = getActivePad(t);
         if(!pad) return;
-        const label = prompt('Well name or number (optional — press OK to skip):');
+        // A blank name used to be accepted, which quietly recorded a well with
+        // a date and nothing else - easy to do by tapping through, and the
+        // only way to undo it was hand-editing JSON in the Google Sheet.
+        // Now an empty box re-asks instead of counting. Cancel still bails.
+        const label = promptRequired('Well name or number:', 'A well name or number is required.');
         if(label === null) return;
         if(!Array.isArray(pad.billedWells)) pad.billedWells = [];
-        pad.billedWells.push({ date: todayStr(), label: (label||'').trim() });
+        pad.billedWells.push({ date: todayStr(), label: label });
+        t.updatedAt = nowIso();
+        await saveTickets();
+        render();
+      };
+    });
+
+    document.querySelectorAll('[data-unbill-well]').forEach(b=>{
+      b.onclick = async ()=>{
+        const t = tickets.find(x=>x.id===b.dataset.unbillWell);
+        if(!t) return;
+        const pad = getActivePad(t);
+        if(!pad || !Array.isArray(pad.billedWells)) return;
+        const i = parseInt(b.dataset.wellIndex, 10);
+        const w = pad.billedWells[i];
+        if(!w) return;
+        const desc = w.label ? `"${w.label}"` : `the entry dated ${fmtDate(w.date)}`;
+        if(!confirm(`Remove ${desc} from ${pad.name}?\n\nThis lowers the billed count for this pad.`)) return;
+        pad.billedWells.splice(i, 1);
         t.updatedAt = nowIso();
         await saveTickets();
         render();
@@ -4563,16 +4607,16 @@ function attachHandlers(){
         // Ask what's happening — new pad or coming home?
         const goingToNewPad = confirm('Is the iron going to a new pad?\n\nOK = Yes, moving to a new pad\nCancel = No');
         if(goingToNewPad){
-          const newName = prompt('New pad name:');
-          if(!newName || !newName.trim()) return; // cancelled — nothing happens
-          const newWells = parseInt(prompt('How many wells on this pad?'));
-          if(!newWells || newWells < 1) return; // cancelled — nothing happens
+          const newName = promptRequired('New pad name:', 'A pad name is required.');
+          if(newName === null) return; // cancelled — nothing happens
+          const newWells = promptWellCount();
+          if(newWells === null) return; // cancelled — nothing happens
           // Mark current pad complete now that we know they're committed
           if(pad){ pad.status = 'complete'; pad.completedDate = todayStr(); }
           if(!Array.isArray(t.pads)) t.pads = [];
           t.pads.push({
             id: 'p_' + Math.random().toString(36).slice(2,8),
-            name: newName.trim(),
+            name: newName,
             totalWells: newWells,
             billedWells: [],
             status: 'active',
@@ -4595,14 +4639,14 @@ function attachHandlers(){
       b.onclick = async ()=>{
         const t = tickets.find(x=>x.id===b.dataset.addPad);
         if(!t) return;
-        const name = prompt('Pad name:');
-        if(!name || !name.trim()) return;
-        const wells = parseInt(prompt('How many wells on this pad?'));
-        if(!wells || wells < 1) return;
+        const name = promptRequired('Pad name:', 'A pad name is required.');
+        if(name === null) return;
+        const wells = promptWellCount();
+        if(wells === null) return;
         if(!Array.isArray(t.pads)) t.pads = [];
         t.pads.push({
           id: 'p_' + Math.random().toString(36).slice(2,8),
-          name: name.trim(),
+          name: name,
           totalWells: wells,
           billedWells: [],
           status: 'active',
