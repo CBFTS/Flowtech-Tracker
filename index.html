@@ -1269,6 +1269,196 @@ function renderCountScreen(){
   `;
 }
 
+/* ── ON-HAND CHECK WHILE BUILDING A TICKET ─────────────────────────
+   Warns the moment more of something goes on a ticket than is left on
+   the ground - not after saving, when the load is already promised.
+
+   On hand = what you own, minus what's already out on OTHER open
+   tickets. A ticket being edited never counts against itself, or
+   opening a saved ticket would flag every line on it.
+
+   Deliberately a warning, not a block. Sometimes you know a load is
+   coming back Thursday and you're committing it anyway - that's your
+   call, not the app's.
+*/
+function availableOnHand(name, excludeTicketId){
+  const owned = equipmentOwned[name];
+  if(owned == null || owned === '') return null; // no count on file, nothing to check against
+  let committed = 0;
+  tickets.forEach(t=>{
+    if(t.returnDate) return;
+    if(excludeTicketId && t.id === excludeTicketId) return;
+    (t.equipment||[]).forEach(e=>{
+      if(e.name === name) committed += Number(e.qty)||0;
+    });
+  });
+  return { owned: Number(owned), committed: committed, available: Number(owned) - committed };
+}
+
+// The same item can appear on more than one line of the ticket being
+// built, so lines are totalled per item before comparing.
+function draftQtyFor(name){
+  return draftEquip.reduce((sum,e)=> e.name === name ? sum + (Number(e.qty)||0) : sum, 0);
+}
+
+function onHandWarningFor(name){
+  if(!name) return '';
+  const a = availableOnHand(name, editingId);
+  if(!a) return '';
+  const wanted = draftQtyFor(name);
+  if(wanted <= a.available) return '';
+  const over = wanted - a.available;
+  const detail = a.committed > 0
+    ? `${a.owned} owned, ${a.committed} already out`
+    : `${a.owned} owned`;
+  return `Only ${a.available} on hand — ${detail}. This ticket asks for ${wanted}, which is ${over} more than you have.`;
+}
+
+// Updated imperatively rather than by re-rendering, so typing in the
+// quantity box doesn't lose focus mid-keystroke.
+function refreshOnHandWarnings(){
+  draftEquip.forEach(e=>{
+    const el = document.getElementById('qtywarn-' + e.id);
+    if(!el) return;
+    const msg = onHandWarningFor(e.name);
+    el.innerHTML = msg
+      ? `<div style="margin-top:5px; font-size:11px; color:#B5432A; line-height:1.35;">⚠ ${escHtml(msg)}</div>`
+      : '';
+  });
+}
+
+/* ── SEED INVENTORY FROM TICKET HISTORY ────────────────────────────
+   You necessarily own at least as many of a thing as were out at once.
+   Summing what's out *today* understates that - the real floor is the
+   most that were ever out simultaneously, which the ticket history knows.
+
+   Worked by sweeping each item's out-periods: +qty when a ticket delivers,
+   -qty when it returns (open tickets run to today), tracking the running
+   peak. Returns are processed before deliveries on the same date, so iron
+   that came back the morning another load went out isn't double counted -
+   that keeps the estimate conservative, which is what you want in a floor.
+*/
+function peakConcurrentByItem(){
+  const events = {}; // name -> [{date, delta}]
+  const today = todayStr();
+
+  tickets.forEach(t=>{
+    const start = t.deliveryDate;
+    if(!start) return;
+    const end = t.returnDate || today;
+    (t.equipment||[]).forEach(e=>{
+      const name = e.name;
+      const qty = Number(e.qty)||0;
+      if(!name || qty <= 0) return;
+      if(!events[name]) events[name] = [];
+      events[name].push({ date:start, delta:qty });
+      events[name].push({ date:end, delta:-qty });
+    });
+  });
+
+  const result = {};
+  Object.keys(events).forEach(name=>{
+    const list = events[name].sort((a,b)=>{
+      if(a.date !== b.date) return a.date < b.date ? -1 : 1;
+      return a.delta - b.delta; // negatives (returns) first on the same day
+    });
+    let running = 0, peak = 0, peakDate = '';
+    list.forEach(ev=>{
+      running += ev.delta;
+      if(running > peak){ peak = running; peakDate = ev.date; }
+    });
+    // Whatever is out right now, independent of the sweep.
+    let nowOut = 0;
+    tickets.filter(t=>!t.returnDate).forEach(t=>{
+      (t.equipment||[]).forEach(e=>{ if(e.name === name) nowOut += Number(e.qty)||0; });
+    });
+    result[name] = { peak: peak, peakDate: peakDate, nowOut: nowOut };
+  });
+  return result;
+}
+
+// Splits what the history implies into two piles: items with no owned count
+// at all, and items whose saved count is lower than what the tickets prove
+// was out at once - that second pile is an existing error, not a blank.
+function seedProposal(){
+  const peaks = peakConcurrentByItem();
+  const blanks = [], conflicts = [], fine = [];
+  Object.keys(peaks).sort((a,b)=>a.localeCompare(b)).forEach(name=>{
+    const p = peaks[name];
+    if(p.peak <= 0) return;
+    const owned = equipmentOwned[name];
+    const hasOwned = owned != null && owned !== '';
+    if(!hasOwned) blanks.push({ name, ...p });
+    else if(Number(owned) < p.peak) conflicts.push({ name, ...p, owned:Number(owned) });
+    else fine.push({ name, ...p, owned:Number(owned) });
+  });
+  return { blanks, conflicts, fine };
+}
+
+function renderSeedReview(){
+  const { blanks, conflicts, fine } = seedProposal();
+
+  const row = (r, showWas)=>`
+    <div style="display:grid; grid-template-columns:1fr 60px 60px; gap:8px; padding:10px 0; border-bottom:1px solid var(--line); font-size:13px; align-items:center;">
+      <div>
+        <div style="font-weight:600;">${escHtml(r.name)}</div>
+        <div style="font-size:11px; color:var(--ink-soft);">${r.nowOut} out now · peak ${r.peak} at once${r.peakDate?` (${fmtDate(r.peakDate)})`:''}</div>
+      </div>
+      <div style="text-align:center; color:var(--ink-soft);">${showWas ? r.owned : '—'}</div>
+      <div style="text-align:center; font-weight:600;">${r.peak}</div>
+    </div>`;
+
+  const header = `<div style="display:grid; grid-template-columns:1fr 60px 60px; gap:8px; padding-bottom:8px; border-bottom:2px solid var(--line); font-size:10px; text-transform:uppercase; letter-spacing:0.5px; color:var(--ink-soft); font-family:'IBM Plex Mono',monospace;">
+      <div>Item</div><div style="text-align:center;">Was</div><div style="text-align:center;">Set to</div>
+    </div>`;
+
+  return `
+    <div style="padding:14px 0 10px 0; border-bottom:1.5px solid var(--line); margin-bottom:12px;">
+      <div style="font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; font-size:15px;">Fill From Ticket History</div>
+      <div style="font-size:12px; color:var(--ink-soft); margin-top:4px; line-height:1.5;">
+        Sets owned to the most of each item that was ever out at the same time. That's a <strong>floor, not a count</strong> — anything sitting at the yard that never went out on a ticket won't show up here. A real yard count still beats it.
+      </div>
+    </div>
+
+    ${blanks.length?`
+      <h2 class="section-title" style="margin-top:0;">No count on file · ${blanks.length}</h2>
+      ${header}${blanks.map(r=>row(r,false)).join('')}
+    `:`<p style="font-size:13px; color:var(--ink-soft);">Every item that's ever been on a ticket already has a count on file.</p>`}
+
+    ${conflicts.length?`
+      <h2 class="section-title" style="margin-top:22px; color:#B5432A;">Saved count is too low · ${conflicts.length}</h2>
+      <p style="font-size:12px; color:#B5432A; margin:-8px 0 8px 0;">More of these were out at once than the app thinks you own, so the saved number is wrong.</p>
+      ${header}${conflicts.map(r=>row(r,true)).join('')}
+    `:''}
+
+    ${fine.length?`<div style="font-size:11px; color:var(--ink-soft); margin-top:14px;">${fine.length} item${fine.length!==1?'s':''} already ${fine.length!==1?'have':'has'} a count at or above what the history proves — left alone.</div>`:''}
+
+    <div style="display:flex; gap:10px; margin:20px 0 10px 0;">
+      <button id="seed-cancel" class="ghost-btn" style="flex:1;">Cancel</button>
+      <button id="seed-apply" class="primary-btn" style="flex:1;">Fill ${blanks.length + conflicts.length} item${(blanks.length+conflicts.length)!==1?'s':''}</button>
+    </div>
+    <div style="margin-bottom:30px; font-size:11px; color:var(--ink-soft);">Only the items listed above change. Everything else is left exactly as it is.</div>
+  `;
+}
+
+async function applySeedFromTickets(){
+  const { blanks, conflicts } = seedProposal();
+  const all = blanks.concat(conflicts);
+  if(all.length === 0){ countMode = null; render(); return; }
+
+  all.forEach(r=>{
+    equipmentOwned[r.name] = r.peak;
+    if(!(equipmentCatalog||[]).includes(r.name)) equipmentCatalog.push(r.name);
+  });
+
+  countMode = null;
+  await saveCatalog();
+  await saveEquipmentOwned();
+  currentTab = 'inventory';
+  render();
+  alert(`Filled ${all.length} item${all.length!==1?'s':''} from ticket history.\n\nThese are minimums — a yard count will correct anything that never went out on a ticket.`);
+}
+
 function renderCountReview(){
   const out = outQtyByName();
   const names = countableItemNames();
@@ -2393,7 +2583,12 @@ function render(){
   // Count mode takes over the whole screen. No tab bar, no header chrome -
   // it's used one-handed in a yard, and every pixel of tap target counts.
   if(countMode){
-    app.innerHTML = (countMode === 'review') ? renderCountReview() : renderCountScreen();
+    // Wrapped in <main> so these screens inherit the same padding as every
+    // other view - without it they sit flush against the screen edge.
+    const inner = countMode === 'review' ? renderCountReview()
+                : countMode === 'seed'   ? renderSeedReview()
+                : renderCountScreen();
+    app.innerHTML = `<main style="padding:16px;">${inner}</main>`;
     attachHandlers();
     return;
   }
@@ -2796,7 +2991,10 @@ function renderNewTicket(){
         </select>
         ${isCustomColor?`<input type="text" style="margin-top:6px;" placeholder="New color name" value="${escAttr(e.bandColor)}" data-field="customcolor" data-eqid="${e.id}">`:''}
       </td>
-      <td><input type="number" min="0" placeholder="Qty" value="${e.qty}" data-field="qty" data-eqid="${e.id}"></td>
+      <td>
+        <input type="number" min="0" placeholder="Qty" value="${e.qty}" data-field="qty" data-eqid="${e.id}">
+        <div id="qtywarn-${e.id}"></div>
+      </td>
       <td><button class="equip-remove" data-remove-eq="${e.id}" title="Remove">×</button></td>
     </tr>`;
   }).join('');
@@ -3283,6 +3481,7 @@ function renderInventory(){
       <p>All equipment has been marked returned. Nothing currently out to show in inventory.</p>
       <div style="display:flex; gap:10px; justify-content:center; margin-top:12px; flex-wrap:wrap;">
         <button class="primary-btn" id="start-count-btn">Count Inventory</button>
+        <button class="ghost-btn" id="seed-from-tickets-btn">Fill From Tickets</button>
         <button class="ghost-btn" id="print-count-sheet-btn">Print Count Sheet</button>
       </div>
     </div>`;
@@ -3361,6 +3560,7 @@ function renderInventory(){
       <h2 class="section-title" style="margin-bottom:0;">Inventory Currently Out, By Equipment</h2>
       <div style="display:flex; gap:8px;">
         <button class="ghost-btn" id="start-count-btn" style="font-size:12px;">Count Inventory</button>
+        <button class="ghost-btn" id="seed-from-tickets-btn" style="font-size:12px;">Fill From Tickets</button>
         <button class="ghost-btn" id="print-count-sheet-btn" style="font-size:12px;">Print Count Sheet</button>
       </div>
     </div>
@@ -4636,8 +4836,16 @@ function attachHandlers(){
       inp.oninput = ()=>{
         const row = draftEquip.find(e=>e.id===inp.dataset.eqid);
         if(row) row[inp.dataset.field] = inp.value;
+        // Every row is refreshed, not just this one: two lines can carry
+        // the same item, so changing one can clear or trigger the other.
+        if(inp.dataset.field === 'qty') refreshOnHandWarnings();
       };
     });
+
+    // Paint any warnings that already apply the moment the tab renders -
+    // picking an item from the dropdown re-renders, so this catches that
+    // path too without the dropdown needing to know about it.
+    refreshOnHandWarnings();
 
     // Photo attachment
     const photoInput = document.getElementById('f-photo');
@@ -5202,6 +5410,13 @@ function attachHandlers(){
   const countSheetBtn = document.getElementById('print-count-sheet-btn');
   if(countSheetBtn) countSheetBtn.onclick = ()=> printCountSheet();
 
+  const seedBtn = document.getElementById('seed-from-tickets-btn');
+  if(seedBtn) seedBtn.onclick = ()=>{ countMode = 'seed'; render(); };
+  const seedCancel = document.getElementById('seed-cancel');
+  if(seedCancel) seedCancel.onclick = ()=>{ countMode = null; currentTab = 'inventory'; render(); };
+  const seedApply = document.getElementById('seed-apply');
+  if(seedApply) seedApply.onclick = async ()=>{ await applySeedFromTickets(); };
+
   // ── Yard count mode ──────────────────────────────────────────────
   const startCountBtn = document.getElementById('start-count-btn');
   if(startCountBtn) startCountBtn.onclick = ()=>{
@@ -5318,6 +5533,29 @@ async function onSaveTicket(){
   );
   if(duplicate){
     const proceed = confirm(`Ticket number "${ticketNumber}" is already used on another ticket (${duplicate.customer||'—'} / ${duplicate.rig||'—'}). Save anyway?`);
+    if(!proceed) return;
+  }
+
+  // Last look at on-hand before this load is committed. The inline warning
+  // may have been missed, or scrolled past - this is the point of no
+  // return, so it asks once, plainly, with the numbers.
+  const shortages = [];
+  const checkedNames = {};
+  equipment.forEach(e=>{
+    if(checkedNames[e.name]) return; // one line per item, even if split across rows
+    checkedNames[e.name] = true;
+    const a = availableOnHand(e.name, editingId);
+    if(!a) return;
+    const wanted = equipment.reduce((sum,x)=> x.name === e.name ? sum + (Number(x.qty)||0) : sum, 0);
+    if(wanted > a.available){
+      shortages.push(`• ${e.name}: ticket has ${wanted}, only ${a.available} on hand (${a.owned} owned${a.committed?`, ${a.committed} already out`:''})`);
+    }
+  });
+  if(shortages.length > 0){
+    const proceed = confirm(
+      `This ticket puts out more than you have on hand:\n\n${shortages.join('\n')}\n\n` +
+      `Save anyway?`
+    );
     if(!proceed) return;
   }
 
