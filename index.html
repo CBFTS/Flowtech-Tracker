@@ -1077,6 +1077,295 @@ function ticketTotal(t){
   return t.equipment.reduce((sum,e)=> sum + (Number(e.price)||0), 0) + extra;
 }
 
+/* ── YARD COUNT MODE ───────────────────────────────────────────────
+   Counting iron on a phone, standing in a yard, probably in gloves.
+   Design rules that follow from that:
+
+   - Counters start at ZERO, never pre-filled with what's on file. A
+     pre-filled number turns a count into a confirmation: you glance, it
+     looks about right, you move on. The entire point is catching where
+     the record drifted, so the number has to come from what you see.
+   - "Not counted" and "counted zero" are different facts and stay
+     different. Skipping a rack is not the same as looking and finding
+     none there.
+   - Two counters per item: READY (painted, good to go) and IN SHOP (in
+     the queue for repair, rebuild, reinspect, paint). Both are owned,
+     but only one can go out tomorrow - and counting them separately
+     gets that split for free.
+   - Nothing is written to inventory until a review screen has been seen
+     and confirmed.
+   - Progress saves on every tap, so a dead battery loses nothing.
+*/
+
+const COUNT_SESSION_KEY = 'flowtech_equipment_tracker_countsession';
+let countMode = null;      // null | 'counting' | 'review'
+let countSession = null;   // { startedAt, items:{ name:{ready,shop,counted} } }
+let countSearchTerm = '';
+let countHideDone = false;
+
+function loadCountSession(){
+  try{
+    const raw = localStorage.getItem(COUNT_SESSION_KEY);
+    countSession = raw ? JSON.parse(raw) : null;
+  }catch(e){ countSession = null; }
+  if(countSession && typeof countSession !== 'object') countSession = null;
+  return countSession;
+}
+
+function saveCountSession(){
+  try{
+    if(countSession) localStorage.setItem(COUNT_SESSION_KEY, JSON.stringify(countSession));
+    else localStorage.removeItem(COUNT_SESSION_KEY);
+  }catch(e){ showStorageWarning('inventory count', e); }
+}
+
+// Units currently on open tickets, so not at the yard to be counted.
+function outQtyByName(){
+  const out = {};
+  tickets.filter(t=>!t.returnDate).forEach(t=>{
+    (t.equipment||[]).forEach(e=>{
+      const key = e.name || 'Unnamed';
+      out[key] = (out[key]||0) + (Number(e.qty)||0);
+    });
+  });
+  return out;
+}
+
+// Everything worth counting: the catalogue, plus anything out on a ticket
+// that never made it into the catalogue, plus anything a previous count
+// found on the ground.
+function countableItemNames(){
+  const names = new Set();
+  (equipmentCatalog||[]).forEach(n=>{ if(n) names.add(n); });
+  Object.keys(outQtyByName()).forEach(n=>names.add(n));
+  if(countSession && countSession.items) Object.keys(countSession.items).forEach(n=>names.add(n));
+  return Array.from(names).sort((a,b)=>a.localeCompare(b));
+}
+
+function startCountSession(){
+  countSession = { startedAt: new Date().toISOString(), items: {} };
+  saveCountSession();
+  countMode = 'counting';
+  countSearchTerm = '';
+  countHideDone = false;
+  render();
+}
+
+function countEntry(name){
+  if(!countSession.items[name]) countSession.items[name] = { ready:0, shop:0, counted:false };
+  return countSession.items[name];
+}
+
+function adjustCount(name, field, delta){
+  const it = countEntry(name);
+  it[field] = Math.max(0, (Number(it[field])||0) + delta);
+  it.counted = true; // touching either counter means this item was looked at
+  saveCountSession();
+  render();
+}
+
+function markCountedZero(name){
+  const it = countEntry(name);
+  it.ready = 0; it.shop = 0; it.counted = true;
+  saveCountSession();
+  render();
+}
+
+function clearCountEntry(name){
+  if(countSession.items[name]) delete countSession.items[name];
+  saveCountSession();
+  render();
+}
+
+function renderCountScreen(){
+  const out = outQtyByName();
+  let names = countableItemNames();
+  const total = names.length;
+  const doneCount = names.filter(n=>countSession.items[n] && countSession.items[n].counted).length;
+
+  if(countSearchTerm){
+    const s = countSearchTerm.toLowerCase();
+    names = names.filter(n=>n.toLowerCase().includes(s));
+  }
+  if(countHideDone){
+    names = names.filter(n=>!(countSession.items[n] && countSession.items[n].counted));
+  }
+
+  const rows = names.map(name=>{
+    const it = countSession.items[name] || { ready:0, shop:0, counted:false };
+    const owned = equipmentOwned[name];
+    const hasOwned = owned != null && owned !== '';
+    const outQty = out[name] || 0;
+    const expected = hasOwned ? (Number(owned) - outQty) : null;
+    const seen = (Number(it.ready)||0) + (Number(it.shop)||0);
+    const drift = (it.counted && expected != null) ? (seen - expected) : null;
+
+    // The expected figure is shown for context but never seeds the counter.
+    let hint = hasOwned
+      ? `${owned} on file${outQty?` · ${outQty} out`:''} · expect ${expected} here`
+      : `<span style="color:#B8691C;">no count on file yet</span>`;
+    if(drift !== null && drift !== 0){
+      hint += ` · <strong style="color:#B5432A;">${drift>0?'+':''}${drift}</strong>`;
+    } else if(drift === 0){
+      hint += ` · <strong style="color:#1E8A29;">matches</strong>`;
+    }
+
+    const stepper = (field, label)=>`
+      <div style="flex:1; min-width:0;">
+        <div style="font-family:'Oswald',sans-serif; font-weight:600; font-size:14px; text-transform:uppercase; letter-spacing:1px; color:#3A4540; text-align:center; margin-bottom:7px;">${label}</div>
+        <div style="display:flex; align-items:center; gap:6px;">
+          <button data-count-adj="${escAttr(name)}" data-count-field="${field}" data-count-delta="-1"
+            style="width:46px; height:46px; border-radius:8px; border:1.5px solid var(--line); background:#fff; font-size:22px; line-height:1; cursor:pointer; font-family:inherit;">−</button>
+          <div style="flex:1; text-align:center; font-size:22px; font-weight:600; font-family:'IBM Plex Mono',monospace;">${it[field]||0}</div>
+          <button data-count-adj="${escAttr(name)}" data-count-field="${field}" data-count-delta="1"
+            style="width:46px; height:46px; border-radius:8px; border:1.5px solid var(--line); background:#fff; font-size:22px; line-height:1; cursor:pointer; font-family:inherit;">+</button>
+        </div>
+      </div>`;
+
+    return `<div style="background:#fff; border:1.5px solid ${it.counted?'#B7D9BB':'var(--line)'}; border-radius:10px; padding:12px 14px; margin-bottom:10px;">
+      <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px;">
+        <div style="font-weight:600; font-size:15px; line-height:1.25;">${escHtml(name)}</div>
+        ${it.counted?`<span style="font-family:'IBM Plex Mono',monospace; font-size:10px; color:#1E8A29; white-space:nowrap;">COUNTED</span>`:''}
+      </div>
+      <div style="font-size:11px; color:var(--ink-soft); margin:3px 0 10px 0;">${hint}</div>
+      <div style="display:flex; gap:14px;">
+        ${stepper('ready','Ready')}
+        ${stepper('shop','In Shop')}
+      </div>
+      <div style="display:flex; gap:14px; margin-top:8px;">
+        <button data-count-zero="${escAttr(name)}" style="background:none; border:none; padding:0; color:var(--ink-soft); font-size:11px; text-decoration:underline; cursor:pointer; font-family:inherit;">none here</button>
+        ${it.counted?`<button data-count-clear="${escAttr(name)}" style="background:none; border:none; padding:0; color:var(--ink-soft); font-size:11px; text-decoration:underline; cursor:pointer; font-family:inherit;">undo</button>`:''}
+      </div>
+    </div>`;
+  }).join('');
+
+  const pct = total>0 ? Math.round((doneCount/total)*100) : 0;
+
+  return `
+    <div style="position:sticky; top:0; background:var(--paper); padding:12px 0 10px 0; z-index:5; border-bottom:1.5px solid var(--line);">
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:8px;">
+        <div style="font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; font-size:15px;">Yard Count</div>
+        <button id="count-exit" class="ghost-btn" style="font-size:12px;">Pause</button>
+      </div>
+      <div style="background:var(--line); border-radius:4px; height:6px; overflow:hidden;">
+        <div style="height:100%; width:${pct}%; background:#33D63A; min-width:2px;"></div>
+      </div>
+      <div style="font-size:11px; color:var(--ink-soft); margin-top:5px;">${doneCount} of ${total} counted</div>
+      <div style="display:flex; gap:8px; margin-top:8px;">
+        <input type="text" id="count-search" placeholder="Filter..." value="${escAttr(countSearchTerm)}"
+          style="flex:1; padding:8px 10px; border:1.5px solid var(--line); border-radius:8px; font-family:inherit; font-size:14px;">
+        <button id="count-toggle-done" class="ghost-btn" style="font-size:12px; white-space:nowrap;">${countHideDone?'Show all':'Hide done'}</button>
+      </div>
+    </div>
+
+    <div style="padding-top:12px;">
+      ${rows || `<p style="font-size:13px; color:var(--ink-soft); padding:20px 0;">Nothing matches that filter.</p>`}
+    </div>
+
+    <div style="display:flex; gap:10px; margin:6px 0 30px 0;">
+      <button id="count-add-item" class="ghost-btn" style="flex:1;">Add item found</button>
+      <button id="count-review" class="primary-btn" style="flex:1;">Review &amp; finish</button>
+    </div>
+  `;
+}
+
+function renderCountReview(){
+  const out = outQtyByName();
+  const names = countableItemNames();
+  const counted = names.filter(n=>countSession.items[n] && countSession.items[n].counted);
+  const skipped = names.filter(n=>!(countSession.items[n] && countSession.items[n].counted));
+
+  let changeRows = '', sameCount = 0;
+  counted.forEach(name=>{
+    const it = countSession.items[name];
+    const outQty = out[name] || 0;
+    const newOwned = (Number(it.ready)||0) + (Number(it.shop)||0) + outQty;
+    const oldOwned = (equipmentOwned[name] != null && equipmentOwned[name] !== '') ? Number(equipmentOwned[name]) : null;
+    const changed = oldOwned === null || oldOwned !== newOwned;
+    if(!changed){ sameCount++; return; }
+    const delta = oldOwned === null ? null : (newOwned - oldOwned);
+    changeRows += `<div style="display:grid; grid-template-columns:1fr 62px 62px 62px; gap:8px; padding:10px 0; border-bottom:1px solid var(--line); font-size:13px; align-items:center;">
+      <div>
+        <div style="font-weight:600;">${escHtml(name)}</div>
+        <div style="font-size:11px; color:var(--ink-soft);">${it.ready} ready · ${it.shop} in shop${outQty?` · ${outQty} out`:''}</div>
+      </div>
+      <div style="text-align:center; color:var(--ink-soft);">${oldOwned===null?'—':oldOwned}</div>
+      <div style="text-align:center; font-weight:600;">${newOwned}</div>
+      <div style="text-align:center; font-weight:600; color:${delta===null?'#B8691C':(delta>0?'#1E8A29':'#B5432A')};">${delta===null?'new':(delta>0?'+'+delta:delta)}</div>
+    </div>`;
+  });
+
+  return `
+    <div style="padding:14px 0 10px 0; border-bottom:1.5px solid var(--line); margin-bottom:12px;">
+      <div style="font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; font-size:15px;">Review Count</div>
+      <div style="font-size:12px; color:var(--ink-soft); margin-top:4px;">
+        Owned is set to <strong>ready + in shop + out on tickets</strong>, since iron on a rig isn't at the yard to be counted.
+      </div>
+    </div>
+
+    ${skipped.length>0?`<div style="background:#FFF8E6; border:1.5px solid #E6D080; border-radius:8px; padding:12px 14px; margin-bottom:14px;">
+      <div style="font-weight:600; font-size:13px; color:#8A6D10; margin-bottom:4px;">${skipped.length} item${skipped.length!==1?'s':''} not counted</div>
+      <div style="font-size:11px; color:#8A6D10; line-height:1.5;">${skipped.map(escHtml).join(', ')}</div>
+      <div style="font-size:11px; color:#8A6D10; margin-top:6px;">These keep whatever is already on file. Nothing is changed for them.</div>
+    </div>`:''}
+
+    ${changeRows?`
+      <div style="display:grid; grid-template-columns:1fr 62px 62px 62px; gap:8px; padding-bottom:8px; border-bottom:2px solid var(--line); font-size:10px; text-transform:uppercase; letter-spacing:0.5px; color:var(--ink-soft); font-family:'IBM Plex Mono',monospace;">
+        <div>Item</div><div style="text-align:center;">Was</div><div style="text-align:center;">Now</div><div style="text-align:center;">Change</div>
+      </div>
+      ${changeRows}
+    `:`<p style="font-size:13px; color:var(--ink-soft);">No changes — everything counted matches what's on file.</p>`}
+
+    ${sameCount>0?`<div style="font-size:11px; color:var(--ink-soft); margin-top:10px;">${sameCount} counted item${sameCount!==1?'s':''} already matched and ${sameCount!==1?'are':'is'} not listed.</div>`:''}
+
+    <div style="display:flex; gap:10px; margin:20px 0 30px 0;">
+      <button id="count-back" class="ghost-btn" style="flex:1;">Back to counting</button>
+      <button id="count-apply" class="primary-btn" style="flex:1;">Apply to inventory</button>
+    </div>
+    <div style="margin-bottom:30px;">
+      <button id="count-discard" style="background:none; border:none; color:#B5432A; font-size:12px; text-decoration:underline; cursor:pointer; font-family:inherit;">Discard this count</button>
+    </div>
+  `;
+}
+
+async function applyCountSession(){
+  const out = outQtyByName();
+  const names = countableItemNames();
+  const snapshot = {};
+  let applied = 0;
+
+  names.forEach(name=>{
+    const it = countSession.items[name];
+    if(!it || !it.counted) return; // never touch what wasn't counted
+    const ready = Number(it.ready)||0;
+    const shop = Number(it.shop)||0;
+    equipmentOwned[name] = ready + shop + (out[name]||0);
+    snapshot[name] = { ready: ready, shop: shop, out: out[name]||0 };
+    applied++;
+    // An item found at the yard that isn't in the catalogue should join it,
+    // otherwise it drops off every future count and ticket dropdown.
+    if(!(equipmentCatalog||[]).includes(name)) equipmentCatalog.push(name);
+  });
+
+  // Ready/in-shop lives in appSettings so it rides the existing cloud sync
+  // without needing a backend change.
+  appSettings.inventoryCount = {
+    countedAt: new Date().toISOString(),
+    items: snapshot
+  };
+
+  countSession = null;
+  saveCountSession();
+  countMode = null;
+
+  await saveCatalog();
+  await saveEquipmentOwned();
+  await saveAppSettings();
+  currentTab = 'inventory';
+  render();
+  alert(`Inventory updated — ${applied} item${applied!==1?'s':''} counted.`);
+}
+
 // A clipboard sheet for counting iron at the yard. Deliberately printed
 // rather than typed on a phone: counting is a two-hands, dirty-gloves job,
 // and the numbers get entered once afterwards.
@@ -2101,6 +2390,14 @@ function resetDraftTicket(){
 }
 
 function render(){
+  // Count mode takes over the whole screen. No tab bar, no header chrome -
+  // it's used one-handed in a yard, and every pixel of tap target counts.
+  if(countMode){
+    app.innerHTML = (countMode === 'review') ? renderCountReview() : renderCountScreen();
+    attachHandlers();
+    return;
+  }
+
   let html = `
     <header>
       <div class="brand-row">
@@ -2984,7 +3281,10 @@ function renderInventory(){
     return `<div class="empty-state">
       <div class="stamp">Nothing Out</div>
       <p>All equipment has been marked returned. Nothing currently out to show in inventory.</p>
-      <button class="ghost-btn" id="print-count-sheet-btn" style="margin-top:12px;">Print Count Sheet</button>
+      <div style="display:flex; gap:10px; justify-content:center; margin-top:12px; flex-wrap:wrap;">
+        <button class="primary-btn" id="start-count-btn">Count Inventory</button>
+        <button class="ghost-btn" id="print-count-sheet-btn">Print Count Sheet</button>
+      </div>
     </div>`;
   }
 
@@ -3059,7 +3359,10 @@ function renderInventory(){
     </div>
     <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
       <h2 class="section-title" style="margin-bottom:0;">Inventory Currently Out, By Equipment</h2>
-      <button class="ghost-btn" id="print-count-sheet-btn" style="font-size:12px;">Print Count Sheet</button>
+      <div style="display:flex; gap:8px;">
+        <button class="ghost-btn" id="start-count-btn" style="font-size:12px;">Count Inventory</button>
+        <button class="ghost-btn" id="print-count-sheet-btn" style="font-size:12px;">Print Count Sheet</button>
+      </div>
     </div>
     ${noMatches ? `<p style="font-size:13px; color:var(--ink-soft);">No equipment matches "${escHtml(inventorySearchTerm)}".</p>` : groups}
   `;
@@ -4898,6 +5201,81 @@ function attachHandlers(){
 
   const countSheetBtn = document.getElementById('print-count-sheet-btn');
   if(countSheetBtn) countSheetBtn.onclick = ()=> printCountSheet();
+
+  // ── Yard count mode ──────────────────────────────────────────────
+  const startCountBtn = document.getElementById('start-count-btn');
+  if(startCountBtn) startCountBtn.onclick = ()=>{
+    if(loadCountSession()){
+      const when = countSession.startedAt ? new Date(countSession.startedAt).toLocaleString(undefined,{dateStyle:'medium',timeStyle:'short'}) : 'earlier';
+      if(confirm(`There's an unfinished count from ${when}.\n\nOK to pick it up where you left off, or Cancel to start fresh.`)){
+        countMode = 'counting';
+        render();
+        return;
+      }
+    }
+    startCountSession();
+  };
+
+  document.querySelectorAll('[data-count-adj]').forEach(btn=>{
+    btn.onclick = ()=> adjustCount(btn.dataset.countAdj, btn.dataset.countField, Number(btn.dataset.countDelta));
+  });
+  document.querySelectorAll('[data-count-zero]').forEach(btn=>{
+    btn.onclick = ()=> markCountedZero(btn.dataset.countZero);
+  });
+  document.querySelectorAll('[data-count-clear]').forEach(btn=>{
+    btn.onclick = ()=> clearCountEntry(btn.dataset.countClear);
+  });
+
+  const countSearch = document.getElementById('count-search');
+  if(countSearch){
+    countSearch.oninput = ()=>{
+      countSearchTerm = countSearch.value;
+      render();
+      const el = document.getElementById('count-search');
+      if(el){ el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
+    };
+  }
+  const countToggleDone = document.getElementById('count-toggle-done');
+  if(countToggleDone) countToggleDone.onclick = ()=>{ countHideDone = !countHideDone; render(); };
+
+  const countExit = document.getElementById('count-exit');
+  if(countExit) countExit.onclick = ()=>{
+    // Paused, not lost - the session stays on the device.
+    countMode = null;
+    currentTab = 'inventory';
+    render();
+  };
+
+  const countAddItem = document.getElementById('count-add-item');
+  if(countAddItem) countAddItem.onclick = ()=>{
+    const name = promptRequired('Name of the item you found:', 'A name is required.');
+    if(name === null) return;
+    const exists = countableItemNames().some(n=>n.toLowerCase() === name.toLowerCase());
+    if(exists){ alert(`"${name}" is already on the list.`); return; }
+    countEntry(name);
+    saveCountSession();
+    countSearchTerm = '';
+    render();
+  };
+
+  const countReviewBtn = document.getElementById('count-review');
+  if(countReviewBtn) countReviewBtn.onclick = ()=>{ countMode = 'review'; render(); };
+
+  const countBack = document.getElementById('count-back');
+  if(countBack) countBack.onclick = ()=>{ countMode = 'counting'; render(); };
+
+  const countApply = document.getElementById('count-apply');
+  if(countApply) countApply.onclick = async ()=>{ await applyCountSession(); };
+
+  const countDiscard = document.getElementById('count-discard');
+  if(countDiscard) countDiscard.onclick = ()=>{
+    if(!confirm('Discard this count? Everything you tallied will be lost and your inventory stays as it is.')) return;
+    countSession = null;
+    saveCountSession();
+    countMode = null;
+    currentTab = 'inventory';
+    render();
+  };
 
   if(currentTab === 'inventory'){
     const invSearch = document.getElementById('inventory-search-input');
