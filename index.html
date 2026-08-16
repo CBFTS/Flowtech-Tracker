@@ -1102,6 +1102,9 @@ let countMode = null;      // null | 'counting' | 'review'
 let countSession = null;   // { startedAt, items:{ name:{ready,shop,counted} } }
 let countSearchTerm = '';
 let countHideDone = false;
+// Snapshot of what was already counted when "Hide done" was switched on,
+// so items counted after that stay put instead of disappearing mid-tap.
+let countHiddenNames = [];
 
 function loadCountSession(){
   try{
@@ -1148,6 +1151,7 @@ function startCountSession(){
   countMode = 'counting';
   countSearchTerm = '';
   countHideDone = false;
+  countHiddenNames = [];
   render();
 }
 
@@ -1188,7 +1192,11 @@ function renderCountScreen(){
     names = names.filter(n=>n.toLowerCase().includes(s));
   }
   if(countHideDone){
-    names = names.filter(n=>!(countSession.items[n] && countSession.items[n].counted));
+    // Hides what was already done when the button was pressed - NOT what
+    // gets counted afterwards. Filtering live meant the first tap on a
+    // card marked it counted and the card vanished underneath your finger
+    // at a count of 1, with no way to enter the rest.
+    names = names.filter(n=>!countHiddenNames.includes(n));
   }
 
   const rows = names.map(name=>{
@@ -5451,7 +5459,15 @@ function attachHandlers(){
     };
   }
   const countToggleDone = document.getElementById('count-toggle-done');
-  if(countToggleDone) countToggleDone.onclick = ()=>{ countHideDone = !countHideDone; render(); };
+  if(countToggleDone) countToggleDone.onclick = ()=>{
+    countHideDone = !countHideDone;
+    // Take the snapshot at the moment it's switched on. Pressing it again
+    // after counting more will hide those too.
+    countHiddenNames = countHideDone
+      ? countableItemNames().filter(n=>countSession.items[n] && countSession.items[n].counted)
+      : [];
+    render();
+  };
 
   const countExit = document.getElementById('count-exit');
   if(countExit) countExit.onclick = ()=>{
