@@ -1277,6 +1277,85 @@ function renderCountScreen(){
   `;
 }
 
+/* ── YARD STATE: OUT → IN SHOP → READY ─────────────────────────────
+   Out is derived from tickets and needs no upkeep. The other two are
+   stored, because nothing in the ticket data can imply them.
+
+   Returned iron always enters the shop queue - repair, rebuild,
+   reinspect, paint - whatever condition it came back in. There's no
+   judgement call at the yard, so there isn't one here: a return moves
+   that equipment into In Shop by itself.
+
+   Rather than hooking every place a ticket can be returned (in the app,
+   by a driver through a return link, in a rig move, or on the other
+   device arriving by sync), this reconciles - it looks for returned
+   tickets it hasn't accounted for and processes them. Idempotent, so
+   running it repeatedly changes nothing, and it can't miss a path.
+*/
+function ensureInventoryCount(){
+  if(!appSettings.inventoryCount || typeof appSettings.inventoryCount !== 'object'){
+    appSettings.inventoryCount = { items:{}, processedReturns: allReturnedTicketIds_() };
+  }
+  const inv = appSettings.inventoryCount;
+  if(!inv.items || typeof inv.items !== 'object') inv.items = {};
+  // A count applied before this feature existed wrote items but no return
+  // ledger. Seeding it with everything already returned stops years of old
+  // returns flooding into In Shop the first time this runs.
+  if(!Array.isArray(inv.processedReturns)) inv.processedReturns = allReturnedTicketIds_();
+  return inv;
+}
+
+function allReturnedTicketIds_(){
+  return tickets.filter(t=>t.returnDate).map(t=>t.id);
+}
+
+function yardEntry(name){
+  const inv = ensureInventoryCount();
+  if(!inv.items[name]) inv.items[name] = { ready:0, shop:0 };
+  const it = inv.items[name];
+  it.ready = Number(it.ready)||0;
+  it.shop = Number(it.shop)||0;
+  return it;
+}
+
+async function reconcileShopFromReturns(){
+  if(!tickets || tickets.length === 0) return false;
+  const inv = ensureInventoryCount();
+  const seen = new Set(inv.processedReturns);
+  let changed = false;
+
+  tickets.forEach(t=>{
+    if(!t.returnDate || seen.has(t.id)) return;
+    (t.equipment||[]).forEach(e=>{
+      const name = e.name;
+      const qty = Number(e.qty)||0;
+      if(!name || qty <= 0) return;
+      yardEntry(name).shop += qty;
+    });
+    inv.processedReturns.push(t.id);
+    seen.add(t.id);
+    changed = true;
+  });
+
+  if(changed) await saveAppSettings();
+  return changed;
+}
+
+// The one manual step, mirroring a message the yard already sends.
+async function markReadyFromShop(name){
+  const it = yardEntry(name);
+  if(it.shop <= 0) return;
+  const raw = prompt(`How many ${name} are through the shop and ready?\n\n${it.shop} currently in the queue.`, String(it.shop));
+  if(raw === null) return;
+  const qty = parseInt(raw, 10);
+  if(!(qty > 0)){ alert('Enter a whole number greater than 0.'); return; }
+  const move = Math.min(qty, it.shop);
+  it.shop -= move;
+  it.ready += move;
+  await saveAppSettings();
+  render();
+}
+
 /* ── ON-HAND CHECK WHILE BUILDING A TICKET ─────────────────────────
    Warns the moment more of something goes on a ticket than is left on
    the ground - not after saving, when the load is already promised.
@@ -1549,7 +1628,11 @@ async function applyCountSession(){
   // without needing a backend change.
   appSettings.inventoryCount = {
     countedAt: new Date().toISOString(),
-    items: snapshot
+    items: snapshot,
+    // A fresh count is the new baseline: every return up to this moment is
+    // already reflected in what was physically counted, so mark them all
+    // accounted for. Without this the next reconcile would add them again.
+    processedReturns: allReturnedTicketIds_()
   };
 
   countSession = null;
@@ -2358,6 +2441,7 @@ async function pullFromCloud(silent){
     localStorage.setItem(TEMPLATE_KEY, JSON.stringify(templateCatalog));
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(appSettings));
     syncStatus = 'ok';
+    await reconcileShopFromReturns();
   }catch(e){
     console.error('Cloud pull failed', e);
     syncStatus = 'error';
@@ -2391,6 +2475,7 @@ async function pushToCloud(){
     });
     if(deletesToSend.length) pendingDeletes = pendingDeletes.filter(id=>!deletesToSend.includes(id));
     syncStatus = 'ok';
+    await reconcileShopFromReturns();
   }catch(e){
     console.error('Cloud push failed', e);
     syncStatus = 'error';
@@ -3478,21 +3563,137 @@ function renderByRig(){
   `;
 }
 
+/* ── FULL INVENTORY ────────────────────────────────────────────────
+   Every asset owned, and where it is. The rest of this tab can only
+   describe what's out on a ticket, which means it says nothing at all
+   about the iron sitting at the yard - and nothing whatsoever on a day
+   when everything is home.
+
+   On Hand is deliberately named that rather than "Available": it means
+   not on a ticket. Some of it may be in the queue for rebuild or paint,
+   which this view has no way of knowing unless a count recorded it.
+*/
+function renderFullInventory(){
+  const out = outQtyByName();
+  const names = new Set();
+  (equipmentCatalog||[]).forEach(n=>{ if(n) names.add(n); });
+  Object.keys(out).forEach(n=>names.add(n));
+  Object.keys(equipmentOwned||{}).forEach(n=>names.add(n));
+
+  let rows = Array.from(names).sort((a,b)=>a.localeCompare(b)).map(name=>{
+    const ownedRaw = equipmentOwned[name];
+    const owned = (ownedRaw != null && ownedRaw !== '') ? Number(ownedRaw) : null;
+    const outQty = out[name] || 0;
+    const inv = ensureInventoryCount();
+    const y = inv.items[name] || { ready:0, shop:0 };
+    return {
+      name, owned, out: outQty,
+      onHand: owned === null ? null : owned - outQty,
+      ready: Number(y.ready)||0,
+      shop: Number(y.shop)||0
+    };
+  });
+
+  if(inventorySearchTerm){
+    const s = inventorySearchTerm.toLowerCase();
+    rows = rows.filter(r=>r.name.toLowerCase().includes(s));
+  }
+
+  if(rows.length === 0){
+    return `<h2 class="section-title">Full Inventory</h2>
+      <p style="font-size:13px; color:var(--ink-soft);">Nothing to show yet. Add equipment to the catalog, or use Fill From Tickets.</p>`;
+  }
+
+  const withCount = rows.filter(r=>r.owned !== null);
+  const totalOwned = withCount.reduce((s,r)=>s+r.owned, 0);
+  const totalOut = rows.reduce((s,r)=>s+r.out, 0);
+  const totalOnHand = withCount.reduce((s,r)=>s+r.onHand, 0);
+  const noCount = rows.filter(r=>r.owned === null).length;
+  const utilisation = totalOwned > 0 ? Math.round((totalOut/totalOwned)*100) : 0;
+  const totalReady = rows.reduce((s,r)=>s+r.ready, 0);
+  const totalShop = rows.reduce((s,r)=>s+r.shop, 0);
+
+  const body = rows.map(r=>{
+    const unknown = r.owned === null;
+    // A bar reading how much of this item is out, so a glance down the
+    // column shows what's working and what's sitting.
+    const pct = (!unknown && r.owned > 0) ? Math.min(100, Math.round((r.out/r.owned)*100)) : 0;
+    const allOut = !unknown && r.onHand <= 0 && r.owned > 0;
+    // Whatever is home but hasn't been placed in either yard bucket - iron
+    // that was never counted, or came back before the shop queue existed.
+    const unaccounted = (!unknown && (r.ready>0 || r.shop>0))
+      ? Math.max(0, r.onHand - r.ready - r.shop) : 0;
+    return `<div style="padding:10px 0; border-bottom:1px solid var(--line);">
+      <div style="display:grid; grid-template-columns:1fr 54px 54px 62px; gap:6px; font-size:13px; align-items:center;">
+        <div style="font-weight:600;">${escHtml(r.name)}</div>
+        <div style="text-align:center; color:var(--ink-soft);">${unknown?'—':r.owned}</div>
+        <div style="text-align:center; color:${r.out>0?'var(--ink)':'var(--ink-soft)'};">${r.out||'—'}</div>
+        <div style="text-align:center; font-weight:600; color:${unknown?'#B8691C':(allOut?'#B5432A':'#1E8A29')};">
+          ${unknown?'not set':r.onHand}
+        </div>
+      </div>
+      ${unknown?'':`<div style="background:var(--paper-2); border-radius:3px; height:5px; overflow:hidden; margin-top:7px;">
+        <div style="height:100%; width:${pct}%; background:${allOut?'#B5432A':'#33D63A'}; min-width:${r.out>0?'2px':'0'};"></div>
+      </div>`}
+      ${(r.ready>0 || r.shop>0) ? `<div style="display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:7px; flex-wrap:wrap;">
+        <div style="font-size:11px; color:var(--ink-soft);">
+          <span style="color:#1E8A29; font-weight:600;">${r.ready} ready</span>
+          &middot; <span style="color:${r.shop>0?'#B8691C':'var(--ink-soft)'};">${r.shop} in shop</span>
+          ${unaccounted ? ` &middot; <span style="color:#B8691C;">${unaccounted} unaccounted</span>` : ''}
+        </div>
+        ${r.shop>0?`<button data-mark-ready="${escAttr(r.name)}" style="background:none; border:1px solid var(--line); border-radius:5px; padding:4px 9px; font-size:11px; cursor:pointer; font-family:inherit; white-space:nowrap;">Ready &#9656;</button>`:''}
+      </div>` : ''}
+    </div>`;
+  }).join('');
+
+  return `
+    <h2 class="section-title">Full Inventory</h2>
+    <div class="summary-cards" style="grid-template-columns:repeat(3,1fr);">
+      <div class="summary-card"><div class="num">${totalOwned}</div><div class="lbl">Total Owned</div></div>
+      <div class="summary-card"><div class="num">${totalOut}</div><div class="lbl">Out On Tickets</div></div>
+      <div class="summary-card"><div class="num" style="color:#1E8A29;">${totalOnHand}</div><div class="lbl">On Hand</div></div>
+    </div>
+    ${(totalReady>0 || totalShop>0) ? `<div class="summary-cards" style="grid-template-columns:repeat(2,1fr); margin-top:-6px;">
+      <div class="summary-card"><div class="num" style="color:#1E8A29;">${totalReady}</div><div class="lbl">Ready To Go</div></div>
+      <div class="summary-card"><div class="num" style="color:#B8691C;">${totalShop}</div><div class="lbl">In Shop</div></div>
+    </div>` : ''}
+    <div style="background:#fff; border:1.5px solid var(--line); border-radius:8px; padding:16px;">
+      <div style="display:grid; grid-template-columns:1fr 54px 54px 62px; gap:6px; padding-bottom:8px; border-bottom:2px solid var(--line); font-size:10px; text-transform:uppercase; letter-spacing:0.5px; color:var(--ink-soft); font-family:'IBM Plex Mono',monospace;">
+        <div>Item</div>
+        <div style="text-align:center;">Owned</div>
+        <div style="text-align:center;">Out</div>
+        <div style="text-align:center;">On Hand</div>
+      </div>
+      ${body}
+      <div style="font-size:11px; color:var(--ink-soft); margin-top:12px; line-height:1.5;">
+        ${totalOwned>0?`${utilisation}% of your iron is out on tickets right now. `:''}On Hand means not on a ticket — some of it may still be in the queue for rebuild or paint.
+        ${(totalReady>0||totalShop>0)?`<br>Returned iron goes into <strong>In Shop</strong> on its own. When the yard says a piece is through paint, tap <strong>Ready &#9656;</strong>.`:''}
+        ${noCount>0?`<br><strong style="color:#B8691C;">${noCount} item${noCount!==1?'s have':' has'} no owned count yet</strong> — count the yard, or use Fill From Tickets for a rough floor.`:''}
+      </div>
+    </div>
+  `;
+}
+
 function renderInventory(){
   const outTickets = tickets.filter(t=>!t.returnDate);
 
   if(outTickets.length === 0){
     // Still offer the count sheet here - an empty yard is the easiest time
     // to count, so this is exactly when it's most useful.
-    return `<div class="empty-state">
-      <div class="stamp">Nothing Out</div>
-      <p>All equipment has been marked returned. Nothing currently out to show in inventory.</p>
-      <div style="display:flex; gap:10px; justify-content:center; margin-top:12px; flex-wrap:wrap;">
+    return `
+      <div class="search-bar">
+        <input type="text" id="inventory-search-input" placeholder="Filter by equipment name..." value="${escAttr(inventorySearchTerm)}">
+      </div>
+      <div style="background:#EEF4EE; border:1.5px solid #D6E2D6; border-radius:8px; padding:12px 14px; margin-bottom:16px; font-size:13px;">
+        <strong>Nothing is out right now.</strong> Every asset below is home.
+      </div>
+      <div style="display:flex; gap:10px; margin-bottom:18px; flex-wrap:wrap;">
         <button class="primary-btn" id="start-count-btn">Count Inventory</button>
         <button class="ghost-btn" id="seed-from-tickets-btn">Fill From Tickets</button>
         <button class="ghost-btn" id="print-count-sheet-btn">Print Count Sheet</button>
       </div>
-    </div>`;
+      ${renderFullInventory()}
+    `;
   }
 
   // Aggregate every equipment line across all open tickets, grouped by name.
@@ -3573,6 +3774,7 @@ function renderInventory(){
       </div>
     </div>
     ${noMatches ? `<p style="font-size:13px; color:var(--ink-soft);">No equipment matches "${escHtml(inventorySearchTerm)}".</p>` : groups}
+    ${renderFullInventory()}
   `;
 }
 
@@ -5242,7 +5444,12 @@ function attachHandlers(){
     document.querySelectorAll('[data-return]').forEach(b=>{
       b.onclick = async ()=>{
         const t = tickets.find(x=>x.id===b.dataset.return);
-        if(t){ t.returnDate = todayStr(); t.updatedAt = nowIso(); await saveTickets(); render(); }
+        if(t){
+          t.returnDate = todayStr(); t.updatedAt = nowIso();
+          await saveTickets();
+          await reconcileShopFromReturns(); // straight into the shop queue
+          render();
+        }
       };
     });
     document.querySelectorAll('[data-delete]').forEach(b=>{
@@ -5339,6 +5546,7 @@ function attachHandlers(){
         }
         t.updatedAt = nowIso();
         await saveTickets();
+        await reconcileShopFromReturns(); // coming home means into the queue
         render();
       };
     });
@@ -5411,9 +5619,14 @@ function attachHandlers(){
       });
       selectedTicketIds.clear();
       await saveTickets();
+      await reconcileShopFromReturns();
       render();
     };
   }
+
+  document.querySelectorAll('[data-mark-ready]').forEach(btn=>{
+    btn.onclick = async ()=> await markReadyFromShop(btn.dataset.markReady);
+  });
 
   const countSheetBtn = document.getElementById('print-count-sheet-btn');
   if(countSheetBtn) countSheetBtn.onclick = ()=> printCountSheet();
@@ -5742,6 +5955,7 @@ async function init(){
   await loadCustomerCatalog();
   await loadTemplates();
   loadSyncUrl();
+  await reconcileShopFromReturns();
   render();
   if(syncUrl){
     await pullFromCloud(true);
