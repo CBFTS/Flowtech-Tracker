@@ -1077,6 +1077,189 @@ function ticketTotal(t){
   return t.equipment.reduce((sum,e)=> sum + (Number(e.price)||0), 0) + extra;
 }
 
+// A clipboard sheet for counting iron at the yard. Deliberately printed
+// rather than typed on a phone: counting is a two-hands, dirty-gloves job,
+// and the numbers get entered once afterwards.
+//
+// Each row carries what the app currently believes, so a count either
+// confirms the record or exposes where it drifted:
+//   On File   - owned count already saved in the app
+//   Out       - units currently on open tickets, so not at the yard
+//   Expected  - On File minus Out, i.e. what should physically be there
+//   Counted   - blank, filled in by hand
+function printCountSheet(){
+  const outByName = {};
+  tickets.filter(t=>!t.returnDate).forEach(t=>{
+    (t.equipment||[]).forEach(e=>{
+      const key = e.name || 'Unnamed';
+      outByName[key] = (outByName[key]||0) + (Number(e.qty)||0);
+    });
+  });
+
+  // Every catalogue item, plus anything that only exists out on a ticket -
+  // an item missing from the catalogue is exactly the kind of gap a count
+  // is supposed to surface.
+  const names = Array.from(new Set(
+    (equipmentCatalog||[]).concat(Object.keys(outByName))
+  )).filter(Boolean).sort((a,b)=>a.localeCompare(b));
+
+  const symbolSvg = document.querySelector('svg.logo-symbol') ? document.querySelector('svg.logo-symbol').outerHTML : '';
+  const nameSvg = document.querySelector('svg.logo-name') ? document.querySelector('svg.logo-name').outerHTML : '';
+  const printedAt = new Date().toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+
+  const rows = names.map((n,i)=>{
+    const owned = equipmentOwned[n];
+    const out = outByName[n] || 0;
+    const hasOwned = owned != null && owned !== '';
+    const expected = hasOwned ? (Number(owned) - out) : null;
+    return `<tr class="${i%2===1?'alt-row':''}">
+      <td>${escHtml(n)}</td>
+      <td class="num">${hasOwned ? owned : '<span class="unset">not set</span>'}</td>
+      <td class="num">${out || '—'}</td>
+      <td class="num">${expected != null ? expected : '—'}</td>
+      <td class="write"></td>
+      <td class="write wide"></td>
+    </tr>`;
+  }).join('');
+
+  // Blank rows for anything found at the yard that isn't in the app yet.
+  let blanks = '';
+  for(let i=0;i<6;i++){
+    blanks += `<tr class="${(names.length+i)%2===1?'alt-row':''}">
+      <td class="write"></td><td class="num">—</td><td class="num">—</td>
+      <td class="num">—</td><td class="write"></td><td class="write wide"></td>
+    </tr>`;
+  }
+
+  const totalOwned = names.reduce((s,n)=>{
+    const o = equipmentOwned[n];
+    return s + ((o!=null && o!=='') ? Number(o) : 0);
+  }, 0);
+  const totalOut = Object.values(outByName).reduce((s,v)=>s+v, 0);
+  const unset = names.filter(n=>equipmentOwned[n]==null || equipmentOwned[n]==='').length;
+
+  const printWindow = window.open('', '_blank', 'width=850,height=1100');
+  if(!printWindow){
+    alert('Your browser blocked the print window. Please allow pop-ups for this page and try again.');
+    return;
+  }
+
+  const html = `
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Inventory Count Sheet</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: 'Inter', Arial, sans-serif;
+    color: #1B211C;
+    max-width: 780px;
+    margin: 0 auto;
+    padding: 36px;
+    border: 1px solid #D3DED4;
+  }
+  .print-header {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    border-bottom: 4px solid #33D63A; padding-bottom: 16px; margin-bottom: 8px;
+  }
+  .print-header .logos { display: flex; align-items: center; gap: 14px; }
+  .print-header svg.logo-symbol { height: 46px; width: auto; }
+  .print-header svg.logo-name { height: 24px; width: auto; }
+  .sheet-badge {
+    font-family: 'IBM Plex Mono', monospace;
+    background: #14181A; color: #33D63A;
+    padding: 8px 16px; border-radius: 6px; font-size: 13px;
+    letter-spacing: 1px; white-space: nowrap;
+  }
+  h1 {
+    font-family: 'Oswald', sans-serif; font-weight: 600; font-size: 20px;
+    text-transform: uppercase; letter-spacing: 2px; margin: 22px 0 4px 0; color: #14181A;
+  }
+  .contact { font-family:'IBM Plex Mono',monospace; font-size:10px; color:#5B6660; margin-bottom:4px; }
+  .meta-grid {
+    display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 4px 24px;
+    margin: 14px 0 18px 0; font-size: 13px; border: 1px solid #E8EDE8;
+    border-radius: 8px; padding: 14px 18px; background: #FAFCF9;
+  }
+  .meta-grid .label {
+    color: #5B6660; text-transform: uppercase; font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px; letter-spacing: 0.5px; display: block;
+  }
+  .meta-grid .value { font-size: 14px; font-weight: 500; }
+  table { width: 100%; border-collapse: collapse; margin-bottom: 16px; }
+  th {
+    text-align: left; font-family: 'IBM Plex Mono', monospace; font-size: 10px;
+    text-transform: uppercase; letter-spacing: 0.5px;
+    background: #14181A; color: #F4F7F4; padding: 9px 10px;
+  }
+  th.num, td.num { text-align: center; }
+  td { padding: 0 10px; border-bottom: 1px solid #E8EDE8; font-size: 13px; height: 30px; }
+  tr.alt-row td { background: #FAFCF9; }
+  td.write { background: #FFFFFF !important; border-bottom: 1px solid #C8D4C9; }
+  td.write.wide { min-width: 150px; }
+  .unset { color: #B8691C; font-family:'IBM Plex Mono',monospace; font-size: 11px; }
+  .note {
+    font-size: 11px; color: #5B6660; border-top: 1.5px dashed #D3DED4;
+    padding-top: 10px; margin-top: 6px; line-height: 1.5;
+  }
+  .print-footer {
+    display: flex; justify-content: space-between;
+    font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #5B6660;
+    border-top: 1px solid #E8EDE8; padding-top: 10px; margin-top: 14px;
+  }
+  @media print { body { border: none; padding: 0; } tr { page-break-inside: avoid; } }
+</style>
+</head>
+<body>
+  <div class="print-header">
+    <div class="logos">${symbolSvg}${nameSvg}</div>
+    <div class="sheet-badge">COUNT SHEET</div>
+  </div>
+  <div class="contact">985-860-9919 &middot; chrisbull@flow-techsystemsllc.com</div>
+  <h1>Inventory Count Sheet</h1>
+  <div class="meta-grid">
+    <div><span class="label">Counted By</span><span class="value">_____________________</span></div>
+    <div><span class="label">Date</span><span class="value">_____________________</span></div>
+    <div><span class="label">Location</span><span class="value">_____________________</span></div>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>Equipment</th>
+        <th class="num">On File</th>
+        <th class="num">Out</th>
+        <th class="num">Expected</th>
+        <th class="num">Counted</th>
+        <th>Notes</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${rows}
+      ${blanks}
+    </tbody>
+  </table>
+  <div class="note">
+    <strong>Expected</strong> is what's on file minus what's out on open tickets &mdash; that's what should physically be at the yard.
+    Anything in for repair, rebuild or paint still counts as owned, so note it rather than leaving it out of the count.
+    Blank rows at the bottom are for anything you find that isn't in the app yet.
+    ${unset>0?`<br><strong style="color:#B8691C;">${unset} item${unset!==1?'s have':' has'} no owned count on file yet</strong> &mdash; those are the ones this sheet exists to fill in.`:''}
+  </div>
+  <div class="print-footer">
+    <span>Flow-Tech Systems LLC &middot; ${names.length} item${names.length!==1?'s':''} &middot; ${totalOwned} on file &middot; ${totalOut} out</span>
+    <span>Printed ${printedAt}</span>
+  </div>
+</body>
+</html>`;
+
+  printWindow.document.write(html);
+  printWindow.document.close();
+  setTimeout(()=>{ printWindow.focus(); printWindow.print(); }, 400);
+}
+
 function printTicket(t){
   const isOut = !t.returnDate;
 
@@ -2796,9 +2979,12 @@ function renderInventory(){
   const outTickets = tickets.filter(t=>!t.returnDate);
 
   if(outTickets.length === 0){
+    // Still offer the count sheet here - an empty yard is the easiest time
+    // to count, so this is exactly when it's most useful.
     return `<div class="empty-state">
       <div class="stamp">Nothing Out</div>
       <p>All equipment has been marked returned. Nothing currently out to show in inventory.</p>
+      <button class="ghost-btn" id="print-count-sheet-btn" style="margin-top:12px;">Print Count Sheet</button>
     </div>`;
   }
 
@@ -2871,7 +3057,10 @@ function renderInventory(){
       <div class="summary-card"><div class="num">${totalUnitsOut}</div><div class="lbl">Total Units Out</div></div>
       ${overCapacityCount>0?`<div class="summary-card" style="border-color:#B5432A;"><div class="num" style="color:#B5432A;">${overCapacityCount}</div><div class="lbl">Over Capacity</div></div>`:''}
     </div>
-    <h2 class="section-title">Inventory Currently Out, By Equipment</h2>
+    <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+      <h2 class="section-title" style="margin-bottom:0;">Inventory Currently Out, By Equipment</h2>
+      <button class="ghost-btn" id="print-count-sheet-btn" style="font-size:12px;">Print Count Sheet</button>
+    </div>
     ${noMatches ? `<p style="font-size:13px; color:var(--ink-soft);">No equipment matches "${escHtml(inventorySearchTerm)}".</p>` : groups}
   `;
 }
@@ -4706,6 +4895,9 @@ function attachHandlers(){
       render();
     };
   }
+
+  const countSheetBtn = document.getElementById('print-count-sheet-btn');
+  if(countSheetBtn) countSheetBtn.onclick = ()=> printCountSheet();
 
   if(currentTab === 'inventory'){
     const invSearch = document.getElementById('inventory-search-input');
