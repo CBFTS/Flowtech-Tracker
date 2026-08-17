@@ -3804,6 +3804,12 @@ function renderInventory(){
    QuickBooks, not changing the math here.
 */
 
+// Bare alphanumerics only, for identifiers where spacing is meaningless:
+// "Neal 5104H", "neal 5104 h" and "NEAL-5104-H" all become "neal5104h".
+function normalizeTight(s){
+  return String(s||'').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
 function normalizeForMatch(s){
   return String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
 }
@@ -4183,6 +4189,161 @@ function renderRevenueByCustomer(){
   `;
 }
 
+/* ── BILLING CHECK ─────────────────────────────────────────────────
+   Catches the one failure the rest of the system is blind to: a well
+   marked billed in the tracker that never actually got invoiced.
+
+   Why nothing else catches it - the Wednesday reminder measures days
+   since a rig last had a well billed, so marking a well billed RESETS
+   that clock. The mistake silences the very alarm meant to catch it,
+   the pad completes on the next rig move, and the well disappears into
+   history with no invoice behind it.
+
+   Normal order of work is: invoice in QuickBooks first, mark it in the
+   tracker within a week. So a marked well with no invoice is already
+   out of sequence and can be flagged quickly. The grace window only
+   exists to absorb the occasional time it's done the other way round.
+
+   Telling a per-well invoice from a day-rate one is done from the data
+   rather than a list to maintain: a per-well invoice names a well and
+   carries no service-date range. Firebird's day-rate invoices name a
+   well AND carry dates, so they're excluded; generator invoices name no
+   well at all, so they're excluded too.
+*/
+function billingCheckGraceDays(){
+  const v = Number(appSettings.billingCheckGraceDays);
+  return (v > 0) ? v : 7;
+}
+
+function isPerWellInvoice(inv){
+  if(!inv || !inv.wellName) return false;
+  if(inv.statedDays != null) return false; // a day-rate line, not a well
+  return true;
+}
+
+function buildBillingCheck(){
+  const startDate = (qbRevenueData && qbRevenueData.startDate) || (new Date().getFullYear() + '-01-01');
+  const invoices = (qbRevenueData && Array.isArray(qbRevenueData.invoices)) ? qbRevenueData.invoices : [];
+  const perWell = invoices.filter(isPerWellInvoice);
+
+  // Every well marked billed in the tracker this year.
+  const marked = [];
+  (tickets||[]).forEach(t=>{
+    if(!Array.isArray(t.pads)) return;
+    t.pads.forEach(pad=>{
+      (Array.isArray(pad.billedWells)?pad.billedWells:[]).forEach(w=>{
+        if(!w || !w.date || w.date < startDate) return;
+        marked.push({
+          rig: t.rig || '',
+          customer: t.customer || '',
+          pad: pad.name || '',
+          label: (w.label||'').trim(),
+          date: w.date
+        });
+      });
+    });
+  });
+
+  const graceCutoff = (()=>{
+    const d = new Date();
+    d.setDate(d.getDate() - billingCheckGraceDays());
+    return d.toISOString().slice(0,10);
+  })();
+
+  const usedInvoices = new Set();
+  const missing = [];   // marked billed, no invoice found - money at risk
+  const tooRecent = []; // marked billed but inside the grace window
+
+  marked.forEach(m=>{
+    const mRig = normalizeTight(m.rig);
+    const mWell = normalizeTight(m.label);
+
+    const hit = perWell.find((inv,i)=>{
+      if(usedInvoices.has(i)) return false;
+      const iRig = normalizeTight(inv.rig);
+      const iWell = normalizeTight(inv.wellName);
+      // Rig has to agree when both name one.
+      const rigOk = (!mRig || !iRig) ? true : (mRig === iRig || mRig.indexOf(iRig) !== -1 || iRig.indexOf(mRig) !== -1);
+      if(!rigOk) return false;
+      if(!mWell || !iWell) return false;
+      return mWell === iWell || mWell.indexOf(iWell) !== -1 || iWell.indexOf(mWell) !== -1;
+    });
+
+    if(hit !== undefined){
+      usedInvoices.add(perWell.indexOf(hit));
+      return;
+    }
+    if(m.date > graceCutoff) tooRecent.push(m);
+    else missing.push(m);
+  });
+
+  // Invoices with no matching marked well - usually just the tracker
+  // lagging behind, which is the harmless direction.
+  const unmarked = perWell.filter((inv,i)=>!usedInvoices.has(i));
+
+  return { missing, tooRecent, unmarked, perWellCount: perWell.length, markedCount: marked.length, grace: billingCheckGraceDays() };
+}
+
+function renderBillingCheck(){
+  if(!syncUrl) return '';
+  if(!qbRevenueData || !qbRevenueData.connected || qbRevenueData.error) return '';
+
+  const c = buildBillingCheck();
+  if(c.markedCount === 0 && c.perWellCount === 0) return '';
+
+  const heading = `<h2 class="section-title" style="margin-top:24px;">Billing Check</h2>`;
+
+  if(c.missing.length === 0 && c.unmarked.length === 0){
+    return `${heading}
+      <div style="background:#EEF4EE; border:1.5px solid #B7D9BB; border-radius:8px; padding:14px 16px; font-size:13px;">
+        <strong style="color:#1E8A29;">Everything lines up.</strong>
+        <div style="font-size:12px; color:#5B6660; margin-top:4px;">
+          ${c.markedCount} well${c.markedCount!==1?'s':''} marked billed this year, all matched to an invoice.
+          ${c.tooRecent.length?`${c.tooRecent.length} marked in the last ${c.grace} days ${c.tooRecent.length!==1?'are':'is'} not checked yet.`:''}
+        </div>
+      </div>`;
+  }
+
+  let out = heading;
+
+  if(c.missing.length > 0){
+    const total = c.missing.length;
+    out += `<div style="background:#FCEBEA; border:1.5px solid #E0A9A0; border-radius:8px; padding:14px 16px; margin-bottom:12px;">
+      <div style="font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; font-size:13px; color:#B5432A; font-weight:600; margin-bottom:4px;">
+        ${total} well${total!==1?'s':''} marked billed with no invoice
+      </div>
+      <div style="font-size:12px; color:#8A3B2A; margin-bottom:8px;">
+        Marked billed in the tracker more than ${c.grace} days ago, but no per-well invoice in QuickBooks names it. Each one is work you may not have charged for.
+      </div>
+      ${c.missing.map(m=>`<div style="padding:8px 0; border-top:1px solid #E0A9A0; font-size:13px;">
+        <div style="font-weight:600;">${escHtml(m.label || '(no well name)')}</div>
+        <div style="font-size:11px; color:#8A3B2A;">${escHtml(m.rig||'no rig')} &middot; ${escHtml(m.pad||'no pad')} &middot; ${escHtml(m.customer||'')} &middot; marked ${fmtDate(m.date)}</div>
+      </div>`).join('')}
+    </div>`;
+  }
+
+  if(c.unmarked.length > 0){
+    out += `<div style="background:#FFF8E6; border:1.5px solid #E6D080; border-radius:8px; padding:14px 16px; margin-bottom:12px;">
+      <div style="font-size:12px; color:#8A6D10;">
+        <strong>${c.unmarked.length} invoice${c.unmarked.length!==1?'s':''} not marked billed in the tracker.</strong>
+        Usually just the tracker running behind — you've invoiced it, the app doesn't know yet. Worth a look if any are old.
+      </div>
+      ${c.unmarked.slice(0,15).map(inv=>`<div style="padding:6px 0; border-top:1px dashed #E6D080; font-size:12px;">
+        <span style="font-weight:600;">${escHtml(inv.wellName||'(no well name)')}</span>
+        <span style="color:#8A6D10;"> &middot; ${escHtml(inv.rig||'no rig')} &middot; ${escHtml(inv.docNumber||'')} &middot; ${escHtml(inv.date||'')}</span>
+      </div>`).join('')}
+      ${c.unmarked.length>15?`<div style="font-size:11px; color:#8A6D10; padding-top:6px;">Showing the first 15 of ${c.unmarked.length}.</div>`:''}
+    </div>`;
+  }
+
+  out += `<div style="font-size:11px; color:var(--ink-soft); line-height:1.5;">
+    Compares wells marked billed in the tracker against per-well invoices in QuickBooks, matching on rig and well name. Day-rate invoices and generator rentals are left out — they don't map one to one with wells.
+    ${c.tooRecent.length?`<br>${c.tooRecent.length} well${c.tooRecent.length!==1?'s':''} marked in the last ${c.grace} days ${c.tooRecent.length!==1?'are':'is'} still inside the grace window.`:''}
+  </div>`;
+
+  return out;
+}
+
 function renderReports(){
   const now = new Date();
   const thisMonth = now.getFullYear() + '-' + String(now.getMonth()+1).padStart(2,'0');
@@ -4354,6 +4515,7 @@ function renderReports(){
     </div>
 
     ${renderRevenueByCustomer()}
+    ${renderBillingCheck()}
 
     <h2 class="section-title" style="margin-top:24px;">Wells Billed by Month</h2>
     <div style="background:#fff; border:1.5px solid #E8EDE8; border-radius:8px; padding:16px;">
