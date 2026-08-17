@@ -756,6 +756,7 @@ let qbRevenueData = null; // { connected, startDate, totalRevenue, invoiceCount,
 let qbRevenueLoading = false; // guards against firing a second fetch while one is already in flight
 let showUnattributedDetail = false; // expands the diagnostic list under the Unattributed row on Reports
 let showInvoiceRules = false; // expands the invoice-number rules editor on Reports
+let expandedPayers = []; // paying customers whose operator breakdown is open
 let showPadHistory = false; // Pad History table on Reports starts collapsed - it grows without bound
 
 // QuickBooks customers that are really pass-through vendors - the invoice is
@@ -3881,56 +3882,63 @@ function renderRevenueByCustomer(){
   }
 
   const lookup = buildOperatorLookup();
-  const groups = {};   // operator/customer name -> { total, count, viaVendor, direct }
+
+  // Grouped by WHO PAYS. Silverzone and West Texas Premix are the paying
+  // customers; the operator whose well it is sits underneath them. Earlier
+  // versions promoted the operator to the top line, which quietly
+  // misrepresented Silverzone - it's a cementing company Flow-Tech is set
+  // up with directly, and the operators are its clients, not Flow-Tech's.
+  const groups = {};
   let unattributed = { total:0, count:0, items:[] };
   let vendorTotal = 0;
 
   invoices.forEach(inv=>{
     const billedTo = inv.customer || 'Unknown';
-    // Compare on the parent name so sub-customer jobs like
-    // "West Texas Premix Pits:H&P 517" still register as vendor-billed.
-    const parent = parentCustomerName(billedTo);
-    const isPassThrough = isPassThroughCustomer(billedTo);
+    // Parent name, so sub-customer jobs like "West Texas Premix Pits:H&P 517"
+    // land on the parent rather than splitting into their own row.
+    const parent = parentCustomerName(billedTo) || billedTo;
 
-    if(isPassThrough) vendorTotal += inv.amount || 0;
-
-    // An invoice-number rule is an explicit decision about who the work
-    // belongs to, so it beats everything else - including which customer
-    // QuickBooks has the invoice written against.
+    // An invoice-number rule names the payer - FBE and GEN are both Firebird,
+    // SZC is Silverzone - and beats whatever QuickBooks has on the invoice.
     const rule = matchInvoiceRule(inv);
+    const payer = rule ? rule.operator : parent;
+
+    if(!groups[payer]) groups[payer] = {
+      total:0, count:0, byRule:0, prefixes:{}, breakdown:{}, split:false
+    };
+    const g = groups[payer];
+    g.total += inv.amount || 0;
+    g.count++;
     if(rule){
-      const name = rule.operator;
-      if(!groups[name]) groups[name] = { total:0, count:0, viaVendor:0, direct:0, byRule:0, vendors:{}, prefixes:{} };
-      groups[name].total += inv.amount || 0;
-      groups[name].count++;
-      groups[name].byRule += inv.amount || 0;
-      groups[name].prefixes[rule.prefix] = true;
-      if(isPassThrough) groups[name].vendors[parent] = true;
-      return;
+      g.byRule += inv.amount || 0;
+      g.prefixes[rule.prefix] = true;
     }
 
-    if(isPassThrough){
-      const match = attributeInvoice(inv, lookup);
-      if(!match){
+    // Only payers marked as pass-through get broken out underneath.
+    if(isPassThroughCustomer(payer)){
+      g.split = true;
+      vendorTotal += inv.amount || 0;
+
+      // The operator, in order of reliability:
+      //   1. the "Customer:" label written on the invoice itself
+      //   2. a rig or pad name matched against ticket history
+      //   3. nothing - and it says so rather than guessing
+      let op = (inv.operator || '').trim();
+      if(!op){
+        const match = attributeInvoice(inv, lookup);
+        op = match ? match.operator : '';
+      }
+      const key = op || 'Unattributed';
+      if(!g.breakdown[key]) g.breakdown[key] = { total:0, count:0, fromLabel:false };
+      g.breakdown[key].total += inv.amount || 0;
+      g.breakdown[key].count++;
+      if(inv.operator) g.breakdown[key].fromLabel = true;
+
+      if(!op){
         unattributed.total += inv.amount || 0;
         unattributed.count++;
         unattributed.items.push(inv);
-        return;
       }
-      const name = match.operator;
-      if(!groups[name]) groups[name] = { total:0, count:0, viaVendor:0, direct:0, byRule:0, vendors:{}, prefixes:{} };
-      groups[name].total += inv.amount || 0;
-      groups[name].count++;
-      groups[name].viaVendor += inv.amount || 0;
-      groups[name].vendors[parent] = true;
-    } else {
-      // Group direct customers by parent too, so a customer with jobs under
-      // it lands on one line instead of scattering into one row per job.
-      const key = parent || billedTo;
-      if(!groups[key]) groups[key] = { total:0, count:0, viaVendor:0, direct:0, byRule:0, vendors:{}, prefixes:{} };
-      groups[key].total += inv.amount || 0;
-      groups[key].count++;
-      groups[key].direct += inv.amount || 0;
     }
   });
 
@@ -3941,22 +3949,42 @@ function renderRevenueByCustomer(){
   let rows = '';
   entries.forEach(([name, g])=>{
     const barWidth = maxTotal > 0 ? Math.min(100, Math.round((g.total / maxTotal) * 100)) : 0;
-    const vendorNames = Object.keys(g.vendors);
     const prefixNames = Object.keys(g.prefixes||{});
+    const opNames = Object.keys(g.breakdown||{});
+    const expanded = expandedPayers.includes(name);
+
     const bits = [];
-    if(g.byRule > 0) bits.push(`${fmtMoney(g.byRule)} by invoice # (${escHtml(prefixNames.join(', '))})`);
-    if(g.viaVendor > 0) bits.push(`${fmtMoney(g.viaVendor)} via ${escHtml(vendorNames.join(', '))}`);
-    if(g.direct > 0 && bits.length) bits.push(`${fmtMoney(g.direct)} direct`);
+    if(g.byRule > 0) bits.push(`by invoice # ${escHtml(prefixNames.join(', '))}`);
+    if(g.split && opNames.length) bits.push(`${opNames.length} operator${opNames.length!==1?'s':''}`);
     const tag = bits.length
       ? `<div style="font-size:11px; color:#5B6660; margin-top:2px;">${bits.join(' &middot; ')}</div>`
       : '';
-    // Any row that came straight from QuickBooks (rather than being derived
-    // by splitting a vendor) can itself be marked as a pass-through vendor.
-    // This is how you tell the app the real spelling of a vendor name
-    // without anybody having to guess it.
-    const splitBtn = g.direct > 0
+
+    // A payer that isn't being split can be marked as a pass-through, which
+    // is how the app learns the exact spelling without anybody guessing it.
+    const splitBtn = !g.split
       ? `<button data-split-vendor="${escAttr(name)}" style="background:none; border:none; padding:0; margin-left:8px; color:#2E7D32; font-size:11px; text-decoration:underline; cursor:pointer; font-family:inherit;">split by operator</button>`
-      : '';
+      : `<button data-toggle-payer="${escAttr(name)}" style="background:none; border:none; padding:0; margin-left:8px; color:#2E7D32; font-size:11px; text-decoration:underline; cursor:pointer; font-family:inherit;">${expanded?'hide':'show'} operators</button>`;
+
+    // Operators nested under their payer, so the payer total stays the
+    // headline figure and the breakdown is there when you want it.
+    let nested = '';
+    if(g.split && expanded && opNames.length){
+      const ops = opNames.map(k=>[k, g.breakdown[k]]).sort((a,b)=>b[1].total - a[1].total);
+      nested = ops.map(([op, o])=>{
+        const isUnattr = op === 'Unattributed';
+        const share = g.total > 0 ? Math.round((o.total/g.total)*100) : 0;
+        return `<div style="display:grid; grid-template-columns:1fr 46px 90px; gap:8px; padding:7px 0 7px 14px; border-left:2px solid #E8EDE8; margin-left:2px; font-size:12px; align-items:center;">
+          <div>
+            <span style="${isUnattr?'color:#8A6D10; font-weight:600;':'font-weight:600;'}">${escHtml(op)}</span>
+            <span style="color:#5B6660;"> &middot; ${share}%</span>
+            ${o.fromLabel?'':`<span style="color:#5B6660; font-size:10px;"> by rig</span>`}
+          </div>
+          <div style="text-align:center; color:#5B6660;">${o.count}</div>
+          <div style="text-align:right;">${fmtMoney(o.total)}</div>
+        </div>`;
+      }).join('');
+    }
 
     rows += `<div style="padding:10px 0; border-bottom:1px solid #E8EDE8;">
       <div style="display:grid; grid-template-columns:1fr 60px 100px; gap:8px; font-size:13px; align-items:center;">
@@ -3967,15 +3995,15 @@ function renderRevenueByCustomer(){
       <div style="background:#E8EDE8; border-radius:4px; height:6px; overflow:hidden; margin-top:8px;">
         <div style="height:100%; width:${barWidth}%; background:#33D63A; border-radius:4px; min-width:2px;"></div>
       </div>
+      ${nested}
     </div>`;
   });
 
+  // Unattributed invoices are already counted inside their payer's
+  // breakdown, so this is a note about them - NOT another row. Adding it as
+  // a row double counted the money against the header total.
+  let unattributedNote = '';
   if(unattributed.count > 0){
-    // Expandable detail: shows the actual text pulled off each unmatched
-    // invoice next to the rig and pad names being matched against. If the
-    // rig name is visible in that text but still isn't matching, the names
-    // are spelled differently in QuickBooks than in the tracker - and this
-    // is where you can see it side by side.
     let detail = '';
     if(showUnattributedDetail){
       let items = '';
@@ -3989,27 +4017,19 @@ function renderRevenueByCustomer(){
           <div style="font-size:11px; color:#5B6660; margin-top:3px; word-break:break-word;">${raw ? escHtml(raw) : '<em>No text found on this invoice at all.</em>'}</div>
         </div>`;
       });
-      const moreNote = unattributed.items.length > 25
-        ? `<div style="font-size:11px; color:#8A6D10; padding-top:8px;">Showing the first 25 of ${unattributed.items.length}.</div>` : '';
       const knownNames = lookup.slice(0, 40).map(l=>l.label);
       detail = `<div style="background:#FFF8E6; border:1px solid #E6D080; border-radius:6px; padding:10px 12px; margin-top:8px;">
-        ${items}${moreNote}
+        ${items}
+        ${unattributed.items.length > 25 ? `<div style="font-size:11px; color:#8A6D10; padding-top:8px;">Showing the first 25 of ${unattributed.items.length}.</div>` : ''}
         <div style="font-size:11px; color:#5B6660; margin-top:10px; padding-top:8px; border-top:1px solid #E6D080;">
           <strong>Matching against ${lookup.length} name${lookup.length!==1?'s':''} from your tickets:</strong> ${escHtml(knownNames.join(', '))}${lookup.length>40?' ...':''}
         </div>
       </div>`;
     }
-
-    rows += `<div style="padding:10px 0; border-bottom:1px solid #E8EDE8;">
-      <div style="display:grid; grid-template-columns:1fr 60px 100px; gap:8px; font-size:13px; align-items:center;">
-        <div>
-          <div style="font-weight:600; color:#8A6D10;">Unattributed</div>
-          <div style="font-size:11px; color:#8A6D10;">Billed through ${escHtml(getPassThroughList().join(', '))}, no rig or pad name recognized
-            <button id="toggle-unattributed-detail" style="background:none; border:none; padding:0 0 0 4px; color:#8A6D10; font-size:11px; text-decoration:underline; cursor:pointer; font-family:inherit;">${showUnattributedDetail?'hide':'show me why'}</button>
-          </div>
-        </div>
-        <div style="text-align:center; color:#8A6D10;">${unattributed.count}</div>
-        <div style="text-align:right; font-weight:600; color:#8A6D10;">${fmtMoney(unattributed.total)}</div>
+    unattributedNote = `<div style="background:#FFF8E6; border:1.5px solid #E6D080; border-radius:8px; padding:12px 14px; margin-top:14px;">
+      <div style="font-size:12px; color:#8A6D10;">
+        <strong>${unattributed.count} invoice${unattributed.count!==1?'s':''} (${fmtMoney(unattributed.total)})</strong> couldn't be tied to an operator — no <em>Customer:</em> line and no rig or pad name recognized. They're included in their customer's total above, shown as Unattributed in the breakdown.
+        <button id="toggle-unattributed-detail" style="background:none; border:none; padding:0 0 0 4px; color:#8A6D10; font-size:11px; text-decoration:underline; cursor:pointer; font-family:inherit;">${showUnattributedDetail?'hide':'show me why'}</button>
       </div>
       ${detail}
     </div>`;
@@ -4067,9 +4087,10 @@ function renderRevenueByCustomer(){
     </div>
     <div style="background:#fff; border:1.5px solid #E8EDE8; border-radius:8px; padding:16px;">
       <div style="display:grid; grid-template-columns:1fr 60px 100px; gap:8px; padding-bottom:8px; border-bottom:2px solid #E8EDE8; font-size:11px; text-transform:uppercase; letter-spacing:0.5px; color:#5B6660;">
-        <div>Operator</div><div style="text-align:center;">Inv</div><div style="text-align:right;">Revenue</div>
+        <div>Customer</div><div style="text-align:center;">Inv</div><div style="text-align:right;">Revenue</div>
       </div>
       ${rows}
+      ${unattributedNote}
       <div style="margin-top:12px; padding-top:10px; border-top:1px solid #E8EDE8; font-size:11px; color:#5B6660;">
         ${rules.length} invoice number rule${rules.length!==1?'s':''} active
         <button id="toggle-invoice-rules" style="background:none; border:none; padding:0 0 0 4px; color:#2E7D32; font-size:11px; text-decoration:underline; cursor:pointer; font-family:inherit;">${showInvoiceRules?'hide':'edit'}</button>
@@ -4078,7 +4099,7 @@ function renderRevenueByCustomer(){
       ${vendorChips}
       <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; margin-top:12px; flex-wrap:wrap;">
         <div style="font-size:11px; color:#5B6660;">
-          Live from QuickBooks${fetchedTime?' as of '+fetchedTime:''}. Vendor-billed work is credited to the operator by matching rig and pad names on the invoice.
+          Live from QuickBooks${fetchedTime?' as of '+fetchedTime:''}. Vendor-billed work is credited to the operator using the <em>Customer:</em> line on the invoice, falling back to rig and pad name matching.
           ${qbRevenueData.truncated?'<span style="color:#B5432A;"> Showing the first 10,000 invoices only.</span>':''}
         </div>
         <button class="ghost-btn" id="refresh-qb-revenue-btn" style="font-size:12px;">Refresh</button>
@@ -4618,13 +4639,23 @@ function attachHandlers(){
     };
   });
 
+  document.querySelectorAll('[data-toggle-payer]').forEach(btn=>{
+    btn.onclick = ()=>{
+      const name = btn.dataset.togglePayer;
+      expandedPayers = expandedPayers.includes(name)
+        ? expandedPayers.filter(n=>n!==name)
+        : expandedPayers.concat([name]);
+      render();
+    };
+  });
+
   document.querySelectorAll('[data-split-vendor]').forEach(btn=>{
     btn.onclick = ()=>{
       const name = btn.dataset.splitVendor;
       const list = getPassThroughList();
       if(!list.some(v=>normalizeForMatch(v) === normalizeForMatch(name))) list.push(name);
       savePassThroughCustomers();
-      showUnattributedDetail = true; // open the diagnostic straight away so it's obvious what matched
+      if(!expandedPayers.includes(name)) expandedPayers.push(name); // show the result immediately
       render();
     };
   });
