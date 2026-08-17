@@ -1389,6 +1389,18 @@ function draftQtyFor(name){
   return draftEquip.reduce((sum,e)=> e.name === name ? sum + (Number(e.qty)||0) : sum, 0);
 }
 
+// True when the paying customer is itself an operator we work for - i.e. it
+// shows up as a customer on tickets. Firebird pays for its own wells;
+// West Texas Premix pays for other people's.
+function payerIsOperator(payer){
+  const p = normalizeForMatch(payer);
+  if(!p) return false;
+  return knownOperatorNames().some(n=>{
+    const nn = normalizeForMatch(n);
+    return nn === p || nn.indexOf(p) !== -1 || p.indexOf(nn) !== -1;
+  });
+}
+
 function onHandWarningFor(name){
   if(!name) return '';
   const a = availableOnHand(name, editingId);
@@ -3851,6 +3863,20 @@ function isPassThroughCustomer(name){
   });
 }
 
+// Looks up the operator behind a named rig, using the labelled Rig field
+// rather than scanning description text. Far more reliable, and it works
+// even when the description carries nothing else useful.
+function operatorForRig(rigName, lookup){
+  const r = normalizeForMatch(rigName);
+  if(!r) return null;
+  for(let i=0;i<lookup.length;i++){
+    if(lookup[i].kind !== 'rig') continue;
+    const k = lookup[i].key;
+    if(k === r || r.indexOf(k) !== -1 || k.indexOf(r) !== -1) return lookup[i];
+  }
+  return null;
+}
+
 function attributeInvoice(inv, lookup){
   const haystack = normalizeForMatch(invoiceSearchText(inv));
   if(!haystack) return null;
@@ -3920,21 +3946,45 @@ function renderRevenueByCustomer(){
       vendorTotal += inv.amount || 0;
 
       // The operator, in order of reliability:
-      //   1. the "Customer:" label written on the invoice itself
+      //   1. the "Customer:" label written on the invoice
       //   2. a rig or pad name matched against ticket history
-      //   3. nothing - and it says so rather than guessing
+      //   3. the payer itself, but ONLY when the payer is somebody you
+      //      actually work for - Firebird is an operator that pays its own
+      //      bills, so an unlabelled Firebird invoice belongs to Firebird.
+      //      A vendor like West Texas Premix is nobody's operator, so this
+      //      never fires for them.
       let op = (inv.operator || '').trim();
+      let fromLabel = !!op;
+      if(!op && inv.rig){
+        const byRig = operatorForRig(inv.rig, lookup);
+        if(byRig) op = byRig.operator;
+      }
       if(!op){
         const match = attributeInvoice(inv, lookup);
         op = match ? match.operator : '';
       }
-      const key = op || 'Unattributed';
-      if(!g.breakdown[key]) g.breakdown[key] = { total:0, count:0, fromLabel:false };
-      g.breakdown[key].total += inv.amount || 0;
-      g.breakdown[key].count++;
-      if(inv.operator) g.breakdown[key].fromLabel = true;
+      if(!op && payerIsOperator(payer)) op = payer;
+      const opKey = op || 'Unattributed';
 
-      if(!op){
+      if(!g.breakdown[opKey]) g.breakdown[opKey] = { total:0, count:0, fromLabel:false, rigs:{} };
+      const ob = g.breakdown[opKey];
+      ob.total += inv.amount || 0;
+      ob.count++;
+      if(fromLabel) ob.fromLabel = true;
+
+      // Rig beneath the operator. The rig label is on every invoice type
+      // you send, so this is read rather than inferred nearly every time.
+      let rig = (inv.rig || '').trim();
+      if(!rig){
+        const m = attributeInvoice(inv, lookup);
+        if(m && m.kind === 'rig') rig = m.label;
+      }
+      const rigKey = rig || 'Rig not named';
+      if(!ob.rigs[rigKey]) ob.rigs[rigKey] = { total:0, count:0 };
+      ob.rigs[rigKey].total += inv.amount || 0;
+      ob.rigs[rigKey].count++;
+
+      if(opKey === 'Unattributed'){
         unattributed.total += inv.amount || 0;
         unattributed.count++;
         unattributed.items.push(inv);
@@ -3955,7 +4005,11 @@ function renderRevenueByCustomer(){
 
     const bits = [];
     if(g.byRule > 0) bits.push(`by invoice # ${escHtml(prefixNames.join(', '))}`);
-    if(g.split && opNames.length) bits.push(`${opNames.length} operator${opNames.length!==1?'s':''}`);
+    if(g.split && opNames.length){
+      let rigCount = 0;
+      opNames.forEach(op=>{ rigCount += Object.keys(g.breakdown[op].rigs||{}).length; });
+      bits.push(`${rigCount} rig${rigCount!==1?'s':''}`);
+    }
     const tag = bits.length
       ? `<div style="font-size:11px; color:#5B6660; margin-top:2px;">${bits.join(' &middot; ')}</div>`
       : '';
@@ -3964,24 +4018,45 @@ function renderRevenueByCustomer(){
     // is how the app learns the exact spelling without anybody guessing it.
     const splitBtn = !g.split
       ? `<button data-split-vendor="${escAttr(name)}" style="background:none; border:none; padding:0; margin-left:8px; color:#2E7D32; font-size:11px; text-decoration:underline; cursor:pointer; font-family:inherit;">split by operator</button>`
-      : `<button data-toggle-payer="${escAttr(name)}" style="background:none; border:none; padding:0; margin-left:8px; color:#2E7D32; font-size:11px; text-decoration:underline; cursor:pointer; font-family:inherit;">${expanded?'hide':'show'} operators</button>`;
+      : `<button data-toggle-payer="${escAttr(name)}" style="background:none; border:none; padding:0; margin-left:8px; color:#2E7D32; font-size:11px; text-decoration:underline; cursor:pointer; font-family:inherit;">${expanded?'hide':'show'} rigs</button>`;
 
-    // Operators nested under their payer, so the payer total stays the
-    // headline figure and the breakdown is there when you want it.
+    // One flat level: a row per rig, with the operator named beside it.
+    // The rig is the only thing labelled on every invoice type, so this is
+    // read data rather than inference, and it's the level that actually
+    // tells you something - Double Eagle as a single figure hides one rig
+    // running while the other has been quiet since June.
     let nested = '';
     if(g.split && expanded && opNames.length){
-      const ops = opNames.map(k=>[k, g.breakdown[k]]).sort((a,b)=>b[1].total - a[1].total);
-      nested = ops.map(([op, o])=>{
-        const isUnattr = op === 'Unattributed';
-        const share = g.total > 0 ? Math.round((o.total/g.total)*100) : 0;
+      const rigRows = [];
+      opNames.forEach(op=>{
+        const o = g.breakdown[op];
+        Object.keys(o.rigs).forEach(rig=>{
+          rigRows.push({
+            rig,
+            operator: op,
+            fromLabel: o.fromLabel,
+            total: o.rigs[rig].total,
+            count: o.rigs[rig].count
+          });
+        });
+      });
+      rigRows.sort((x,y)=>y.total - x.total);
+
+      nested = rigRows.map(r=>{
+        const isUnattr = r.operator === 'Unattributed';
+        const share = g.total > 0 ? Math.round((r.total/g.total)*100) : 0;
+        // Naming the operator is pointless when it IS the payer, as with
+        // Firebird - that would just repeat the row above.
+        const sameAsPayer = normalizeForMatch(r.operator) === normalizeForMatch(name);
+        const opLabel = (isUnattr || !sameAsPayer)
+          ? `<span style="color:${isUnattr?'#8A6D10':'#5B6660'};"> &middot; ${escHtml(r.operator)}</span>` : '';
         return `<div style="display:grid; grid-template-columns:1fr 46px 90px; gap:8px; padding:7px 0 7px 14px; border-left:2px solid #E8EDE8; margin-left:2px; font-size:12px; align-items:center;">
           <div>
-            <span style="${isUnattr?'color:#8A6D10; font-weight:600;':'font-weight:600;'}">${escHtml(op)}</span>
+            <span style="font-weight:600;">${escHtml(r.rig)}</span>${opLabel}
             <span style="color:#5B6660;"> &middot; ${share}%</span>
-            ${o.fromLabel?'':`<span style="color:#5B6660; font-size:10px;"> by rig</span>`}
           </div>
-          <div style="text-align:center; color:#5B6660;">${o.count}</div>
-          <div style="text-align:right;">${fmtMoney(o.total)}</div>
+          <div style="text-align:center; color:#5B6660;">${r.count}</div>
+          <div style="text-align:right;">${fmtMoney(r.total)}</div>
         </div>`;
       }).join('');
     }
