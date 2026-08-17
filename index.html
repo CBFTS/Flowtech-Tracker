@@ -1295,7 +1295,11 @@ function renderCountScreen(){
 */
 function ensureInventoryCount(){
   if(!appSettings.inventoryCount || typeof appSettings.inventoryCount !== 'object'){
-    appSettings.inventoryCount = { items:{}, processedReturns: allReturnedTicketIds_() };
+    appSettings.inventoryCount = {
+      items:{},
+      processedReturns: allReturnedTicketIds_(),
+      processedDeliveries: tickets.map(t=>t.id)
+    };
   }
   const inv = appSettings.inventoryCount;
   if(!inv.items || typeof inv.items !== 'object') inv.items = {};
@@ -1303,6 +1307,10 @@ function ensureInventoryCount(){
   // ledger. Seeding it with everything already returned stops years of old
   // returns flooding into In Shop the first time this runs.
   if(!Array.isArray(inv.processedReturns)) inv.processedReturns = allReturnedTicketIds_();
+  // Same reasoning for departures: on first appearance every existing ticket
+  // counts as accounted for, or the first run would subtract every delivery
+  // ever made from Ready.
+  if(!Array.isArray(inv.processedDeliveries)) inv.processedDeliveries = tickets.map(t=>t.id);
   return inv;
 }
 
@@ -1319,12 +1327,34 @@ function yardEntry(name){
   return it;
 }
 
-async function reconcileShopFromReturns(){
+async function reconcileYardFromTickets(){
   if(!tickets || tickets.length === 0) return false;
   const inv = ensureInventoryCount();
-  const seen = new Set(inv.processedReturns);
   let changed = false;
 
+  // ── Iron leaving ────────────────────────────────────────────────
+  // A ticket going out has to come OUT of Ready. Without this Ready only
+  // ever climbs, and ends up contradicting On Hand on the same screen -
+  // ten marked ready while only six are at the yard. Floored at zero: if
+  // more went out than was ever marked ready that's a data gap, and the
+  // row reports it rather than the number going negative.
+  const seenOut = new Set(inv.processedDeliveries);
+  tickets.forEach(t=>{
+    if(seenOut.has(t.id)) return;
+    (t.equipment||[]).forEach(e=>{
+      const name = e.name;
+      const qty = Number(e.qty)||0;
+      if(!name || qty <= 0) return;
+      const it = yardEntry(name);
+      it.ready = Math.max(0, it.ready - qty);
+    });
+    inv.processedDeliveries.push(t.id);
+    seenOut.add(t.id);
+    changed = true;
+  });
+
+  // ── Iron coming home ────────────────────────────────────────────
+  const seen = new Set(inv.processedReturns);
   tickets.forEach(t=>{
     if(!t.returnDate || seen.has(t.id)) return;
     (t.equipment||[]).forEach(e=>{
@@ -1645,7 +1675,8 @@ async function applyCountSession(){
     // A fresh count is the new baseline: every return up to this moment is
     // already reflected in what was physically counted, so mark them all
     // accounted for. Without this the next reconcile would add them again.
-    processedReturns: allReturnedTicketIds_()
+    processedReturns: allReturnedTicketIds_(),
+    processedDeliveries: tickets.map(t=>t.id)
   };
 
   countSession = null;
@@ -2454,7 +2485,7 @@ async function pullFromCloud(silent){
     localStorage.setItem(TEMPLATE_KEY, JSON.stringify(templateCatalog));
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(appSettings));
     syncStatus = 'ok';
-    await reconcileShopFromReturns();
+    await reconcileYardFromTickets();
   }catch(e){
     console.error('Cloud pull failed', e);
     syncStatus = 'error';
@@ -2488,7 +2519,7 @@ async function pushToCloud(){
     });
     if(deletesToSend.length) pendingDeletes = pendingDeletes.filter(id=>!deletesToSend.includes(id));
     syncStatus = 'ok';
-    await reconcileShopFromReturns();
+    await reconcileYardFromTickets();
   }catch(e){
     console.error('Cloud push failed', e);
     syncStatus = 'error';
@@ -3634,8 +3665,13 @@ function renderFullInventory(){
     const allOut = !unknown && r.onHand <= 0 && r.owned > 0;
     // Whatever is home but hasn't been placed in either yard bucket - iron
     // that was never counted, or came back before the shop queue existed.
-    const unaccounted = (!unknown && (r.ready>0 || r.shop>0))
-      ? Math.max(0, r.onHand - r.ready - r.shop) : 0;
+    // Positive: home but in neither bucket. Negative: MORE marked ready than
+    // are actually home - which Math.max(0, ...) floored to zero, hiding the
+    // one number that would have shown the problem.
+    const placedGap = (!unknown && (r.ready>0 || r.shop>0))
+      ? (r.onHand - r.ready - r.shop) : 0;
+    const unaccounted = placedGap > 0 ? placedGap : 0;
+    const overplaced = placedGap < 0 ? Math.abs(placedGap) : 0;
     return `<div style="padding:10px 0; border-bottom:1px solid var(--line);">
       <div style="display:grid; grid-template-columns:1fr 54px 54px 62px; gap:6px; font-size:13px; align-items:center;">
         <div style="font-weight:600;">${escHtml(r.name)}</div>
@@ -3653,6 +3689,7 @@ function renderFullInventory(){
           <span style="color:#1E8A29; font-weight:600;">${r.ready} ready</span>
           &middot; <span style="color:${r.shop>0?'#B8691C':'var(--ink-soft)'};">${r.shop} in shop</span>
           ${unaccounted ? ` &middot; <span style="color:#B8691C;">${unaccounted} unaccounted</span>` : ''}
+          ${overplaced ? ` &middot; <span style="color:#B5432A;">${overplaced} more marked ready than are home</span>` : ''}
         </div>
         ${r.shop>0?`<button data-mark-ready="${escAttr(r.name)}" style="background:none; border:1px solid var(--line); border-radius:5px; padding:4px 9px; font-size:11px; cursor:pointer; font-family:inherit; white-space:nowrap;">Ready &#9656;</button>`:''}
       </div>` : ''}
@@ -3827,6 +3864,13 @@ function buildOperatorLookup(){
       const k = normalizeForMatch(t.rig);
       if(k.length >= 3) byKey[k] = { key:k, operator, label:t.rig, kind:'rig' };
     }
+    // A rig this ticket was on previously belongs to the same operator, so
+    // invoices raised under the old rig name still resolve.
+    (Array.isArray(t.previousRigs)?t.previousRigs:[]).forEach(p=>{
+      if(!p || !p.rig) return;
+      const pk = normalizeForMatch(p.rig);
+      if(pk.length >= 3 && !byKey[pk]) byKey[pk] = { key:pk, operator, label:p.rig, kind:'rig' };
+    });
     if(Array.isArray(t.pads)){
       t.pads.forEach(p=>{
         if(!p || !p.name) return;
@@ -3891,7 +3935,12 @@ function knownRigNames(){
   const set = {};
   (rigCatalog||[]).forEach(r=>{ const n=(typeof r==='string')?r:(r&&r.name); if(n) set[n]=true; });
   (archivedRigs||[]).forEach(r=>{ const n=(typeof r==='string')?r:(r&&r.name); if(n) set[n]=true; });
-  (tickets||[]).forEach(t=>{ if(t.rig) set[t.rig]=true; });
+  (tickets||[]).forEach(t=>{
+    if(t.rig) set[t.rig]=true;
+    // Rigs this ticket used to be on - still valid names for anything
+    // invoiced before the transfer.
+    (Array.isArray(t.previousRigs)?t.previousRigs:[]).forEach(p=>{ if(p && p.rig) set[p.rig]=true; });
+  });
   return Object.keys(set);
 }
 
@@ -3927,6 +3976,29 @@ function canonicalRigName(raw){
     if(sameRigName(r, known[i])) return known[i];
   }
   return r;
+}
+
+function rigOperatorOverrides(){
+  const list = appSettings.rigOperatorOverrides;
+  return Array.isArray(list) ? list : [];
+}
+
+function rigOperatorOverride(rigName){
+  const r = normalizeTight(rigName);
+  if(!r) return '';
+  const hit = rigOperatorOverrides().find(o=>{
+    const k = normalizeTight(o.rig);
+    return k && (k === r || k.indexOf(r) !== -1 || r.indexOf(k) !== -1);
+  });
+  return hit ? hit.operator : '';
+}
+
+async function setRigOperatorOverride(rigName, operator){
+  const list = rigOperatorOverrides().filter(o=>normalizeTight(o.rig) !== normalizeTight(rigName));
+  if(operator) list.push({ rig: rigName, operator: operator });
+  appSettings.rigOperatorOverrides = list;
+  await saveAppSettings();
+  render();
 }
 
 function operatorForRig(rigName, lookup){
@@ -4018,6 +4090,11 @@ function renderRevenueByCustomer(){
       //      never fires for them.
       let op = (inv.operator || '').trim();
       let fromLabel = !!op;
+      let fromOverride = false;
+      if(!op && inv.rig){
+        const override = rigOperatorOverride(inv.rig);
+        if(override){ op = override; fromOverride = true; }
+      }
       if(!op && inv.rig){
         const byRig = operatorForRig(inv.rig, lookup);
         if(byRig) op = byRig.operator;
@@ -4044,8 +4121,9 @@ function renderRevenueByCustomer(){
       }
       const canonical = canonicalRigName(rig);
       const rigKey = canonical || 'Rig not named';
-      if(!ob.rigs[rigKey]) ob.rigs[rigKey] = { total:0, count:0, spellings:{}, docs:[] };
+      if(!ob.rigs[rigKey]) ob.rigs[rigKey] = { total:0, count:0, spellings:{}, docs:[], fromOverride:false };
       const rb = ob.rigs[rigKey];
+      if(fromOverride) rb.fromOverride = true;
       rb.total += inv.amount || 0;
       rb.count++;
       if(rig && rig !== rigKey) rb.spellings[rig] = true;
@@ -4107,7 +4185,8 @@ function renderRevenueByCustomer(){
             total: o.rigs[rig].total,
             count: o.rigs[rig].count,
             spellings: Object.keys(o.rigs[rig].spellings||{}),
-            docs: o.rigs[rig].docs||[]
+            docs: o.rigs[rig].docs||[],
+            fromOverride: !!o.rigs[rig].fromOverride
           });
         });
       });
@@ -4123,11 +4202,18 @@ function renderRevenueByCustomer(){
           ? `<span style="color:${isUnattr?'#8A6D10':'#5B6660'};"> &middot; ${escHtml(r.operator)}</span>` : '';
         const mergeNote = r.spellings.length
           ? `<div style="font-size:10px; color:#5B6660; margin-top:1px;">also invoiced as ${escHtml(r.spellings.join(', '))}</div>` : '';
+        let assignBtn = '';
+        if(isUnattr && r.rig !== 'Rig not named'){
+          assignBtn = `<button data-assign-rig="${escAttr(r.rig)}" style="background:none; border:none; padding:0; margin-left:6px; color:#2E7D32; font-size:10px; text-decoration:underline; cursor:pointer; font-family:inherit;">assign operator</button>`;
+        } else if(r.fromOverride){
+          // Says plainly that this one was set by hand, and lets it be undone.
+          assignBtn = `<span style="color:#5B6660; font-size:10px;"> set by hand</span><button data-assign-rig="${escAttr(r.rig)}" style="background:none; border:none; padding:0; margin-left:6px; color:#2E7D32; font-size:10px; text-decoration:underline; cursor:pointer; font-family:inherit;">change</button>`;
+        }
         const docNote = (r.rig === 'Rig not named' && r.docs.length)
           ? `<div style="font-size:10px; color:#8A6D10; margin-top:1px;">${escHtml(r.docs.slice(0,6).join(', '))}${r.docs.length>6?` +${r.docs.length-6} more`:''}</div>` : '';
         return `<div style="display:grid; grid-template-columns:1fr 46px 90px; gap:8px; padding:7px 0 7px 14px; border-left:2px solid #E8EDE8; margin-left:2px; font-size:12px; align-items:center;">
           <div>
-            <span style="font-weight:600;">${escHtml(r.rig)}</span>${opLabel}
+            <span style="font-weight:600;">${escHtml(r.rig)}</span>${opLabel}${assignBtn}
             <span style="color:#5B6660;"> &middot; ${share}%</span>
             ${mergeNote}${docNote}
           </div>
@@ -4280,6 +4366,17 @@ function renderRevenueByCustomer(){
    well AND carry dates, so they're excluded; generator invoices name no
    well at all, so they're excluded too.
 */
+// Wells and invoices before this date are taken as settled and left out of
+// the check. Deliberately separate from the revenue pull, which stays
+// year-to-date - moving that would quietly change what "Invoiced YTD" means
+// and break the revenue figures to tidy up a different screen.
+function billingCheckStartDate(){
+  const d = appSettings.billingCheckStartDate;
+  const revStart = (qbRevenueData && qbRevenueData.startDate) || (new Date().getFullYear() + '-01-01');
+  if(!d) return revStart;
+  return d > revStart ? d : revStart; // never reach back further than the data
+}
+
 function billingCheckGraceDays(){
   const v = Number(appSettings.billingCheckGraceDays);
   return (v > 0) ? v : 7;
@@ -4292,9 +4389,11 @@ function isPerWellInvoice(inv){
 }
 
 function buildBillingCheck(){
-  const startDate = (qbRevenueData && qbRevenueData.startDate) || (new Date().getFullYear() + '-01-01');
+  const startDate = billingCheckStartDate();
   const invoices = (qbRevenueData && Array.isArray(qbRevenueData.invoices)) ? qbRevenueData.invoices : [];
-  const perWell = invoices.filter(isPerWellInvoice);
+  // Both sides are cut off at the same date, or old invoices would look
+  // unmarked while the wells they belong to had been filtered away.
+  const perWell = invoices.filter(inv=>isPerWellInvoice(inv) && (!inv.date || inv.date >= startDate));
 
   // Every well marked billed in the tracker this year.
   const marked = [];
@@ -4304,7 +4403,14 @@ function buildBillingCheck(){
       (Array.isArray(pad.billedWells)?pad.billedWells:[]).forEach(w=>{
         if(!w || !w.date || w.date < startDate) return;
         marked.push({
-          rig: t.rig || '',
+          ticketId: t.id,
+          padId: pad.id || pad.name || '',
+          // Every rig this ticket has been associated with. An invoice raised
+          // before a rig transfer names the old one.
+          rigLineage: [t.rig].concat((Array.isArray(t.previousRigs)?t.previousRigs:[]).map(p=>p&&p.rig)).filter(Boolean),
+          // The rig recorded when the well was billed, not whatever the
+          // ticket says now - a transferred rig would otherwise rewrite it.
+          rig: (w.rig || t.rig || ''),
           customer: t.customer || '',
           pad: pad.name || '',
           label: (w.label||'').trim(),
@@ -4321,28 +4427,117 @@ function buildBillingCheck(){
   })();
 
   const usedInvoices = new Set();
-  const missing = [];   // marked billed, no invoice found - money at risk
-  const tooRecent = []; // marked billed but inside the grace window
+  const missing = [];      // marked billed, no invoice found - money at risk
+  const tooRecent = [];    // marked billed but inside the grace window
+  const rigChanged = [];   // matched by well, but invoiced under another rig
+  const matchedByCount = []; // reconciled by count when the names disagreed
+
+  const wellsAgree = (a, b)=>{
+    if(!a || !b) return false;
+    if(a === b) return true;
+    // A short label is not evidence. "3" would otherwise match "neal5103h",
+    // and match whichever invoice happened to come first.
+    const shorter = a.length <= b.length ? a : b;
+    if(shorter.length < 4) return false;
+    return a.indexOf(b) !== -1 || b.indexOf(a) !== -1;
+  };
+  const rigsAgree = (a, b)=>{
+    if(!a || !b) return true; // one side silent - the well name carries it
+    return a === b || a.indexOf(b) !== -1 || b.indexOf(a) !== -1 || sameRigName(a, b);
+  };
+
+  // Pass one: match on names. Anything that fails is set aside rather than
+  // judged yet - the grace window is applied at the end, so a well marked
+  // yesterday can still account for an invoice and stop it being reported
+  // as unmarked.
+  const unmatched = [];
+  // Rigs learned from invoices that matched wells on the same pad.
+  const discoveredRigs = {};
 
   marked.forEach(m=>{
     const mRig = normalizeTight(m.rig);
     const mWell = normalizeTight(m.label);
 
-    const hit = perWell.find((inv,i)=>{
+    // Rig and well both agree. Preferred, and precise.
+    let idx = perWell.findIndex((inv,i)=>{
       if(usedInvoices.has(i)) return false;
-      const iRig = normalizeTight(inv.rig);
-      const iWell = normalizeTight(inv.wellName);
-      // Rig has to agree when both name one.
-      const rigOk = (!mRig || !iRig) ? true : (mRig === iRig || mRig.indexOf(iRig) !== -1 || iRig.indexOf(mRig) !== -1);
-      if(!rigOk) return false;
-      if(!mWell || !iWell) return false;
-      return mWell === iWell || mWell.indexOf(iWell) !== -1 || iWell.indexOf(mWell) !== -1;
+      if(!wellsAgree(mWell, normalizeTight(inv.wellName))) return false;
+      return rigsAgree(mRig, normalizeTight(inv.rig));
     });
 
-    if(hit !== undefined){
-      usedInvoices.add(perWell.indexOf(hit));
+    // The well name alone. Specific enough to stand by itself, and the rig
+    // legitimately differs after iron transfers to a replacement rig.
+    let viaWellOnly = false;
+    if(idx === -1){
+      idx = perWell.findIndex((inv,i)=>{
+        if(usedInvoices.has(i)) return false;
+        return wellsAgree(mWell, normalizeTight(inv.wellName));
+      });
+      if(idx !== -1) viaWellOnly = true;
+    }
+
+    if(idx !== -1){
+      usedInvoices.add(idx);
+      const padKey = m.ticketId + '|' + m.padId;
+      if(perWell[idx].rig){
+        if(!discoveredRigs[padKey]) discoveredRigs[padKey] = [];
+        if(discoveredRigs[padKey].indexOf(perWell[idx].rig) === -1) discoveredRigs[padKey].push(perWell[idx].rig);
+      }
+      if(viaWellOnly){
+        const inv = perWell[idx];
+        if(inv.rig && m.rig && !rigsAgree(mRig, normalizeTight(inv.rig))){
+          rigChanged.push({ well: m.label, trackerRig: m.rig, invoiceRig: inv.rig, doc: inv.docNumber, date: m.date });
+        }
+      }
       return;
     }
+    unmatched.push(m);
+  });
+
+  // Pass two: reconcile by COUNT within each pad. Well names are typed by
+  // hand in the tracker and typed again on the invoice, so they often don't
+  // agree - "1-1H" against "Neal 5103H". Four wells billed on a pad against
+  // four spare per-well invoices for that rig reconciles regardless of what
+  // anybody called them.
+  const byPad = {};
+  unmatched.forEach(m=>{
+    const key = m.ticketId + '|' + m.padId;
+    if(!byPad[key]) byPad[key] = [];
+    byPad[key].push(m);
+  });
+
+  const leftover = [];
+  Object.keys(byPad).forEach(key=>{
+    const group = byPad[key];
+    const lineage = ((group[0].rigLineage && group[0].rigLineage.length) ? group[0].rigLineage.slice() : [group[0].rig])
+      .concat(discoveredRigs[key] || [])
+      .filter(Boolean);
+
+    const spare = [];
+    perWell.forEach((inv,i)=>{
+      if(usedInvoices.has(i)) return;
+      const iRig = normalizeTight(inv.rig);
+      if(!iRig) return;
+      const onLineage = lineage.some(r=>{
+        const lr = normalizeTight(r);
+        return lr && (lr === iRig || lr.indexOf(iRig) !== -1 || iRig.indexOf(lr) !== -1 || sameRigName(r, inv.rig));
+      });
+      if(onLineage) spare.push(i);
+    });
+
+    group.forEach(m=>{
+      if(spare.length > 0){
+        const i = spare.shift();
+        usedInvoices.add(i);
+        matchedByCount.push({ well: m.label, rig: perWell[i].rig, doc: perWell[i].docNumber, date: m.date });
+      } else {
+        leftover.push(m);
+      }
+    });
+  });
+
+  // Only now decide what's a problem and what's simply recent.
+  leftover.forEach(m=>{
     if(m.date > graceCutoff) tooRecent.push(m);
     else missing.push(m);
   });
@@ -4351,7 +4546,21 @@ function buildBillingCheck(){
   // lagging behind, which is the harmless direction.
   const unmarked = perWell.filter((inv,i)=>!usedInvoices.has(i));
 
-  return { missing, tooRecent, unmarked, perWellCount: perWell.length, markedCount: marked.length, grace: billingCheckGraceDays() };
+  return { missing, tooRecent, unmarked, rigChanged, matchedByCount, perWellCount: perWell.length, markedCount: marked.length, grace: billingCheckGraceDays(), startDate: startDate, isScoped: !!appSettings.billingCheckStartDate };
+}
+
+function renderBillingCheckFooter(c){
+  return `<div style="font-size:11px; color:var(--ink-soft); line-height:1.5; margin-top:10px;">
+    Compares wells marked billed in the tracker against per-well invoices in QuickBooks, matching on rig and well name. Day-rate invoices and generator rentals are left out — they don't map one to one with wells.
+    ${c.tooRecent.length?`<br>${c.tooRecent.length} well${c.tooRecent.length!==1?'s':''} marked in the last ${c.grace} days ${c.tooRecent.length!==1?'are':'is'} still inside the grace window.`:''}
+    <div style="display:flex; align-items:center; gap:8px; margin-top:8px; flex-wrap:wrap;">
+      <span>Checking from</span>
+      <input type="date" id="billing-check-start" value="${escAttr(c.startDate)}"
+        style="padding:4px 6px; border:1px solid var(--line); border-radius:4px; font-size:12px; font-family:inherit;">
+      ${c.isScoped?`<button id="billing-check-reset" style="background:none; border:none; padding:0; color:#2E7D32; font-size:11px; text-decoration:underline; cursor:pointer; font-family:inherit;">use whole year</button>`:''}
+      <span style="color:#8A8F94;">anything before this is treated as already settled</span>
+    </div>
+  </div>`;
 }
 
 function renderBillingCheck(){
@@ -4368,10 +4577,14 @@ function renderBillingCheck(){
       <div style="background:#EEF4EE; border:1.5px solid #B7D9BB; border-radius:8px; padding:14px 16px; font-size:13px;">
         <strong style="color:#1E8A29;">Everything lines up.</strong>
         <div style="font-size:12px; color:#5B6660; margin-top:4px;">
-          ${c.markedCount} well${c.markedCount!==1?'s':''} marked billed this year, all matched to an invoice.
+          ${c.markedCount} well${c.markedCount!==1?'s':''} marked billed in range, all matched to an invoice.
           ${c.tooRecent.length?`${c.tooRecent.length} marked in the last ${c.grace} days ${c.tooRecent.length!==1?'are':'is'} not checked yet.`:''}
         </div>
-      </div>`;
+      </div>
+      ${c.rigChanged.length?`<div style="background:#EEF4EE; border:1.5px solid #B7D9BB; border-radius:8px; padding:12px 14px; margin-top:10px; font-size:12px; color:#2E5B34;">
+        <strong>${c.rigChanged.length} well${c.rigChanged.length!==1?'s':''} matched under a different rig</strong> — ${c.rigChanged.map(r=>escHtml(r.well)+' (invoiced as '+escHtml(r.invoiceRig)+')').join(', ')}. Normal after a rig transfer.
+      </div>`:''}
+      ${renderBillingCheckFooter(c)}`;
   }
 
   let out = heading;
@@ -4406,11 +4619,33 @@ function renderBillingCheck(){
     </div>`;
   }
 
-  out += `<div style="font-size:11px; color:var(--ink-soft); line-height:1.5;">
-    Compares wells marked billed in the tracker against per-well invoices in QuickBooks, matching on rig and well name. Day-rate invoices and generator rentals are left out — they don't map one to one with wells.
-    ${c.tooRecent.length?`<br>${c.tooRecent.length} well${c.tooRecent.length!==1?'s':''} marked in the last ${c.grace} days ${c.tooRecent.length!==1?'are':'is'} still inside the grace window.`:''}
-  </div>`;
+  if(c.matchedByCount.length > 0){
+    out += `<div style="background:#EEF4EE; border:1.5px solid #B7D9BB; border-radius:8px; padding:12px 14px; margin-bottom:12px;">
+      <div style="font-size:12px; color:#2E5B34;">
+        <strong>${c.matchedByCount.length} well${c.matchedByCount.length!==1?'s':''} reconciled by count.</strong>
+        The invoice exists for the right rig, but the well name on it doesn't match what was typed in the tracker. Counted as billed.
+      </div>
+      ${c.matchedByCount.map(r=>`<div style="padding:6px 0; border-top:1px dashed #B7D9BB; font-size:12px;">
+        <span style="font-weight:600;">${escHtml(r.well||'(no name)')}</span>
+        <span style="color:#5B6660;"> &middot; paired with ${escHtml(r.doc||'invoice')} on ${escHtml(r.rig||'')}</span>
+      </div>`).join('')}
+    </div>`;
+  }
 
+  if(c.rigChanged.length > 0){
+    out += `<div style="background:#EEF4EE; border:1.5px solid #B7D9BB; border-radius:8px; padding:12px 14px; margin-bottom:12px;">
+      <div style="font-size:12px; color:#2E5B34;">
+        <strong>${c.rigChanged.length} well${c.rigChanged.length!==1?'s':''} matched under a different rig.</strong>
+        Invoiced on one rig and now sitting on another in the tracker — normal when iron transfers straight to a replacement rig, since the ticket's rig gets changed and the equipment never comes back. Counted as billed.
+      </div>
+      ${c.rigChanged.map(r=>`<div style="padding:6px 0; border-top:1px dashed #B7D9BB; font-size:12px;">
+        <span style="font-weight:600;">${escHtml(r.well)}</span>
+        <span style="color:#5B6660;"> &middot; invoiced as ${escHtml(r.invoiceRig)}${r.doc?` (${escHtml(r.doc)})`:''}, ticket now says ${escHtml(r.trackerRig)}</span>
+      </div>`).join('')}
+    </div>`;
+  }
+
+  out += renderBillingCheckFooter(c);
   return out;
 }
 
@@ -4946,6 +5181,21 @@ function attachHandlers(){
     };
   });
 
+  document.querySelectorAll('[data-assign-rig]').forEach(btn=>{
+    btn.onclick = async ()=>{
+      const rig = btn.dataset.assignRig;
+      const known = knownOperatorNames();
+      const suggestion = known.length ? `\n\nOperators on file: ${known.join(', ')}` : '';
+      const current = rigOperatorOverride(rig);
+      const answer = prompt(`Which operator does "${rig}" belong to?\n\nUse this for a rig that no longer appears on any ticket - released and replaced, so invoices raised under it have nothing left to match.\n\nLeave it empty to clear this and go back to working it out from your tickets.${suggestion}`, current || '');
+      if(answer === null) return;
+      const name = answer.trim();
+      // Empty means clear it, so a wrong entry can be undone and the ticket
+      // data takes over again.
+      await setRigOperatorOverride(rig, name ? bestOperatorMatch(name) : '');
+    };
+  });
+
   document.querySelectorAll('[data-toggle-payer]').forEach(btn=>{
     btn.onclick = ()=>{
       const name = btn.dataset.togglePayer;
@@ -5018,6 +5268,19 @@ function attachHandlers(){
       if(i >= 0 && i < list.length){ list.splice(i,1); saveInvoiceRules(); render(); }
     };
   });
+
+  const bcStart = document.getElementById('billing-check-start');
+  if(bcStart) bcStart.onchange = async ()=>{
+    appSettings.billingCheckStartDate = bcStart.value || '';
+    await saveAppSettings();
+    render();
+  };
+  const bcReset = document.getElementById('billing-check-reset');
+  if(bcReset) bcReset.onclick = async ()=>{
+    appSettings.billingCheckStartDate = '';
+    await saveAppSettings();
+    render();
+  };
 
   const toggleUnattrBtn = document.getElementById('toggle-unattributed-detail');
   if(toggleUnattrBtn) toggleUnattrBtn.onclick = ()=>{
@@ -5785,7 +6048,7 @@ function attachHandlers(){
         if(t){
           t.returnDate = todayStr(); t.updatedAt = nowIso();
           await saveTickets();
-          await reconcileShopFromReturns(); // straight into the shop queue
+          await reconcileYardFromTickets(); // straight into the shop queue
           render();
         }
       };
@@ -5821,7 +6084,12 @@ function attachHandlers(){
         const label = promptRequired('Well name or number:', 'A well name or number is required.');
         if(label === null) return;
         if(!Array.isArray(pad.billedWells)) pad.billedWells = [];
-        pad.billedWells.push({ date: todayStr(), label: label });
+        // Rig is stamped at the moment of billing. Without this the check
+        // reads the ticket's CURRENT rig, so transferring iron to a new rig
+        // - which is done by renaming the rig on the same ticket, since the
+        // equipment never comes back - rewrites the history of every well
+        // already billed under the old rig and flags them all as unbilled.
+        pad.billedWells.push({ date: todayStr(), label: label, rig: t.rig || '' });
         t.updatedAt = nowIso();
         await saveTickets();
         render();
@@ -5884,7 +6152,7 @@ function attachHandlers(){
         }
         t.updatedAt = nowIso();
         await saveTickets();
-        await reconcileShopFromReturns(); // coming home means into the queue
+        await reconcileYardFromTickets(); // coming home means into the queue
         render();
       };
     });
@@ -5957,7 +6225,7 @@ function attachHandlers(){
       });
       selectedTicketIds.clear();
       await saveTickets();
-      await reconcileShopFromReturns();
+      await reconcileYardFromTickets();
       render();
     };
   }
@@ -6131,7 +6399,17 @@ async function onSaveTicket(){
     savedTicketId = editingId;
     const idx = tickets.findIndex(t=>t.id===editingId);
     if(idx>-1){
-      tickets[idx] = {...tickets[idx], ticketNumber, customer, rig, deliveryDate, returnDate, notes, photo, signatureDelivered, signatureReceived, wellCharges, equipment, updatedAt: nowIso()};
+      const prior = tickets[idx];
+      // When an operator drops a rig and picks up a replacement, the iron
+      // transfers straight across and the rig name on this ticket changes.
+      // The old name has to be remembered: invoices already raised under it
+      // still need to resolve to a rig and an operator, and without this the
+      // rename wipes that name out of the app entirely.
+      let previousRigs = Array.isArray(prior.previousRigs) ? prior.previousRigs.slice() : [];
+      if(prior.rig && prior.rig !== rig && !previousRigs.some(p=>p.rig === prior.rig)){
+        previousRigs.push({ rig: prior.rig, until: todayStr() });
+      }
+      tickets[idx] = {...prior, ticketNumber, customer, rig, previousRigs, deliveryDate, returnDate, notes, photo, signatureDelivered, signatureReceived, wellCharges, equipment, updatedAt: nowIso()};
     }
     editingId = null;
   }else{
@@ -6293,7 +6571,7 @@ async function init(){
   await loadCustomerCatalog();
   await loadTemplates();
   loadSyncUrl();
-  await reconcileShopFromReturns();
+  await reconcileYardFromTickets();
   render();
   if(syncUrl){
     await pullFromCloud(true);
