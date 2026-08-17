@@ -1293,25 +1293,76 @@ function renderCountScreen(){
    tickets it hasn't accounted for and processes them. Idempotent, so
    running it repeatedly changes nothing, and it can't miss a path.
 */
+/* ── YARD LEDGER ───────────────────────────────────────────────────
+   The previous design recorded a ticket id once it had been processed and
+   never looked at that ticket again. A ticket id is a one-time token, so
+   anything that changed afterwards was invisible for good:
+
+     - editing a load from 4 to 10 left Ready short by six, permanently
+     - clearing a mis-tapped return date left phantom iron In Shop, which a
+       legitimate "it's through paint" tap then promoted to Ready - iron
+       marked ready for a pressure job that never got inspected
+     - deleting an open ticket never gave its iron back to Ready
+
+   So the ledger now records the QUANTITIES applied per ticket, and every
+   reconcile diffs what should be applied against what is. A change in any
+   direction produces a delta, including back to nothing. It stays
+   idempotent - run it twice and the second pass finds no delta.
+
+   What was actually applied is recorded, not what was intended. If Ready
+   only had three to give against a delta of four, three is what's stored,
+   so a later reversal returns three and the books stay square.
+*/
 function ensureInventoryCount(){
   if(!appSettings.inventoryCount || typeof appSettings.inventoryCount !== 'object'){
-    appSettings.inventoryCount = {
-      items:{},
-      processedReturns: allReturnedTicketIds_(),
-      processedDeliveries: tickets.map(t=>t.id)
-    };
+    appSettings.inventoryCount = { items:{}, applied: seedAppliedFromTickets_() };
   }
   const inv = appSettings.inventoryCount;
   if(!inv.items || typeof inv.items !== 'object') inv.items = {};
-  // A count applied before this feature existed wrote items but no return
-  // ledger. Seeding it with everything already returned stops years of old
-  // returns flooding into In Shop the first time this runs.
-  if(!Array.isArray(inv.processedReturns)) inv.processedReturns = allReturnedTicketIds_();
-  // Same reasoning for departures: on first appearance every existing ticket
-  // counts as accounted for, or the first run would subtract every delivery
-  // ever made from Ready.
-  if(!Array.isArray(inv.processedDeliveries)) inv.processedDeliveries = tickets.map(t=>t.id);
+
+  // Migration from the id-only ledgers. Whatever those ids say has already
+  // been applied is recorded as quantities, so the buckets don't move on
+  // upgrade - only future changes start being noticed.
+  if(!inv.applied || typeof inv.applied !== 'object'){
+    const applied = {};
+    const outIds = new Set(Array.isArray(inv.processedDeliveries) ? inv.processedDeliveries : tickets.map(t=>t.id));
+    const backIds = new Set(Array.isArray(inv.processedReturns) ? inv.processedReturns : allReturnedTicketIds_());
+    tickets.forEach(t=>{
+      const q = ticketQuantities_(t);
+      applied[t.id] = {
+        out: outIds.has(t.id) ? q : {},
+        back: backIds.has(t.id) ? q : {}
+      };
+    });
+    inv.applied = applied;
+    delete inv.processedDeliveries;
+    delete inv.processedReturns;
+  }
   return inv;
+}
+
+// Quantities per equipment name on a ticket, totalled - the same item can
+// appear on more than one line.
+function ticketQuantities_(t){
+  const q = {};
+  (t.equipment||[]).forEach(e=>{
+    const name = e.name;
+    const qty = Number(e.qty)||0;
+    if(!name || qty <= 0) return;
+    q[name] = (q[name]||0) + qty;
+  });
+  return q;
+}
+
+// First appearance on a device: every existing ticket counts as already
+// applied, so years of history don't move the buckets on first run.
+function seedAppliedFromTickets_(){
+  const applied = {};
+  tickets.forEach(t=>{
+    const q = ticketQuantities_(t);
+    applied[t.id] = { out: q, back: t.returnDate ? q : {} };
+  });
+  return applied;
 }
 
 function allReturnedTicketIds_(){
@@ -1328,44 +1379,71 @@ function yardEntry(name){
 }
 
 async function reconcileYardFromTickets(){
-  if(!tickets || tickets.length === 0) return false;
+  if(!tickets) return false;
   const inv = ensureInventoryCount();
   let changed = false;
 
-  // ── Iron leaving ────────────────────────────────────────────────
-  // A ticket going out has to come OUT of Ready. Without this Ready only
-  // ever climbs, and ends up contradicting On Hand on the same screen -
-  // ten marked ready while only six are at the yard. Floored at zero: if
-  // more went out than was ever marked ready that's a data gap, and the
-  // row reports it rather than the number going negative.
-  const seenOut = new Set(inv.processedDeliveries);
-  tickets.forEach(t=>{
-    if(seenOut.has(t.id)) return;
-    (t.equipment||[]).forEach(e=>{
-      const name = e.name;
-      const qty = Number(e.qty)||0;
-      if(!name || qty <= 0) return;
-      const it = yardEntry(name);
-      it.ready = Math.max(0, it.ready - qty);
-    });
-    inv.processedDeliveries.push(t.id);
-    seenOut.add(t.id);
-    changed = true;
-  });
+  // Moves a quantity into or out of a bucket and reports how much actually
+  // moved, which is what gets recorded. Ready can't be drawn below zero and
+  // the shop queue can't be drained below zero.
+  const applyDelta = (name, bucket, delta)=>{
+    if(delta === 0) return 0;
+    const it = yardEntry(name);
+    if(delta > 0){
+      it[bucket] += delta;
+      return delta;
+    }
+    const take = Math.min(-delta, it[bucket]);
+    it[bucket] -= take;
+    return -take;
+  };
 
-  // ── Iron coming home ────────────────────────────────────────────
-  const seen = new Set(inv.processedReturns);
-  tickets.forEach(t=>{
-    if(!t.returnDate || seen.has(t.id)) return;
-    (t.equipment||[]).forEach(e=>{
-      const name = e.name;
-      const qty = Number(e.qty)||0;
-      if(!name || qty <= 0) return;
-      yardEntry(name).shop += qty;
+  // Every ticket, plus any id in the ledger whose ticket has since been
+  // deleted - a deleted ticket's iron has to be given back.
+  const ids = new Set(tickets.map(t=>t.id));
+  Object.keys(inv.applied).forEach(id=>ids.add(id));
+
+  ids.forEach(id=>{
+    const t = tickets.find(x=>x.id === id);
+    if(!inv.applied[id]) inv.applied[id] = { out:{}, back:{} };
+    const rec = inv.applied[id];
+    if(!rec.out || typeof rec.out !== 'object') rec.out = {};
+    if(!rec.back || typeof rec.back !== 'object') rec.back = {};
+
+    // What SHOULD be applied for this ticket right now. A deleted ticket
+    // should have nothing applied, which reverses whatever it once did.
+    const q = t ? ticketQuantities_(t) : {};
+    const wantOut = q;                                  // gone out => came off Ready
+    const wantBack = (t && t.returnDate) ? q : {};      // came home => went into the shop queue
+
+    // Ready: subtract what has gone out, give back anything no longer out.
+    const outNames = new Set(Object.keys(wantOut).concat(Object.keys(rec.out)));
+    outNames.forEach(name=>{
+      const delta = (wantOut[name]||0) - (rec.out[name]||0);
+      if(delta === 0) return;
+      // Ready falls when iron leaves, so the sign is inverted here.
+      const moved = applyDelta(name, 'ready', -delta);
+      rec.out[name] = (rec.out[name]||0) - moved;
+      if(rec.out[name] <= 0) delete rec.out[name];
+      changed = true;
     });
-    inv.processedReturns.push(t.id);
-    seen.add(t.id);
-    changed = true;
+
+    // Shop queue: add on return, and remove again if the return is undone.
+    const backNames = new Set(Object.keys(wantBack).concat(Object.keys(rec.back)));
+    backNames.forEach(name=>{
+      const delta = (wantBack[name]||0) - (rec.back[name]||0);
+      if(delta === 0) return;
+      const moved = applyDelta(name, 'shop', delta);
+      rec.back[name] = (rec.back[name]||0) + moved;
+      if(rec.back[name] <= 0) delete rec.back[name];
+      changed = true;
+    });
+
+    // Ledger entry for a ticket that no longer exists and has nothing left
+    // applied is dead weight; these accumulate forever otherwise.
+    if(!t && Object.keys(rec.out).length === 0 && Object.keys(rec.back).length === 0){
+      delete inv.applied[id];
+    }
   });
 
   if(changed) await saveAppSettings();
@@ -1626,7 +1704,7 @@ function renderCountReview(){
     ${skipped.length>0?`<div style="background:#FFF8E6; border:1.5px solid #E6D080; border-radius:8px; padding:12px 14px; margin-bottom:14px;">
       <div style="font-weight:600; font-size:13px; color:#8A6D10; margin-bottom:4px;">${skipped.length} item${skipped.length!==1?'s':''} not counted</div>
       <div style="font-size:11px; color:#8A6D10; line-height:1.5;">${skipped.map(escHtml).join(', ')}</div>
-      <div style="font-size:11px; color:#8A6D10; margin-top:6px;">These keep whatever is already on file. Nothing is changed for them.</div>
+      <div style="font-size:11px; color:#8A6D10; margin-top:6px;">These are left exactly as they are — owned count, ready and in-shop all untouched.</div>
     </div>`:''}
 
     ${changeRows?`
@@ -1669,15 +1747,33 @@ async function applyCountSession(){
 
   // Ready/in-shop lives in appSettings so it rides the existing cloud sync
   // without needing a backend change.
-  appSettings.inventoryCount = {
-    countedAt: new Date().toISOString(),
-    items: snapshot,
-    // A fresh count is the new baseline: every return up to this moment is
-    // already reflected in what was physically counted, so mark them all
-    // accounted for. Without this the next reconcile would add them again.
-    processedReturns: allReturnedTicketIds_(),
-    processedDeliveries: tickets.map(t=>t.id)
-  };
+  //
+  // MERGED, not replaced. Replacing the whole object wiped ready/shop for
+  // every item that wasn't counted - and the review screen promised the
+  // opposite in as many words. Partial counts are the normal case: the count
+  // screen has a filter box and a Hide-done button built for exactly that.
+  const inv = ensureInventoryCount();
+  inv.countedAt = new Date().toISOString();
+  Object.keys(snapshot).forEach(name=>{
+    inv.items[name] = { ready: snapshot[name].ready, shop: snapshot[name].shop };
+  });
+
+  // A count is a new baseline for the items it covered, so the ledger is
+  // rewritten to "everything currently applied" for those - otherwise a
+  // return already reflected in the physical count would be added again.
+  // Items that weren't counted keep their existing ledger entries untouched.
+  const countedNames = new Set(Object.keys(snapshot));
+  tickets.forEach(t=>{
+    const q = ticketQuantities_(t);
+    if(!inv.applied[t.id]) inv.applied[t.id] = { out:{}, back:{} };
+    const rec = inv.applied[t.id];
+    Object.keys(q).forEach(name=>{
+      if(!countedNames.has(name)) return;
+      rec.out[name] = q[name];
+      if(t.returnDate) rec.back[name] = q[name];
+      else delete rec.back[name];
+    });
+  });
 
   countSession = null;
   saveCountSession();
@@ -2200,6 +2296,7 @@ async function loadCatalog(){
 }
 
 async function saveCatalog(){
+  stampStore('catalog');
   try{
     localStorage.setItem(CATALOG_KEY, JSON.stringify(equipmentCatalog));
   }catch(e){
@@ -2219,6 +2316,7 @@ async function loadEquipmentOwned(){
 }
 
 async function saveEquipmentOwned(){
+  stampStore('equipmentOwned');
   try{
     localStorage.setItem(EQUIPMENT_OWNED_KEY, JSON.stringify(equipmentOwned));
   }catch(e){
@@ -2237,6 +2335,7 @@ async function loadAppSettings(){
 }
 
 async function saveAppSettings(){
+  stampStore('appSettings');
   try{
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(appSettings));
   }catch(e){
@@ -2267,6 +2366,7 @@ async function loadColorCatalog(){
 }
 
 async function saveColorCatalog(){
+  stampStore('colorCatalog');
   try{
     localStorage.setItem(COLOR_CATALOG_KEY, JSON.stringify(colorCatalog));
   }catch(e){
@@ -2286,6 +2386,7 @@ async function loadRigCatalog(){
 }
 
 async function saveRigCatalog(){
+  stampStore('rigCatalog');
   try{
     localStorage.setItem(RIG_CATALOG_KEY, JSON.stringify(rigCatalog));
   }catch(e){
@@ -2305,6 +2406,7 @@ async function loadArchivedRigs(){
 }
 
 async function saveArchivedRigs(){
+  stampStore('archivedRigs');
   try{
     localStorage.setItem(ARCHIVED_RIGS_KEY, JSON.stringify(archivedRigs));
   }catch(e){
@@ -2324,6 +2426,7 @@ async function loadCustomerCatalog(){
 }
 
 async function saveCustomerCatalog(){
+  stampStore('customerCatalog');
   try{
     localStorage.setItem(CUSTOMER_CATALOG_KEY, JSON.stringify(customerCatalog));
   }catch(e){
@@ -2352,6 +2455,7 @@ async function loadTemplates(){
 }
 
 async function saveTemplates(){
+  stampStore('templateCatalog');
   try{
     localStorage.setItem(TEMPLATE_KEY, JSON.stringify(templateCatalog));
   }catch(e){
@@ -2413,12 +2517,67 @@ async function fetchQuickBooksRevenue(force){
   render();
 }
 
+// Set when local work exists that the cloud hasn't accepted. Persisted,
+// because the truck leaves the yard, the phone locks, and the app may be
+// reloaded before signal comes back.
+const STORE_STAMPS_KEY = 'flowtech_equipment_tracker_storestamps';
+let storeStamps = null;
+
+function getStoreStamps(){
+  if(storeStamps === null){
+    try{
+      const raw = localStorage.getItem(STORE_STAMPS_KEY);
+      storeStamps = raw ? JSON.parse(raw) : {};
+    }catch(e){ storeStamps = {}; }
+    if(!storeStamps || typeof storeStamps !== 'object') storeStamps = {};
+  }
+  return storeStamps;
+}
+
+// Called whenever a store is actually changed on this device. The server
+// compares these and refuses a write from a device holding older data - which
+// is how a yard count could be overwritten by an iPad that had been idle in
+// the office all afternoon.
+function stampStore(key){
+  const st = getStoreStamps();
+  st[key] = new Date().toISOString();
+  try{ localStorage.setItem(STORE_STAMPS_KEY, JSON.stringify(st)); }catch(e){ /* best effort */ }
+}
+
+const UNSYNCED_KEY = 'flowtech_equipment_tracker_unsynced';
+let unsyncedLocalWork = null;
+
+function hasUnsyncedLocalWork(){
+  if(unsyncedLocalWork === null){
+    try{ unsyncedLocalWork = localStorage.getItem(UNSYNCED_KEY) === 'yes'; }
+    catch(e){ unsyncedLocalWork = false; }
+  }
+  return unsyncedLocalWork;
+}
+
+function setUnsyncedLocalWork(v){
+  unsyncedLocalWork = !!v;
+  try{
+    if(v) localStorage.setItem(UNSYNCED_KEY, 'yes');
+    else localStorage.removeItem(UNSYNCED_KEY);
+  }catch(e){ /* flag is best effort */ }
+}
+
 async function pullFromCloud(silent){
   if(!syncUrl) return;
   // Never pull while a push is still in flight — the server may not have
   // the latest data yet, and pulling now would overwrite local changes
   // with stale cloud data (the "well billed then disappears" bug).
   if(pushInProgress) return;
+  // Local work the cloud hasn't accepted outranks anything the cloud has to
+  // say. Pulling here is what silently destroyed an offline yard count: the
+  // count wrote locally, every push failed, and the next successful pull
+  // replaced owned counts and appSettings with the other device's copy.
+  if(hasUnsyncedLocalWork()){
+    console.warn('Skipping pull - local changes have not reached the cloud yet.');
+    await pushToCloud();
+    return;
+  }
   if(!silent) syncStatus = 'loading';
   render();
   try{
@@ -2448,7 +2607,22 @@ async function pullFromCloud(silent){
       });
     }
     if(Array.isArray(data.catalog) && data.catalog.length) equipmentCatalog = data.catalog;
-    if(data.equipmentOwned && typeof data.equipmentOwned === 'object') equipmentOwned = data.equipmentOwned;
+    if(data.equipmentOwned && typeof data.equipmentOwned === 'object'){
+      // Coerced on the way in. A hand-edited Sheet cell like "12 ea" becomes
+      // NaN, which isn't null so it passes every "is it set" check, then
+      // poisons the totals - one bad cell blanked the entire Inventory
+      // summary with NaN.
+      const clean = {};
+      Object.keys(data.equipmentOwned).forEach(k=>{
+        const raw = data.equipmentOwned[k];
+        if(raw === '' || raw == null){ clean[k] = ''; return; }
+        const n = Number(raw);
+        if(isFinite(n) && n >= 0) clean[k] = n;
+        // A nonsense or negative value is dropped rather than stored, so the
+        // item reads "not set" instead of poisoning the arithmetic.
+      });
+      equipmentOwned = clean;
+    }
     if(Array.isArray(data.colorCatalog) && data.colorCatalog.length) colorCatalog = data.colorCatalog;
     if(Array.isArray(data.rigCatalog) && data.rigCatalog.length) rigCatalog = data.rigCatalog;
     if(Array.isArray(data.archivedRigs)) archivedRigs = data.archivedRigs;
@@ -2512,17 +2686,27 @@ async function pushToCloud(){
     // on success - a delete that happens while the request is in flight stays
     // queued for the next push instead of being silently dropped.
     const deletesToSend = pendingDeletes.slice();
-    await fetch(syncUrl, {
+    const res = await fetch(syncUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({ tickets: ticketsForCloud, deletes: deletesToSend, catalog: equipmentCatalog, equipmentOwned: equipmentOwned, colorCatalog: colorCatalog, rigCatalog: rigCatalog, archivedRigs: archivedRigs, customerCatalog: customerCatalog, templateCatalog: templateCatalog, appSettings: appSettings })
+      body: JSON.stringify({ tickets: ticketsForCloud, deletes: deletesToSend, catalog: equipmentCatalog, equipmentOwned: equipmentOwned, colorCatalog: colorCatalog, rigCatalog: rigCatalog, archivedRigs: archivedRigs, customerCatalog: customerCatalog, templateCatalog: templateCatalog, appSettings: appSettings, stamps: getStoreStamps() })
     });
+    // The response has to be checked. Previously this awaited the fetch and
+    // then declared success regardless, so a server-side error showed a
+    // green sync while nothing had been saved.
+    if(!res || !res.ok) throw new Error('Push rejected (' + (res ? res.status : 'no response') + ')');
+
     if(deletesToSend.length) pendingDeletes = pendingDeletes.filter(id=>!deletesToSend.includes(id));
     syncStatus = 'ok';
+    setUnsyncedLocalWork(false);
     await reconcileYardFromTickets();
   }catch(e){
     console.error('Cloud push failed', e);
     syncStatus = 'error';
+    // Local work now exists that the cloud hasn't got. Until it lands, a
+    // pull must not overwrite it - that's how an offline yard count used to
+    // vanish the moment signal came back.
+    setUnsyncedLocalWork(true);
   }
   pushInProgress = false;
   render();
@@ -2796,6 +2980,14 @@ function syncStatusLabel(){
   return 'Cloud Sync: On ✓';
 }
 
+function renderUnsyncedBanner(){
+  if(!syncUrl || !hasUnsyncedLocalWork()) return '';
+  return `<div style="background:#FFF8E6; border:1.5px solid #E6D080; border-radius:8px; padding:10px 14px; margin-bottom:14px; font-size:12px; color:#8A6D10;">
+    <strong>Not synced yet.</strong> Changes made here haven't reached the cloud — the app is holding onto them and won't let a sync overwrite them. It keeps retrying; nothing is lost.
+    <button id="retry-sync-now" style="background:none; border:none; padding:0 0 0 6px; color:#8A6D10; font-size:12px; text-decoration:underline; cursor:pointer; font-family:inherit;">try now</button>
+  </div>`;
+}
+
 function renderSyncPanel(){
   return `
     <div class="sync-panel">
@@ -2870,6 +3062,7 @@ function renderGlobalSearchResults(){
 }
 
 function renderDashboard(){
+  const unsyncedBanner = renderUnsyncedBanner();
   const outTickets = tickets.filter(t=>!t.returnDate);
   const totalOutItems = outTickets.reduce((s,t)=>s+t.equipment.reduce((s2,e)=>s2+(Number(e.qty)||0),0),0);
   const rigsActive = new Set(outTickets.map(t=>t.rig||'Unassigned rig')).size;
@@ -2903,13 +3096,14 @@ function renderDashboard(){
   }).join('') : `<p style="font-size:13px; color:var(--ink-soft);">No jobs currently out.</p>`;
 
   if(tickets.length === 0){
-    return `<div class="empty-state">
+    return `${unsyncedBanner}<div class="empty-state">
       <div class="stamp">Welcome</div>
       <p>Log your first delivery ticket to see your dashboard fill in.</p>
     </div>`;
   }
 
   return `
+    ${unsyncedBanner}
     <h2 class="section-title">Dashboard</h2>
     ${renderActionAlerts()}
     <div class="summary-cards" style="grid-template-columns:repeat(3,1fr);">
@@ -3903,6 +4097,24 @@ function parentCustomerName(name){
 // Deliberately forgiving: a stored "West Texas Premix Pits" still matches a
 // QuickBooks customer named "West Texas Premix Pits LLC", and vice versa.
 // Exact-name matching is what made this quietly fail before.
+// Payers that pay on somebody else's behalf. Separate from the split list:
+// a payer can be split for reporting without being a vendor.
+const DEFAULT_VENDOR_PAYERS = ['West Texas Premix'];
+
+function vendorPayers(){
+  const v = appSettings.vendorPayers;
+  return Array.isArray(v) ? v : DEFAULT_VENDOR_PAYERS;
+}
+
+function isVendorPayer(name){
+  const n = normalizeForMatch(parentCustomerName(name));
+  if(!n) return false;
+  return vendorPayers().some(v=>{
+    const vn = normalizeForMatch(v);
+    return vn && (n === vn || n.indexOf(vn) !== -1 || vn.indexOf(n) !== -1);
+  });
+}
+
 function isPassThroughCustomer(name){
   const n = normalizeForMatch(parentCustomerName(name));
   if(!n) return false;
@@ -4051,7 +4263,6 @@ function renderRevenueByCustomer(){
   // up with directly, and the operators are its clients, not Flow-Tech's.
   const groups = {};
   let unattributed = { total:0, count:0, items:[] };
-  let vendorTotal = 0;
 
   invoices.forEach(inv=>{
     const billedTo = inv.customer || 'Unknown';
@@ -4078,7 +4289,6 @@ function renderRevenueByCustomer(){
     // Only payers marked as pass-through get broken out underneath.
     if(isPassThroughCustomer(payer)){
       g.split = true;
-      vendorTotal += inv.amount || 0;
 
       // The operator, in order of reliability:
       //   1. the "Customer:" label written on the invoice
@@ -4138,6 +4348,17 @@ function renderRevenueByCustomer(){
       }
     }
   });
+
+  let vendorTotal = 0;
+  const vendorNamesSeen = [];
+  Object.keys(groups).forEach(payer=>{
+    if(!isVendorPayer(payer)) return;
+    vendorTotal += groups[payer].total;
+    if(vendorNamesSeen.indexOf(payer) === -1) vendorNamesSeen.push(payer);
+  });
+  const vendorLabel = vendorNamesSeen.length === 1
+    ? `Through ${vendorNamesSeen[0].replace(/,?\s*(LP|LLC|Inc\.?)$/i,'')}`
+    : (vendorNamesSeen.length > 1 ? 'Through Vendors' : 'Through Vendor');
 
   const entries = Object.keys(groups).map(k=>[k, groups[k]]).sort((a,b)=>b[1].total - a[1].total);
   const grandTotal = qbRevenueData.totalRevenue || 0;
@@ -4317,10 +4538,11 @@ function renderRevenueByCustomer(){
 
   return `
     ${heading}
-    <div class="summary-cards" style="grid-template-columns:repeat(3,1fr);">
+    <div class="summary-cards">
       <div class="summary-card"><div class="num">${fmtMoney(grandTotal)}</div><div class="lbl">Invoiced ${escHtml(startLabel)} YTD</div></div>
       <div class="summary-card"><div class="num">${qbRevenueData.invoiceCount||0}</div><div class="lbl">Invoices</div></div>
-      <div class="summary-card"><div class="num">${fmtMoney(vendorTotal)}</div><div class="lbl">Through Vendor</div></div>
+      <div class="summary-card"><div class="num">${fmtMoney(vendorTotal)}</div><div class="lbl">${escHtml(vendorLabel)}</div></div>
+      <div class="summary-card" style="${unattributed.total>0?'border-color:#E6D080;':''}"><div class="num" style="${unattributed.total>0?'color:#B8691C;':'color:#1E8A29;'}">${fmtMoney(unattributed.total)}</div><div class="lbl">Unattributed</div></div>
     </div>
     <div style="background:#fff; border:1.5px solid #E8EDE8; border-radius:8px; padding:16px;">
       <div style="display:grid; grid-template-columns:1fr 60px 100px; gap:8px; padding-bottom:8px; border-bottom:2px solid #E8EDE8; font-size:11px; text-transform:uppercase; letter-spacing:0.5px; color:#5B6660;">
@@ -5758,10 +5980,35 @@ function attachHandlers(){
     document.querySelectorAll('[data-catalog-remove]').forEach(b=>{
       b.onclick = async ()=>{
         const name = b.dataset.catalogRemove;
+        const inv = ensureInventoryCount();
+        const y = inv.items[name];
+        const stranded = y ? ((Number(y.ready)||0) + (Number(y.shop)||0)) : 0;
+        const outNow = outQtyByName()[name] || 0;
+
+        if(outNow > 0){
+          alert(`${name} can't be removed yet — ${outNow} ${outNow===1?'is':'are'} still out on a ticket.\n\nMark those returned first, or the iron would drop out of inventory while it's in the field.`);
+          return;
+        }
+        if(stranded > 0 && !confirm(`${name} still has ${stranded} recorded at the yard (${(Number(y.ready)||0)} ready, ${(Number(y.shop)||0)} in shop).\n\nRemoving it clears that too. Continue?`)){
+          return;
+        }
+
         equipmentCatalog = equipmentCatalog.filter(n=>n!==name);
         delete equipmentOwned[name];
+        // Clear the yard state as well. Leaving it behind stranded the
+        // ready/shop numbers where nothing rendered them, and re-adding the
+        // name later resurrected them against a blank owned count - where
+        // the discrepancy check is skipped, so nothing would flag it.
+        if(inv.items[name]) delete inv.items[name];
+        Object.keys(inv.applied||{}).forEach(id=>{
+          const rec = inv.applied[id];
+          if(rec.out) delete rec.out[name];
+          if(rec.back) delete rec.back[name];
+        });
+
         await saveCatalog();
         await saveEquipmentOwned();
+        await saveAppSettings();
         render();
       };
     });
@@ -6234,6 +6481,9 @@ function attachHandlers(){
     btn.onclick = async ()=> await markReadyFromShop(btn.dataset.markReady);
   });
 
+  const retrySyncBtn = document.getElementById('retry-sync-now');
+  if(retrySyncBtn) retrySyncBtn.onclick = async ()=>{ await pushToCloud(); };
+
   const countSheetBtn = document.getElementById('print-count-sheet-btn');
   if(countSheetBtn) countSheetBtn.onclick = ()=> printCountSheet();
 
@@ -6430,12 +6680,19 @@ async function onSaveTicket(){
 
   addToCatalogIfNew(rigCatalog, rig);
   addToCatalogIfNew(customerCatalog, customer);
+  // Equipment entered as "+ Add new equipment..." has to join the catalog
+  // too. Without this, once the ticket was returned the item appeared in no
+  // catalog and had no owned count, so it dropped out of Full Inventory
+  // entirely - carrying its In Shop quantity into a queue nothing could see
+  // and no count would ever visit.
+  equipment.forEach(e=>addToCatalogIfNew(equipmentCatalog, e.name));
 
   // Save catalogs to local storage directly (pushToCloud already bundles
   // rig/customer data into the same request that saveTickets() below
   // triggers, so there's no need for three separate overlapping pushes).
   try{ localStorage.setItem(RIG_CATALOG_KEY, JSON.stringify(rigCatalog)); }catch(e){ console.error('Could not save rig list', e); }
   try{ localStorage.setItem(CUSTOMER_CATALOG_KEY, JSON.stringify(customerCatalog)); }catch(e){ console.error('Could not save customer list', e); }
+  try{ localStorage.setItem(CATALOG_KEY, JSON.stringify(equipmentCatalog)); }catch(e){ console.error('Could not save equipment list', e); }
 
   // Kick off saving (local write happens synchronously inside this, before
   // any network call) but don't wait on the cloud push before moving on -
