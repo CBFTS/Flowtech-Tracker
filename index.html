@@ -3872,6 +3872,63 @@ function isPassThroughCustomer(name){
 // Looks up the operator behind a named rig, using the labelled Rig field
 // rather than scanning description text. Far more reliable, and it works
 // even when the description carries nothing else useful.
+/* ── RIG NAME CONSOLIDATION ────────────────────────────────────────
+   Invoices are typed by hand, and not always the same way twice - the
+   same rig turns up as "Cactus 407", "CACTUS-407" and "Cactus Rig 407".
+   Grouping on the literal text split one rig into three rows.
+
+   Every variant is resolved back to the spelling in the rig list, so
+   the tracker's own naming is the one that shows.
+
+   Rig names are almost always a contractor plus a number, which gives a
+   reliable test: the numbers have to match, and if both names carry a
+   distinguishing word that has to match too. So "Cactus Rig 407"
+   consolidates with "Cactus 407", a bare "407" consolidates with it as
+   well, but "Patterson 407" stays separate - same number, different
+   contractor, genuinely a different rig.
+*/
+function knownRigNames(){
+  const set = {};
+  (rigCatalog||[]).forEach(r=>{ const n=(typeof r==='string')?r:(r&&r.name); if(n) set[n]=true; });
+  (archivedRigs||[]).forEach(r=>{ const n=(typeof r==='string')?r:(r&&r.name); if(n) set[n]=true; });
+  (tickets||[]).forEach(t=>{ if(t.rig) set[t.rig]=true; });
+  return Object.keys(set);
+}
+
+function rigTokens(s){
+  const t = String(s||'').toLowerCase();
+  const nums = t.match(/\d+/g) || [];
+  // "rig", "no" and "number" are filler, not identity.
+  const words = (t.match(/[a-z]+/g) || []).filter(w=>w!=='rig' && w!=='no' && w!=='number');
+  return { nums, words };
+}
+
+function sameRigName(a, b){
+  const ta = normalizeTight(a), tb = normalizeTight(b);
+  if(!ta || !tb) return false;
+  if(ta === tb) return true;
+  if(ta.indexOf(tb) !== -1 || tb.indexOf(ta) !== -1) return true;
+
+  const A = rigTokens(a), B = rigTokens(b);
+  if(!A.nums.length || !B.nums.length) return false;
+  if(!A.nums.some(n=>B.nums.indexOf(n) !== -1)) return false;
+  // One side with no contractor word - the number carries it.
+  if(!A.words.length || !B.words.length) return true;
+  return A.words.some(w=>B.words.indexOf(w) !== -1);
+}
+
+// The spelling to display: the rig list's version when it can be matched,
+// otherwise whatever the invoice said.
+function canonicalRigName(raw){
+  const r = String(raw||'').trim();
+  if(!r) return '';
+  const known = knownRigNames();
+  for(let i=0;i<known.length;i++){
+    if(sameRigName(r, known[i])) return known[i];
+  }
+  return r;
+}
+
 function operatorForRig(rigName, lookup){
   const r = normalizeForMatch(rigName);
   if(!r) return null;
@@ -3985,10 +4042,16 @@ function renderRevenueByCustomer(){
         const m = attributeInvoice(inv, lookup);
         if(m && m.kind === 'rig') rig = m.label;
       }
-      const rigKey = rig || 'Rig not named';
-      if(!ob.rigs[rigKey]) ob.rigs[rigKey] = { total:0, count:0 };
-      ob.rigs[rigKey].total += inv.amount || 0;
-      ob.rigs[rigKey].count++;
+      const canonical = canonicalRigName(rig);
+      const rigKey = canonical || 'Rig not named';
+      if(!ob.rigs[rigKey]) ob.rigs[rigKey] = { total:0, count:0, spellings:{}, docs:[] };
+      const rb = ob.rigs[rigKey];
+      rb.total += inv.amount || 0;
+      rb.count++;
+      if(rig && rig !== rigKey) rb.spellings[rig] = true;
+      // Kept so an unnamed-rig row can show which invoices are in it,
+      // rather than leaving you to wonder what's hiding in there.
+      if(!canonical && inv.docNumber) rb.docs.push(inv.docNumber);
 
       if(opKey === 'Unattributed'){
         unattributed.total += inv.amount || 0;
@@ -4042,7 +4105,9 @@ function renderRevenueByCustomer(){
             operator: op,
             fromLabel: o.fromLabel,
             total: o.rigs[rig].total,
-            count: o.rigs[rig].count
+            count: o.rigs[rig].count,
+            spellings: Object.keys(o.rigs[rig].spellings||{}),
+            docs: o.rigs[rig].docs||[]
           });
         });
       });
@@ -4056,10 +4121,15 @@ function renderRevenueByCustomer(){
         const sameAsPayer = normalizeForMatch(r.operator) === normalizeForMatch(name);
         const opLabel = (isUnattr || !sameAsPayer)
           ? `<span style="color:${isUnattr?'#8A6D10':'#5B6660'};"> &middot; ${escHtml(r.operator)}</span>` : '';
+        const mergeNote = r.spellings.length
+          ? `<div style="font-size:10px; color:#5B6660; margin-top:1px;">also invoiced as ${escHtml(r.spellings.join(', '))}</div>` : '';
+        const docNote = (r.rig === 'Rig not named' && r.docs.length)
+          ? `<div style="font-size:10px; color:#8A6D10; margin-top:1px;">${escHtml(r.docs.slice(0,6).join(', '))}${r.docs.length>6?` +${r.docs.length-6} more`:''}</div>` : '';
         return `<div style="display:grid; grid-template-columns:1fr 46px 90px; gap:8px; padding:7px 0 7px 14px; border-left:2px solid #E8EDE8; margin-left:2px; font-size:12px; align-items:center;">
           <div>
             <span style="font-weight:600;">${escHtml(r.rig)}</span>${opLabel}
             <span style="color:#5B6660;"> &middot; ${share}%</span>
+            ${mergeNote}${docNote}
           </div>
           <div style="text-align:center; color:#5B6660;">${r.count}</div>
           <div style="text-align:right;">${fmtMoney(r.total)}</div>
