@@ -2716,7 +2716,7 @@ function render(){
         <button data-tab="new" class="${currentTab==='new'?'active':''}"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><line x1="10" y1="3" x2="10" y2="17"/><line x1="3" y1="10" x2="17" y2="10"/></svg>New Ticket</button>
         <button data-tab="tickets" class="${currentTab==='tickets'?'active':''}"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="2.5" width="14" height="15" rx="1.5"/><line x1="6" y1="6.5" x2="14" y2="6.5"/><line x1="6" y1="10" x2="14" y2="10"/><line x1="6" y1="13.5" x2="11" y2="13.5"/></svg>Tickets</button>
         <button data-tab="byrig" class="${currentTab==='byrig'?'active':''}"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M10 17.5s6-5.6 6-10A6 6 0 1 0 4 7.5c0 4.4 6 10 6 10Z"/><circle cx="10" cy="7.5" r="2"/></svg>Rig Tracker</button>
-        <button data-tab="inventory" class="${currentTab==='inventory'?'active':''}"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2.5 6.5 10 2.5l7.5 4v7l-7.5 4-7.5-4Z"/><path d="M2.5 6.5 10 10.5l7.5-4"/><line x1="10" y1="10.5" x2="10" y2="17.5"/></svg>Inventory Out</button>
+        <button data-tab="inventory" class="${currentTab==='inventory'?'active':''}"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2.5 6.5 10 2.5l7.5 4v7l-7.5 4-7.5-4Z"/><path d="M2.5 6.5 10 10.5l7.5-4"/><line x1="10" y1="10.5" x2="10" y2="17.5"/></svg>Inventory</button>
         <button data-tab="reports" class="${currentTab==='reports'?'active':''}"><svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 17V6l4-3h6l4 3v11"/><line x1="7" y1="9" x2="7" y2="15"/><line x1="10" y1="7" x2="10" y2="15"/><line x1="13" y1="11" x2="13" y2="15"/></svg>Reports</button>
         <button id="toggle-sync-panel" style="margin-left:auto;">${syncUrl?syncStatusLabel():'Cloud Sync: Off'}</button>
       </nav>
@@ -3095,7 +3095,7 @@ function renderNewTicket(){
   const manageSection = showManageCatalog ? `
     <div class="manage-catalog">
       <label style="display:block;margin-bottom:8px;">Manage equipment list</label>
-      <p style="font-size:11px; color:var(--ink-soft); margin:-4px 0 8px 0;">Set "Total Owned" to see utilization (how much of your fleet is out) in the Inventory Out tab. Leave blank if you don't want to track it for that item.</p>
+      <p style="font-size:11px; color:var(--ink-soft); margin:-4px 0 8px 0;">Set "Total Owned" to see utilization (how much of your fleet is out) in the Inventory tab. Leave blank if you don't want to track it for that item.</p>
       ${equipmentCatalog.slice().sort((a,b)=>a.localeCompare(b)).map(name=>`
         <div class="catalog-item">
           <span>${escHtml(name)}</span>
