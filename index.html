@@ -1465,6 +1465,119 @@ async function markReadyFromShop(name){
   render();
 }
 
+/* ── RENAMING AN EQUIPMENT TYPE ────────────────────────────────────
+   An equipment name isn't a label, it's a key. The same string is used
+   in seven places, and changing it in only one splits the item in two:
+   the catalog would show the new spelling with nothing behind it while
+   every ticket, the owned count and the yard buckets stayed with the old.
+
+     1. equipmentCatalog            the list itself
+     2. equipmentOwned[name]        how many are owned
+     3. inventoryCount.items[name]  ready / in shop
+     4. inventoryCount.applied[]    per-ticket yard ledger, keyed by name inside
+     5. ticket.equipment[].name     every ticket ever written
+     6. template.items[].name       saved ticket templates
+     7. the in-progress count session, if one is open
+
+   Tickets also need updatedAt bumped. Without it the server merge keeps
+   the other device's copy - which still says the old name - and the
+   rename quietly undoes itself on the next sync.
+
+   If the new name already exists this is a MERGE, not a rename: counts
+   and yard buckets are added together rather than one overwriting the
+   other. The caller confirms that separately, because it can't be undone.
+*/
+function equipmentRenameImpact(oldName, newName){
+  let ticketCount = 0, lineCount = 0;
+  tickets.forEach(t=>{
+    let hit = false;
+    (t.equipment||[]).forEach(e=>{ if(e.name === oldName){ hit = true; lineCount++; } });
+    if(hit) ticketCount++;
+  });
+  let templateCount = 0;
+  (templateCatalog||[]).forEach(tpl=>{
+    if((tpl.items||[]).some(i=>i.name === oldName)) templateCount++;
+  });
+  const existing = (equipmentCatalog||[]).find(n=>
+    n !== oldName && n.toLowerCase() === newName.toLowerCase());
+  return { ticketCount, lineCount, templateCount, mergeInto: existing || null };
+}
+
+async function renameEquipment(oldName, newName){
+  if(!newName || newName === oldName) return false;
+
+  const inv = ensureInventoryCount();
+  const impact = equipmentRenameImpact(oldName, newName);
+  // Merging into an existing entry uses that entry's exact spelling.
+  const target = impact.mergeInto || newName;
+
+  // 1. the catalog — drop the old name, make sure the new one is present once
+  equipmentCatalog = equipmentCatalog.filter(n=>n !== oldName);
+  if(!equipmentCatalog.includes(target)) equipmentCatalog.push(target);
+
+  // 2. owned count — added together on a merge, since both were real iron
+  if(equipmentOwned[oldName] != null && equipmentOwned[oldName] !== ''){
+    const moving = Number(equipmentOwned[oldName])||0;
+    const already = (equipmentOwned[target] != null && equipmentOwned[target] !== '')
+      ? Number(equipmentOwned[target])||0 : 0;
+    equipmentOwned[target] = impact.mergeInto ? already + moving : moving;
+  }
+  if(target !== oldName) delete equipmentOwned[oldName];
+
+  // 3. yard buckets
+  if(inv.items[oldName]){
+    const from = inv.items[oldName];
+    const to = inv.items[target] || { ready:0, shop:0 };
+    inv.items[target] = {
+      ready: (Number(to.ready)||0) + (Number(from.ready)||0),
+      shop:  (Number(to.shop)||0)  + (Number(from.shop)||0)
+    };
+    if(target !== oldName) delete inv.items[oldName];
+  }
+
+  // 4. the per-ticket yard ledger, on both sides
+  Object.keys(inv.applied||{}).forEach(id=>{
+    const rec = inv.applied[id];
+    ['out','back'].forEach(side=>{
+      if(rec[side] && rec[side][oldName] != null){
+        rec[side][target] = (Number(rec[side][target])||0) + (Number(rec[side][oldName])||0);
+        if(target !== oldName) delete rec[side][oldName];
+      }
+    });
+  });
+
+  // 5. every ticket that carries the old name
+  const touched = [];
+  tickets.forEach(t=>{
+    let hit = false;
+    (t.equipment||[]).forEach(e=>{ if(e.name === oldName){ e.name = target; hit = true; } });
+    if(hit){ t.updatedAt = nowIso(); touched.push(t); }
+  });
+
+  // 6. saved templates
+  (templateCatalog||[]).forEach(tpl=>{
+    (tpl.items||[]).forEach(i=>{ if(i.name === oldName) i.name = target; });
+  });
+
+  // 7. a count session left open on this device
+  if(countSession && countSession.items && countSession.items[oldName]){
+    const from = countSession.items[oldName];
+    const to = countSession.items[target];
+    countSession.items[target] = to
+      ? { ready:(Number(to.ready)||0)+(Number(from.ready)||0),
+          shop:(Number(to.shop)||0)+(Number(from.shop)||0),
+          counted: to.counted || from.counted }
+      : from;
+    if(target !== oldName) delete countSession.items[oldName];
+    saveCountSession();
+  }
+
+  await saveCatalog();
+  await saveEquipmentOwned();
+  await saveAppSettings();
+  if(touched.length) await saveTickets();
+  return true;
+}
 /* ── ON-HAND CHECK WHILE BUILDING A TICKET ─────────────────────────
    Warns the moment more of something goes on a ticket than is left on
    the ground - not after saving, when the load is already promised.
@@ -3425,6 +3538,7 @@ function renderNewTicket(){
           <span>${escHtml(name)}</span>
           <span style="display:flex; align-items:center; gap:8px;">
             <input type="number" min="0" placeholder="Owned" value="${equipmentOwned[name]!=null?equipmentOwned[name]:''}" data-owned-qty="${escAttr(name)}" style="width:70px; font-size:12px; padding:4px 6px;">
+            <button class="catalog-remove" data-catalog-rename="${escAttr(name)}" title="Rename — updates every ticket too" style="font-size:13px;">&#9998;</button>
             <button class="catalog-remove" data-catalog-remove="${escAttr(name)}" title="Remove from list">×</button>
           </span>
         </div>
@@ -6139,6 +6253,42 @@ function attachHandlers(){
         await saveCatalog();
         await saveEquipmentOwned();
         await saveAppSettings();
+        render();
+      };
+    });
+    document.querySelectorAll('[data-catalog-rename]').forEach(btn=>{
+      btn.onclick = async ()=>{
+        const oldName = btn.dataset.catalogRename;
+        const raw = promptRequired(`Rename "${oldName}" to:`, 'A name is required.');
+        if(raw === null) return;
+        const newName = raw.trim();
+        if(!newName || newName === oldName) return;
+
+        const impact = equipmentRenameImpact(oldName, newName);
+
+        // Spell out what this touches. A rename looks cosmetic and isn't -
+        // it rewrites history on every ticket that ever carried the name.
+        const parts = [];
+        if(impact.ticketCount) parts.push(`${impact.ticketCount} ticket${impact.ticketCount===1?'':'s'} (${impact.lineCount} line${impact.lineCount===1?'':'s'})`);
+        if(impact.templateCount) parts.push(`${impact.templateCount} template${impact.templateCount===1?'':'s'}`);
+        const y = ensureInventoryCount().items[oldName];
+        const yardQty = y ? (Number(y.ready)||0)+(Number(y.shop)||0) : 0;
+        if(yardQty) parts.push(`${yardQty} recorded at the yard`);
+        const ownedQty = equipmentOwned[oldName];
+        if(ownedQty != null && ownedQty !== '') parts.push(`the owned count of ${ownedQty}`);
+
+        let msg;
+        if(impact.mergeInto){
+          msg = `"${impact.mergeInto}" already exists.\n\nThis will MERGE "${oldName}" into it — counts and yard numbers are added together, and they become one item.\n\nThis can't be undone.`;
+          if(parts.length) msg += `\n\nMoving across: ${parts.join(', ')}.`;
+        } else {
+          msg = parts.length
+            ? `Rename "${oldName}" to "${newName}"?\n\nThis also updates ${parts.join(', ')}.`
+            : `Rename "${oldName}" to "${newName}"?`;
+        }
+        if(!confirm(msg)) return;
+
+        await renameEquipment(oldName, newName);
         render();
       };
     });
