@@ -2334,8 +2334,69 @@ async function loadAppSettings(){
   }
 }
 
+/* appSettings holds six unrelated features - the yard count and its two
+   ledgers, invoice rules, the pass-through list, vendor payers, the billing
+   check dates, rig overrides. Stamping the whole object on every save meant
+   two problems at once:
+
+   1. Background work claimed authorship. reconcileYardFromTickets() saves
+      at startup and after every pull, so simply opening the app on the iPad
+      gave it a fresher stamp than the phone where someone had actually done
+      something - and "newer" stopped meaning "newer edit".
+
+   2. Unrelated features competed. Changing an invoice rule pushed that
+      device's older copy of the yard numbers along with it.
+
+   Now each top-level key is compared against what was last stamped, and only
+   the keys that genuinely changed get a new stamp - under 'appSettings.<key>',
+   which the server merges one key at a time. */
+const SETTINGS_SNAPSHOT_KEY = 'flowtech_equipment_tracker_settingssnapshot';
+let settingsSnapshot = null;
+
+function getSettingsSnapshot(){
+  if(settingsSnapshot === null){
+    try{
+      const raw = localStorage.getItem(SETTINGS_SNAPSHOT_KEY);
+      settingsSnapshot = raw ? JSON.parse(raw) : {};
+    }catch(e){ settingsSnapshot = {}; }
+    if(!settingsSnapshot || typeof settingsSnapshot !== 'object') settingsSnapshot = {};
+  }
+  return settingsSnapshot;
+}
+
+// Records the current appSettings as the baseline, WITHOUT stamping. Used
+// after a pull, so values that arrived from the other device don't look like
+// local edits the next time something is saved.
+function rebaseSettingsSnapshot(){
+  settingsSnapshot = {};
+  Object.keys(appSettings || {}).forEach(k=>{
+    try{ settingsSnapshot[k] = JSON.stringify(appSettings[k]); }catch(e){}
+  });
+  try{ localStorage.setItem(SETTINGS_SNAPSHOT_KEY, JSON.stringify(settingsSnapshot)); }catch(e){}
+}
+
+function stampChangedSettingKeys(){
+  const snap = getSettingsSnapshot();
+  const now = {};
+  Object.keys(appSettings || {}).forEach(k=>{
+    try{ now[k] = JSON.stringify(appSettings[k]); }catch(e){ now[k] = String(appSettings[k]); }
+  });
+  let changed = 0;
+  Object.keys(now).forEach(k=>{
+    if(snap[k] !== now[k]){ stampStore('appSettings.' + k); changed++; }
+  });
+  // A key removed here is an edit too - stamp it so the server can honour
+  // the deletion instead of the other device quietly restoring it.
+  Object.keys(snap).forEach(k=>{
+    if(!(k in now)){ stampStore('appSettings.' + k); changed++; }
+  });
+  settingsSnapshot = now;
+  try{ localStorage.setItem(SETTINGS_SNAPSHOT_KEY, JSON.stringify(now)); }catch(e){}
+  return changed;
+}
+
 async function saveAppSettings(){
-  stampStore('appSettings');
+  stampChangedSettingKeys();
   try{
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(appSettings));
   }catch(e){
@@ -2648,6 +2709,11 @@ async function pullFromCloud(silent){
         // to leave the tab and come back.
         if(currentTab === 'reports' && syncUrl) fetchQuickBooksRevenue(true);
       }
+
+      // What just arrived is now the baseline. Without this, the next save
+      // would see the other device's values as changes made here and stamp
+      // them as ours - handing this device authorship of edits it never made.
+      rebaseSettingsSnapshot();
     }
     localStorage.setItem(STORAGE_KEY, JSON.stringify(tickets));
     localStorage.setItem(CATALOG_KEY, JSON.stringify(equipmentCatalog));
@@ -2696,9 +2762,29 @@ async function pushToCloud(){
     // green sync while nothing had been saved.
     if(!res || !res.ok) throw new Error('Push rejected (' + (res ? res.status : 'no response') + ')');
 
+    // res.ok only means the request reached the script. The server can accept
+    // the tickets and still refuse individual stores as stale - and it used to
+    // report that as a plain ok, so this device cleared its unsynced flag on
+    // the exact push where something was discarded, disarming the guard that
+    // stops the next pull from overwriting the local copy.
+    let refused = [];
+    try{
+      const body = await res.json();
+      if(body && Array.isArray(body.rejected)) refused = body.rejected;
+    }catch(e){ /* older backend returns no body worth reading */ }
+
     if(deletesToSend.length) pendingDeletes = pendingDeletes.filter(id=>!deletesToSend.includes(id));
-    syncStatus = 'ok';
-    setUnsyncedLocalWork(false);
+
+    if(refused.length){
+      // The other device holds newer data for these. Keep the flag set so a
+      // pull can't run yet, tell the user plainly, and let them decide.
+      syncStatus = 'error';
+      setUnsyncedLocalWork(true);
+      showStaleWriteWarning(refused);
+    } else {
+      syncStatus = 'ok';
+      setUnsyncedLocalWork(false);
+    }
     await reconcileYardFromTickets();
   }catch(e){
     console.error('Cloud push failed', e);
@@ -5343,6 +5429,50 @@ function colorSwatch(name){
 // Shows a visible warning banner when a localStorage write fails — this
 // prevents the silent data loss scenario where the app looks like it saved
 // but nothing actually persisted. The banner stays until dismissed.
+/* Shown when the server refuses part of a push because the other device
+   holds a newer copy. Names what was refused in the words used on screen,
+   not the internal store keys - "appSettings.inventoryCount" means nothing
+   to anyone standing in a yard. */
+const STORE_LABELS = {
+  'catalog': 'equipment list',
+  'equipmentOwned': 'owned counts',
+  'colorCatalog': 'band colors',
+  'rigCatalog': 'rig list',
+  'archivedRigs': 'archived rigs',
+  'customerCatalog': 'customer list',
+  'templateCatalog': 'ticket templates',
+  'appSettings': 'app settings',
+  'appSettings.inventoryCount': 'yard count (ready / in shop)',
+  'appSettings.invoiceRules': 'invoice number rules',
+  'appSettings.passThroughCustomers': 'split-by-operator list',
+  'appSettings.vendorPayers': 'vendor payer list',
+  'appSettings.rigOperatorOverrides': 'rig to operator assignments',
+  'appSettings.billingCheckStartDate': 'billing check start date',
+  'appSettings.billingCheckGraceDays': 'billing check grace window'
+};
+
+function labelForStore(key){
+  if(STORE_LABELS[key]) return STORE_LABELS[key];
+  if(key.indexOf('appSettings.') === 0) return key.slice('appSettings.'.length);
+  return key;
+}
+
+function showStaleWriteWarning(keys){
+  const old = document.getElementById('stale-write-banner');
+  if(old) old.remove();
+  const names = keys.map(labelForStore);
+  const list = names.length === 1 ? names[0]
+    : names.slice(0,-1).join(', ') + ' and ' + names[names.length-1];
+  const banner = document.createElement('div');
+  banner.id = 'stale-write-banner';
+  banner.style.cssText = 'position:fixed; top:0; left:0; right:0; background:#B8691C; color:#fff; padding:12px 20px; z-index:99999; font-family:Inter,sans-serif; font-size:14px; display:flex; justify-content:space-between; align-items:center; gap:12px;';
+  banner.innerHTML = '<span><strong>Not saved to the cloud</strong> &mdash; the other device has newer ' +
+    escHtml(list) + '. Your changes are still on this device. Reload to take their copy, ' +
+    'or make the change again on the device that has the newest data.</span>' +
+    '<button onclick="this.parentElement.remove()" style="background:none; border:1px solid #fff; color:#fff; padding:4px 12px; border-radius:4px; cursor:pointer; font-size:12px; white-space:nowrap;">Dismiss</button>';
+  document.body.prepend(banner);
+}
+
 function showStorageWarning(context, err){
   console.error('Storage write failed (' + context + '):', err);
   if(document.getElementById('storage-warning-banner')) return; // already showing
