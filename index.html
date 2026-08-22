@@ -3570,15 +3570,38 @@ function renderChargeRules(){
     </div>`;
   const rows = rules.map((r,i)=>`
     <div style="display:grid; grid-template-columns:1fr 1fr 82px 82px 1fr 30px; gap:8px; padding:7px 0; border-bottom:1px solid var(--line); align-items:center;">
-      <input type="text" data-rule-field="customer" data-rule-index="${i}" value="${escAttr(r.customer||'')}" placeholder="customer name">
-      <input type="text" data-rule-field="rig" data-rule-index="${i}" value="${escAttr(r.rig||'')}" placeholder="any rig">
+      <input type="text" list="rule-customer-options" data-rule-field="customer" data-rule-index="${i}" value="${escAttr(r.customer||'')}" placeholder="pick a customer">
+      <input type="text" list="rule-rig-options" data-rule-field="rig" data-rule-index="${i}" value="${escAttr(r.rig||'')}" placeholder="any rig">
       <input type="number" step="0.01" min="0" data-rule-field="perDay" data-rule-index="${i}" value="${escAttr(r.perDay==null?'':r.perDay)}" style="text-align:right;">
       <input type="number" step="0.01" min="0" data-rule-field="flatAdd" data-rule-index="${i}" value="${escAttr(r.flatAdd==null?'':r.flatAdd)}" style="text-align:right;">
       <input type="text" data-rule-field="label" data-rule-index="${i}" value="${escAttr(r.label||'')}" placeholder="optional">
       <button data-rule-remove="${i}" title="Remove this rule" style="background:none; border:none; padding:0; cursor:pointer; color:#B5432A; font-size:16px; font-family:inherit;">&times;</button>
     </div>`).join('');
+  // Pick from the names already on your tickets rather than retyping them.
+  // A rule only fires on an exact customer match, and "Firebird Energy II"
+  // with capital i's looks identical to one with lowercase L's in almost
+  // every font - so a mismatch you cannot see would just silently do nothing.
+  const custOpts = (customerCatalog||[]).map(c=>`<option value="${escAttr(c)}">`).join('');
+  const rigOpts  = (rigCatalog||[]).map(r=>`<option value="${escAttr(typeof r==='string'?r:(r&&r.name)||'')}">`).join('');
+
+  // Names used by a rule that match nothing on any ticket. Almost always a
+  // typo, and otherwise invisible - the rule just never fires.
+  const known = {};
+  (customerCatalog||[]).forEach(c=>{ known[String(c).trim().toLowerCase()] = true; });
+  (tickets||[]).forEach(t=>{ if(t.customer) known[String(t.customer).trim().toLowerCase()] = true; });
+  const orphans = rules
+    .map(r=>String(r.customer||'').trim())
+    .filter(c=>c && !known[c.toLowerCase()]);
+
   return `<div style="background:#fff; border:1.5px solid var(--line); border-radius:8px; padding:14px 16px;">
+    <datalist id="rule-customer-options">${custOpts}</datalist>
+    <datalist id="rule-rig-options">${rigOpts}</datalist>
     ${rules.length ? head + rows : '<p style="font-size:13px; color:var(--ink-soft); margin:0 0 10px 0;">No rules yet — adding a well charge will start blank and you type the amount.</p>'}
+    ${orphans.length ? `<div style="background:#FFF8E6; border:1.5px solid #E6D080; border-radius:6px; padding:9px 11px; margin-top:10px; font-size:11px; color:#8A6D10; line-height:1.5;">
+      <strong>${orphans.length === 1 ? 'This name matches no customer on any ticket' : 'These names match no customer on any ticket'}:</strong>
+      ${orphans.map(escHtml).join(', ')}.
+      ${orphans.length === 1 ? 'That rule will never fire.' : 'Those rules will never fire.'} Pick the name from the list rather than typing it.
+    </div>` : ''}
     <button class="ghost-btn" id="add-charge-rule" style="font-size:12px; margin-top:12px;">+ Add Rule</button>
   </div>`;
 }
@@ -6499,6 +6522,10 @@ function attachHandlers(){
       if(!Array.isArray(rules) || !rules[i]) return;
       rules[i][inp.dataset.ruleField] = inp.value;
       await saveAppSettings();
+      // Only the customer box changes whether the warning applies, and
+      // re-rendering on every keystroke would take the focus off the field
+      // you're still typing in.
+      if(inp.dataset.ruleField === 'customer') render();
     };
   });
   document.querySelectorAll('[data-rule-remove]').forEach(b=>{
