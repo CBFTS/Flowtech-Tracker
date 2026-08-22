@@ -3516,7 +3516,9 @@ function renderSyncPanel(){
           The URL travels inside this page, so it can't be a secret. This token is what actually
           protects your data, and it's stored on this device only &mdash; type it once here and once
           on each other device. It never leaves in anything you publish or email.
-          ${syncToken ? '' : '<strong style="color:#B8691C;">Not set on this device yet.</strong>'}
+          <strong id="sync-token-state" style="color:${syncToken ? '#1E8A29' : '#B8691C'};">${syncToken
+            ? 'Saved on this device (' + syncToken.length + ' characters).'
+            : 'Not set on this device yet.'}</strong>
         </div>
       </div>
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
@@ -6368,6 +6370,29 @@ function attachHandlers(){
     render();
   };
 
+  // Save the token the moment it's typed, not only when Connect is pressed.
+  // It used to persist ONLY through Connect, so pasting it and then hitting
+  // Refresh Now - or just leaving the screen - looked like it had been
+  // entered and hadn't been, which reads as "I put the token in and it still
+  // says unauthorized".
+  const tokenField = document.getElementById('sync-token-input');
+  if(tokenField){
+    // Updated in place rather than through render(), so the line under the
+    // box answers "did that take?" the instant you paste - which is the
+    // question you're actually asking when you look at it.
+    const paintTokenState = ()=>{
+      const el = document.getElementById('sync-token-state');
+      if(!el) return;
+      el.textContent = syncToken
+        ? 'Saved on this device (' + syncToken.length + ' characters).'
+        : 'Not set on this device yet.';
+      el.style.color = syncToken ? '#1E8A29' : '#B8691C';
+    };
+    const keep = ()=>{ saveSyncToken(tokenField.value); paintTokenState(); };
+    tokenField.oninput = keep;
+    tokenField.onchange = keep;
+  }
+
   const saveSyncBtn = document.getElementById('save-sync-url');
   if(saveSyncBtn) saveSyncBtn.onclick = async ()=>{
     const tokenInput = document.getElementById('sync-token-input');
@@ -6381,7 +6406,11 @@ function attachHandlers(){
   };
 
   const syncNowBtn = document.getElementById('sync-now-btn');
-  if(syncNowBtn) syncNowBtn.onclick = ()=>{ pullFromCloud(); };
+  if(syncNowBtn) syncNowBtn.onclick = ()=>{
+    const tf = document.getElementById('sync-token-input');
+    if(tf) saveSyncToken(tf.value);   // whatever is in the box is what we mean
+    pullFromCloud();
+  };
 
   const disconnectBtn = document.getElementById('disconnect-sync-btn');
   if(disconnectBtn) disconnectBtn.onclick = ()=>{
