@@ -622,7 +622,19 @@
       margin-bottom:8px;
     }
     table.equip-table-input td{padding:4px 0;}
-    .summary-cards{grid-template-columns:repeat(2,1fr);}
+    /* Inline grid-template-columns on the markup beat this rule, so the
+       four-across Reports cards stayed four-across on a phone with their
+       labels stacked three deep. */
+    .summary-cards{grid-template-columns:repeat(2,1fr) !important;}
+
+    /* The report tables carry fixed pixel columns - 60+60+70+70 plus gaps
+       leaves about 38px for a customer name on a 380px screen, so
+       "West Texas Premix Pits" came out one word per line and the page
+       scrolled sideways. Let the TABLE scroll inside its own card instead
+       of dragging the whole page with it; columns stay aligned and the
+       header scrolls with the rows. */
+    .rpt-card{overflow-x:auto; -webkit-overflow-scrolling:touch;}
+    .rpt{min-width:520px;}
     .filter-bar{flex-direction:column; align-items:stretch;}
     .signature-row{flex-direction:column;}
     .signature-canvas{width:100%; height:120px;}
@@ -711,7 +723,7 @@ let archivedRigs = [];
 let customerCatalog = [];
 let templateCatalog = [];
 let showManageCatalog = false;
-let selectedTicketIds = new Set();
+
 let syncUrl = '';
 // Baked-in default Web App URL, so delivery/return signing links don't need
 // to carry the full address around every time - keeps those links short
@@ -920,7 +932,15 @@ const app = document.getElementById('app');
 
 function uid(){ return 't_' + Date.now() + '_' + Math.random().toString(36).slice(2,8); }
 function eqid(){ return 'e_' + Math.random().toString(36).slice(2,8); }
-function todayStr(){ return new Date().toISOString().slice(0,10); }
+// The LOCAL calendar date. toISOString() is UTC, so from about 7pm Central
+// onward it returned tomorrow - and this is the date stamped on every well
+// marked billed, every Mark Returned, every new ticket, and every pad start
+// and complete. Bill a well after supper and it filed under the next day.
+function todayStr(){
+  const d = new Date();
+  const pad = (n)=> String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate());
+}
 // Full timestamp (not just the date) used to stamp every ticket change, so
 // the shared backend can merge two devices' edits by keeping the newer one
 // instead of letting whoever saves last overwrite the other's tickets.
@@ -930,6 +950,25 @@ function nowIso(){ return new Date().toISOString(); }
 // shared set (and remember them), preventing a stale copy on another device
 // from resurrecting a deleted ticket on its next sync.
 let pendingDeletes = [];
+const PENDING_DELETES_KEY = 'flowtech_equipment_tracker_pendingdeletes';
+
+// This queue used to live only in memory. Delete a ticket with no signal,
+// phone locks, the browser drops the tab - and the delete was gone, so the
+// next sync pulled the ticket straight back down from the sheet.
+function loadPendingDeletes(){
+  try{
+    const raw = localStorage.getItem(PENDING_DELETES_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    pendingDeletes = Array.isArray(arr) ? arr.filter(x=>typeof x === 'string') : [];
+  }catch(e){ pendingDeletes = []; }
+}
+
+function savePendingDeletes(){
+  try{
+    if(pendingDeletes.length) localStorage.setItem(PENDING_DELETES_KEY, JSON.stringify(pendingDeletes));
+    else localStorage.removeItem(PENDING_DELETES_KEY);
+  }catch(e){ /* best effort - the in-memory copy still works this session */ }
+}
 
 // ── PAD / WELL BILLING HELPERS ──────────────────────────────────────
 // Prompts that re-ask instead of accepting an empty box. A blank answer
@@ -966,6 +1005,14 @@ function padSummaryText(pad){
   const billed = Array.isArray(pad.billedWells) ? pad.billedWells.length : 0;
   return `${billed} of ${pad.totalWells} wells billed`;
 }
+function agoLabel(days, opts){
+  const short = opts && opts.short;
+  if(days === null || days === undefined) return short ? '—' : 'never';
+  if(days <= 0) return 'today';
+  if(days === 1) return short ? 'yesterday' : 'yesterday';
+  return short ? (days + 'd ago') : (days + ' days ago');
+}
+
 function daysSinceLastBilled(pad){
   if(!pad || !Array.isArray(pad.billedWells) || pad.billedWells.length === 0) return null;
   const sorted = pad.billedWells.slice().sort((a,b)=>(b.date||'').localeCompare(a.date||''));
@@ -1044,9 +1091,36 @@ function startPendingSubmissionRetry(onFlush){
   setInterval(tryFlush, 15000); // also poll periodically - the 'online' event isn't always reliable on flaky rig-site connections
 }
 
+// Whole days from a to b. Was clamped with Math.max(1, ...), which made
+// three different things all read as "1 day": something that happened today,
+// something dated backwards, and a missing date (NaN). A count of days is
+// allowed to be zero, and a negative one is a typo worth seeing.
+//
+// Bare 'YYYY-MM-DD' parses as UTC midnight while a full timestamp parses as
+// local, so both sides are pinned to local midnight before subtracting -
+// otherwise the answer shifts by a day depending on the hour.
+function dayStart(v){
+  if(v === null || v === undefined || v === '') return null;
+  const str = String(v);
+  const m = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  const d = m ? new Date(Number(m[1]), Number(m[2])-1, Number(m[3])) : new Date(str);
+  if(isNaN(d.getTime())) return null;
+  d.setHours(0,0,0,0);
+  return d;
+}
+
 function daysBetween(a,b){
-  const d1 = new Date(a), d2 = new Date(b);
-  return Math.max(1, Math.round((d2-d1)/(1000*60*60*24)));
+  const d1 = dayStart(a), d2 = dayStart(b);
+  if(!d1 || !d2) return null;
+  return Math.round((d2 - d1) / 86400000);
+}
+
+// For anything that bills or measures a duration: at least one day, and
+// never NaN. Kept separate from daysBetween so a display can tell the
+// truth while a charge still can't come out as zero or blank.
+function billableDays(a,b){
+  const n = daysBetween(a,b);
+  return (n === null || n < 1) ? 1 : n;
 }
 function fmtMoney(n){ return '$' + n.toLocaleString(undefined,{minimumFractionDigits:2, maximumFractionDigits:2}); }
 function fmtDate(s){
@@ -1069,7 +1143,7 @@ function ticketTotal(t){
   const extra = Number(t.extraChargeAmount) || 0;
   if(t.billingType === 'perday' && t.dayRate){
     const end = t.returnDate || todayStr();
-    const days = Math.max(1, daysBetween(t.deliveryDate, end));
+    const days = billableDays(t.deliveryDate, end);
     return (Number(t.dayRate)||0) * days + extra;
   }
   if(t.totalCost !== undefined && t.totalCost !== null && t.totalCost !== ''){
@@ -1210,9 +1284,11 @@ function renderCountScreen(){
     const drift = (it.counted && expected != null) ? (seen - expected) : null;
 
     // The expected figure is shown for context but never seeds the counter.
+    const stale = missedLastCountToo(name);
+    const ageBit = `<span style="color:${stale?'#B8691C':'var(--ink-soft)'};${stale?'font-weight:600;':''}">${countAgeLabel(name)}</span>`;
     let hint = hasOwned
-      ? `${owned} on file${outQty?` · ${outQty} out`:''} · expect ${expected} here`
-      : `<span style="color:#B8691C;">no count on file yet</span>`;
+      ? `${owned} on file${outQty?` · ${outQty} out`:''} · expect ${expected} here · ${ageBit}`
+      : `<span style="color:#B8691C;">no count on file</span>`;
     if(drift !== null && drift !== 0){
       hint += ` · <strong style="color:#B5432A;">${drift>0?'+':''}${drift}</strong>`;
     } else if(drift === 0){
@@ -1231,7 +1307,7 @@ function renderCountScreen(){
         </div>
       </div>`;
 
-    return `<div style="background:#fff; border:1.5px solid ${it.counted?'#B7D9BB':'var(--line)'}; border-radius:10px; padding:12px 14px; margin-bottom:10px;">
+    return `<div style="background:#fff; border:1.5px solid ${it.counted?'#B7D9BB':(stale?'#E6D080':'var(--line)')}; border-radius:10px; padding:12px 14px; margin-bottom:10px;">
       <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px;">
         <div style="font-weight:600; font-size:15px; line-height:1.25;">${escHtml(name)}</div>
         ${it.counted?`<span style="font-family:'IBM Plex Mono',monospace; font-size:10px; color:#1E8A29; white-space:nowrap;">COUNTED</span>`:''}
@@ -1338,7 +1414,56 @@ function ensureInventoryCount(){
     delete inv.processedDeliveries;
     delete inv.processedReturns;
   }
+
+  // Per-item count dates. Before this there was one date for the whole
+  // session, so the app could say what you missed today but not that you'd
+  // missed the same thing three counts running.
+  //
+  // Backfilling gives every item already on file the date of the last
+  // whole-yard count. That's a guess - we can't know which items that
+  // session actually covered - but it's the conservative guess: it cries
+  // wolf on nothing, and from the next count forward every date is exact.
+  if(!inv.countDatesBackfilled){
+    if(inv.countedAt){
+      Object.keys(inv.items).forEach(name=>{
+        const it = inv.items[name];
+        if(it && typeof it === 'object' && !it.countedAt) it.countedAt = inv.countedAt;
+      });
+    }
+    inv.countDatesBackfilled = true;
+  }
   return inv;
+}
+
+// When this item was last actually counted at the yard. Null means never -
+// filling owned from ticket history deliberately does NOT stamp this, since
+// that's a floor derived from what went out, not somebody looking at iron.
+function lastCountedFor(name){
+  const inv = ensureInventoryCount();
+  const it = inv.items[name];
+  return (it && it.countedAt) ? it.countedAt : null;
+}
+
+// True when this item was already skipped in the previous count. That is the
+// signal worth acting on: one miss is an accident, two is a number quietly
+// going stale.
+function missedLastCountToo(name){
+  const inv = ensureInventoryCount();
+  if(!inv.countedAt) return false;          // no previous count to compare to
+  const last = lastCountedFor(name);
+  return !last || last < inv.countedAt;
+}
+
+function countAgeLabel(name){
+  const last = lastCountedFor(name);
+  if(!last) return 'never counted';
+  const days = daysBetween(String(last).slice(0,10), todayStr());
+  if(days === null) return 'never counted';
+  if(days <= 0) return 'counted today';
+  if(days === 1) return 'counted yesterday';
+  if(days < 14) return 'counted ' + days + ' days ago';
+  if(days < 60) return 'counted ' + Math.floor(days/7) + ' weeks ago';
+  return 'last counted ' + fmtDate(String(last).slice(0,10));
 }
 
 // Quantities per equipment name on a ticket, totalled - the same item can
@@ -1378,7 +1503,21 @@ function yardEntry(name){
   return it;
 }
 
+// pushToCloud finishes by reconciling, and reconciling can save settings,
+// which pushes. The flag above is the real fix; this is the backstop, so a
+// future edit that reintroduces the cycle stalls instead of flooding.
+let reconcileRunning = false;
 async function reconcileYardFromTickets(){
+  if(reconcileRunning) return false;
+  reconcileRunning = true;
+  try{
+    return await reconcileYardFromTickets_();
+  } finally {
+    reconcileRunning = false;
+  }
+}
+
+async function reconcileYardFromTickets_(){
   if(!tickets) return false;
   const inv = ensureInventoryCount();
   let changed = false;
@@ -1425,7 +1564,13 @@ async function reconcileYardFromTickets(){
       const moved = applyDelta(name, 'ready', -delta);
       rec.out[name] = (rec.out[name]||0) - moved;
       if(rec.out[name] <= 0) delete rec.out[name];
-      changed = true;
+      // Only a real movement counts as a change. Ready can't go below zero,
+      // so when the yard is short, moved is 0 and NOTHING above changed -
+      // but this used to report "changed" anyway. That answer is what makes
+      // saveAppSettings push, and the push ends by reconciling again, so the
+      // two called each other forever, one POST per lap, on any item whose
+      // Ready count couldn't cover the ticket.
+      if(moved !== 0) changed = true;
     });
 
     // Shop queue: add on return, and remove again if the return is undone.
@@ -1436,13 +1581,14 @@ async function reconcileYardFromTickets(){
       const moved = applyDelta(name, 'shop', delta);
       rec.back[name] = (rec.back[name]||0) + moved;
       if(rec.back[name] <= 0) delete rec.back[name];
-      changed = true;
+      if(moved !== 0) changed = true;   // same reason as above
     });
 
     // Ledger entry for a ticket that no longer exists and has nothing left
     // applied is dead weight; these accumulate forever otherwise.
     if(!t && Object.keys(rec.out).length === 0 && Object.keys(rec.back).length === 0){
       delete inv.applied[id];
+      changed = true;
     }
   });
 
@@ -1575,6 +1721,9 @@ async function renameEquipment(oldName, newName){
   await saveCatalog();
   await saveEquipmentOwned();
   await saveAppSettings();
+  // Templates were rewritten in memory above but never written to disk, so
+  // a reload brought back the old name and the next push pushed it out again.
+  await saveTemplates();
   if(touched.length) await saveTickets();
   return true;
 }
@@ -1785,6 +1934,11 @@ function renderCountReview(){
   const names = countableItemNames();
   const counted = names.filter(n=>countSession.items[n] && countSession.items[n].counted);
   const skipped = names.filter(n=>!(countSession.items[n] && countSession.items[n].counted));
+  // A miss that has happened twice running is a different thing from a miss
+  // today, and worth saying separately - one is an accident, the other is a
+  // number nobody has looked at in months.
+  const repeatSkips = skipped.filter(missedLastCountToo);
+  const freshSkips = skipped.filter(n=>!missedLastCountToo(n));
 
   let changeRows = '', sameCount = 0;
   counted.forEach(name=>{
@@ -1814,10 +1968,16 @@ function renderCountReview(){
       </div>
     </div>
 
-    ${skipped.length>0?`<div style="background:#FFF8E6; border:1.5px solid #E6D080; border-radius:8px; padding:12px 14px; margin-bottom:14px;">
-      <div style="font-weight:600; font-size:13px; color:#8A6D10; margin-bottom:4px;">${skipped.length} item${skipped.length!==1?'s':''} not counted</div>
-      <div style="font-size:11px; color:#8A6D10; line-height:1.5;">${skipped.map(escHtml).join(', ')}</div>
-      <div style="font-size:11px; color:#8A6D10; margin-top:6px;">These are left exactly as they are — owned count, ready and in-shop all untouched.</div>
+    ${repeatSkips.length>0?`<div style="background:#FCEBEA; border:1.5px solid #E0A9A0; border-radius:8px; padding:12px 14px; margin-bottom:14px;">
+      <div style="font-weight:600; font-size:13px; color:#B5432A; margin-bottom:4px;">${repeatSkips.length} item${repeatSkips.length!==1?'s':''} missed again</div>
+      <div style="font-size:11px; color:#8A3B2A; margin-bottom:6px;">Not in this count, and not in your last one either — so ${repeatSkips.length!==1?'they are':'it is'} still resting on old information.</div>
+      ${repeatSkips.map(n=>`<div style="font-size:12px; color:#8A3B2A; padding:2px 0;">${escHtml(n)} — <span style="font-family:'IBM Plex Mono',monospace; font-size:11px;">${escHtml(countAgeLabel(n))}</span></div>`).join('')}
+    </div>`:''}
+
+    ${freshSkips.length>0?`<div style="background:#FFF8E6; border:1.5px solid #E6D080; border-radius:8px; padding:12px 14px; margin-bottom:14px;">
+      <div style="font-weight:600; font-size:13px; color:#8A6D10; margin-bottom:4px;">${freshSkips.length} item${freshSkips.length!==1?'s':''} not counted</div>
+      <div style="font-size:11px; color:#8A6D10; line-height:1.5;">${freshSkips.map(escHtml).join(', ')}</div>
+      <div style="font-size:11px; color:#8A6D10; margin-top:6px;">Counted recently, so these are left exactly as they are — owned count, ready and in-shop all untouched.</div>
     </div>`:''}
 
     ${changeRows?`
@@ -1825,13 +1985,15 @@ function renderCountReview(){
         <div>Item</div><div style="text-align:center;">Was</div><div style="text-align:center;">Now</div><div style="text-align:center;">Change</div>
       </div>
       ${changeRows}
-    `:`<p style="font-size:13px; color:var(--ink-soft);">No changes — everything counted matches what's on file.</p>`}
+    `:`<p style="font-size:13px; color:var(--ink-soft);">${counted.length === 0
+        ? 'You haven&rsquo;t counted anything yet — go back and tally at least one item, or discard this count.'
+        : 'No changes — everything counted matches what&rsquo;s on file.'}</p>`}
 
     ${sameCount>0?`<div style="font-size:11px; color:var(--ink-soft); margin-top:10px;">${sameCount} counted item${sameCount!==1?'s':''} already matched and ${sameCount!==1?'are':'is'} not listed.</div>`:''}
 
     <div style="display:flex; gap:10px; margin:20px 0 30px 0;">
       <button id="count-back" class="ghost-btn" style="flex:1;">Back to counting</button>
-      <button id="count-apply" class="primary-btn" style="flex:1;">Apply to inventory</button>
+      <button id="count-apply" class="primary-btn" style="flex:1;${counted.length === 0 ? ' opacity:0.45; cursor:not-allowed;' : ''}"${counted.length === 0 ? ' disabled' : ''}>Apply to inventory</button>
     </div>
     <div style="margin-bottom:30px;">
       <button id="count-discard" style="background:none; border:none; color:#B5432A; font-size:12px; text-decoration:underline; cursor:pointer; font-family:inherit;">Discard this count</button>
@@ -1866,10 +2028,15 @@ async function applyCountSession(){
   // opposite in as many words. Partial counts are the normal case: the count
   // screen has a filter box and a Hide-done button built for exactly that.
   const inv = ensureInventoryCount();
-  inv.countedAt = new Date().toISOString();
+  const stamp = new Date().toISOString();
+  // Per ITEM, not just per session - so a thing that keeps getting skipped
+  // can be told apart from a thing that was counted an hour ago.
   Object.keys(snapshot).forEach(name=>{
-    inv.items[name] = { ready: snapshot[name].ready, shop: snapshot[name].shop };
+    inv.items[name] = { ready: snapshot[name].ready, shop: snapshot[name].shop, countedAt: stamp };
   });
+  // Set last, so missedLastCountToo() above still compares against the
+  // PREVIOUS session while this one is being reviewed.
+  inv.countedAt = stamp;
 
   // A count is a new baseline for the items it covered, so the ledger is
   // rewritten to "everything currently applied" for those - otherwise a
@@ -1888,13 +2055,18 @@ async function applyCountSession(){
     });
   });
 
-  countSession = null;
-  saveCountSession();
-  countMode = null;
-
+  // Write everything FIRST, and only then drop the raw count. It used to be
+  // cleared here, before three sequential saves and network pushes - so a
+  // phone that died, got backgrounded and killed, or hit its storage limit
+  // in that window lost the whole yard count with "Inventory updated" the
+  // last thing the user saw.
   await saveCatalog();
   await saveEquipmentOwned();
   await saveAppSettings();
+
+  countSession = null;
+  saveCountSession();
+  countMode = null;
   currentTab = 'inventory';
   render();
   alert(`Inventory updated — ${applied} item${applied!==1?'s':''} counted.`);
@@ -2069,7 +2241,7 @@ function printCountSheet(){
     <strong>Expected</strong> is what's on file minus what's out on open tickets &mdash; that's what should physically be at the yard.
     Anything in for repair, rebuild or paint still counts as owned, so note it rather than leaving it out of the count.
     Blank rows at the bottom are for anything you find that isn't in the app yet.
-    ${unset>0?`<br><strong style="color:#B8691C;">${unset} item${unset!==1?'s have':' has'} no owned count on file yet</strong> &mdash; those are the ones this sheet exists to fill in.`:''}
+    ${unset>0?`<br><strong style="color:#B8691C;">${unset} item${unset!==1?'s have':' has'} no count on file</strong> &mdash; those are the ones this sheet exists to fill in.`:''}
   </div>
   <div class="print-footer">
     <span>Flow-Tech Systems LLC &middot; ${names.length} item${names.length!==1?'s':''} &middot; ${totalOwned} on file &middot; ${totalOut} out</span>
@@ -2373,6 +2545,30 @@ const ARCHIVED_RIGS_KEY = 'flowtech_equipment_tracker_archivedrigs';
 const CUSTOMER_CATALOG_KEY = 'flowtech_equipment_tracker_customercatalog';
 const TEMPLATE_KEY = 'flowtech_equipment_tracker_templates';
 const SYNC_URL_KEY = 'flowtech_equipment_tracker_syncurl';
+// The token is typed in once per device and kept HERE, never in the file
+// itself. index.html is served to any browser that opens the app, so a
+// token written into the source would be public the moment the app is.
+const SYNC_TOKEN_KEY = 'flowtech_equipment_tracker_synctoken';
+let syncToken = '';
+
+function loadSyncToken(){
+  try{ syncToken = localStorage.getItem(SYNC_TOKEN_KEY) || ''; }
+  catch(e){ syncToken = ''; }
+}
+
+function saveSyncToken(v){
+  syncToken = (v||'').trim();
+  try{
+    if(syncToken) localStorage.setItem(SYNC_TOKEN_KEY, syncToken);
+    else localStorage.removeItem(SYNC_TOKEN_KEY);
+  }catch(e){ /* best effort */ }
+}
+
+// Appends the token to a GET url.
+function withToken(url){
+  if(!syncToken) return url;
+  return url + (url.indexOf('?') === -1 ? '?' : '&') + 'token=' + encodeURIComponent(syncToken);
+}
 const SETTINGS_KEY = 'flowtech_equipment_tracker_settings';
 
 const DEFAULT_CATALOG = [
@@ -2413,7 +2609,7 @@ async function saveCatalog(){
   try{
     localStorage.setItem(CATALOG_KEY, JSON.stringify(equipmentCatalog));
   }catch(e){
-    console.error('Could not save equipment list', e);
+    showStorageWarning('equipment list', e);
   }
   if(syncUrl) await pushToCloud();
 }
@@ -2433,7 +2629,7 @@ async function saveEquipmentOwned(){
   try{
     localStorage.setItem(EQUIPMENT_OWNED_KEY, JSON.stringify(equipmentOwned));
   }catch(e){
-    console.error('Could not save owned equipment counts', e);
+    showStorageWarning('owned equipment counts', e);
   }
   if(syncUrl) await pushToCloud();
 }
@@ -2463,6 +2659,84 @@ async function loadAppSettings(){
    Now each top-level key is compared against what was last stamped, and only
    the keys that genuinely changed get a new stamp - under 'appSettings.<key>',
    which the server merges one key at a time. */
+/* ── SYNC CONTRACT VERSION ─────────────────────────────────────────
+   Must match SYNC_PROTOCOL in the Apps Script. The two files are edited
+   separately, and when they drift the failure is silent and open rather
+   than loud and closed: this app stamps settings one key at a time, and an
+   older script that only understands whole-object stamps finds nothing to
+   compare, accepts every write, and the protection is off while the sync
+   light stays green.
+
+   So the version is checked, said out loud when it doesn't match, and -
+   more importantly - this side DEGRADES to what the older side actually
+   understands, so a mismatch loses a feature instead of a safeguard.
+
+     1  original
+     2  store stamps
+     3  per-key appSettings stamps + rejected list in the response
+     4  doGet returns store stamps; doPost reports discarded tickets
+*/
+const APP_SYNC_PROTOCOL = 4;
+let serverProtocol = null;   // null until a response has been seen
+
+// True only when the script has confirmed it understands per-key stamps.
+// Unknown counts as NO: assuming a guarantee we haven't been given is the
+// exact failure this is here to prevent.
+function serverSupportsPerKeyStamps(){
+  return serverProtocol !== null && serverProtocol >= 3;
+}
+
+// Only version 4 sends the sheet's stamps back. On anything older the local
+// stamps stay as they are, which is the behaviour that could lock a device
+// out - so the app says so rather than pretending it's protected.
+function serverSendsStamps(){
+  return serverProtocol !== null && serverProtocol >= 4;
+}
+
+// Take the sheet's stamps as our own. This device now holds exactly the
+// sheet's copy of every store, so it should carry exactly the sheet's
+// stamps. Anything else and the next push looks stale to the server.
+function adoptStoreStamps(incoming){
+  if(!incoming || typeof incoming !== 'object') return;
+  const st = getStoreStamps();
+  let touched = false;
+  Object.keys(incoming).forEach(k=>{
+    const v = incoming[k];
+    if(typeof v !== 'string' || !v) return;
+    if(st[k] === v) return;
+    st[k] = v;
+    touched = true;
+  });
+  if(!touched) return;
+  try{ localStorage.setItem(STORE_STAMPS_KEY, JSON.stringify(st)); }catch(e){ /* best effort */ }
+}
+
+function noteServerProtocol(p){
+  const v = Number(p);
+  const known = isFinite(v) && v > 0 ? v : 1;   // no field at all means old
+  if(serverProtocol === known) return;
+  serverProtocol = known;
+  if(known !== APP_SYNC_PROTOCOL) showProtocolMismatch(known);
+  else { const b = document.getElementById('protocol-banner'); if(b) b.remove(); }
+}
+
+function showProtocolMismatch(server){
+  const old = document.getElementById('protocol-banner');
+  if(old) old.remove();
+  const appNewer = APP_SYNC_PROTOCOL > server;
+  const banner = document.createElement('div');
+  banner.id = 'protocol-banner';
+  banner.style.cssText = 'position:fixed; top:0; left:0; right:0; background:#B5432A; color:#fff; padding:12px 20px; z-index:99999; font-family:Inter,sans-serif; font-size:14px; display:flex; justify-content:space-between; align-items:center; gap:12px;';
+  banner.innerHTML = '<span><strong>App and Apps Script are out of step</strong> &mdash; ' +
+    (appNewer
+      ? 'this page expects version ' + APP_SYNC_PROTOCOL + ', the script is on ' + server +
+        '. Paste the latest Code file into the Apps Script editor. Until then some sync protections are running in a reduced mode.'
+      : 'the script is on version ' + server + ', this page is on ' + APP_SYNC_PROTOCOL +
+        '. Upload the latest index.html.') +
+    '</span><button onclick="this.parentElement.remove()" style="background:none; border:1px solid #fff; color:#fff; padding:4px 12px; border-radius:4px; cursor:pointer; font-size:12px; white-space:nowrap;">Dismiss</button>';
+  document.body.prepend(banner);
+}
+
 const SETTINGS_SNAPSHOT_KEY = 'flowtech_equipment_tracker_settingssnapshot';
 let settingsSnapshot = null;
 
@@ -2509,11 +2783,17 @@ function stampChangedSettingKeys(){
 }
 
 async function saveAppSettings(){
-  stampChangedSettingKeys();
+  if(serverSupportsPerKeyStamps()) stampChangedSettingKeys();
+  else {
+    // Older script, or nothing heard from it yet. Whole-object stamping is
+    // coarser but it's a guarantee the other side will actually honour.
+    stampChangedSettingKeys();   // keep the snapshot current either way
+    stampStore('appSettings');
+  }
   try{
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(appSettings));
   }catch(e){
-    console.error('Could not save app settings', e);
+    showStorageWarning('app settings', e);
   }
   if(syncUrl) await pushToCloud();
 }
@@ -2523,6 +2803,7 @@ async function saveAppSettings(){
 function isTicketOverdue(t){
   if(!t || t.returnDate) return false;
   const days = daysBetween(t.deliveryDate, todayStr());
+  if(days === null) return false;   // no usable delivery date - not a judgement we can make
   return days > (appSettings.overdueThresholdDays || 30);
 }
 
@@ -2544,7 +2825,7 @@ async function saveColorCatalog(){
   try{
     localStorage.setItem(COLOR_CATALOG_KEY, JSON.stringify(colorCatalog));
   }catch(e){
-    console.error('Could not save color band list', e);
+    showStorageWarning('colour band list', e);
   }
   if(syncUrl) await pushToCloud();
 }
@@ -2564,7 +2845,7 @@ async function saveRigCatalog(){
   try{
     localStorage.setItem(RIG_CATALOG_KEY, JSON.stringify(rigCatalog));
   }catch(e){
-    console.error('Could not save rig list', e);
+    showStorageWarning('rig list', e);
   }
   if(syncUrl) await pushToCloud();
 }
@@ -2584,7 +2865,7 @@ async function saveArchivedRigs(){
   try{
     localStorage.setItem(ARCHIVED_RIGS_KEY, JSON.stringify(archivedRigs));
   }catch(e){
-    console.error('Could not save archived rigs', e);
+    showStorageWarning('archived rigs', e);
   }
   if(syncUrl) await pushToCloud();
 }
@@ -2604,7 +2885,7 @@ async function saveCustomerCatalog(){
   try{
     localStorage.setItem(CUSTOMER_CATALOG_KEY, JSON.stringify(customerCatalog));
   }catch(e){
-    console.error('Could not save customer list', e);
+    showStorageWarning('customer list', e);
   }
   if(syncUrl) await pushToCloud();
 }
@@ -2633,7 +2914,7 @@ async function saveTemplates(){
   try{
     localStorage.setItem(TEMPLATE_KEY, JSON.stringify(templateCatalog));
   }catch(e){
-    console.error('Could not save templates', e);
+    showStorageWarning('templates', e);
   }
   if(syncUrl) await pushToCloud();
 }
@@ -2662,7 +2943,7 @@ function saveSyncUrl(url){
 async function fetchQuickBooksAR(){
   if(!syncUrl) return;
   try{
-    const res = await fetch(`${syncUrl}?action=qbar`, { method: 'GET' });
+    const res = await fetch(withToken(`${syncUrl}?action=qbar`), { method: 'GET' });
     qbArData = await res.json();
   }catch(e){
     console.error('QuickBooks AR fetch failed', e);
@@ -2681,7 +2962,7 @@ async function fetchQuickBooksRevenue(force){
   if(qbRevenueData && !force) return; // already have it this session
   qbRevenueLoading = true;
   try{
-    const res = await fetch(`${syncUrl}?action=qbrevenue`, { method: 'GET' });
+    const res = await fetch(withToken(`${syncUrl}?action=qbrevenue`), { method: 'GET' });
     qbRevenueData = await res.json();
   }catch(e){
     console.error('QuickBooks revenue fetch failed', e);
@@ -2737,7 +3018,7 @@ function setUnsyncedLocalWork(v){
   }catch(e){ /* flag is best effort */ }
 }
 
-async function pullFromCloud(silent){
+async function pullFromCloud(silent, force){
   if(!syncUrl) return;
   // Never pull while a push is still in flight — the server may not have
   // the latest data yet, and pulling now would overwrite local changes
@@ -2747,17 +3028,24 @@ async function pullFromCloud(silent){
   // say. Pulling here is what silently destroyed an offline yard count: the
   // count wrote locally, every push failed, and the next successful pull
   // replaced owned counts and appSettings with the other device's copy.
-  if(hasUnsyncedLocalWork()){
+  // force = the user was asked outright and chose the cloud copy. Turning
+  // that into a push - which is what happened before - does the exact
+  // opposite of what they clicked, and uploads the stale data they were
+  // trying to get rid of.
+  if(hasUnsyncedLocalWork() && !force){
     console.warn('Skipping pull - local changes have not reached the cloud yet.');
     await pushToCloud();
     return;
   }
+  if(force) setUnsyncedLocalWork(false);
   if(!silent) syncStatus = 'loading';
   render();
   try{
-    const res = await fetch(syncUrl, { method: 'GET' });
+    const res = await fetch(withToken(syncUrl), { method: 'GET' });
     if(!res.ok) throw new Error('Bad response');
     const data = await res.json();
+    if(data && data.error === 'unauthorized'){ showSyncTokenWarning(); throw new Error('unauthorized'); }
+    noteServerProtocol(data.protocol);
     if(Array.isArray(data.tickets)){
       // Photos and hand-drawn signatures made ON THIS DEVICE are never sent
       // to the cloud as part of the main ticket blob (see pushToCloud) -
@@ -2837,6 +3125,9 @@ async function pullFromCloud(silent){
     localStorage.setItem(CUSTOMER_CATALOG_KEY, JSON.stringify(customerCatalog));
     localStorage.setItem(TEMPLATE_KEY, JSON.stringify(templateCatalog));
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(appSettings));
+    // Adopted AFTER everything above has been written, so a failure part way
+    // through doesn't leave this device claiming stamps for data it hasn't got.
+    adoptStoreStamps(data.stamps);
     syncStatus = 'ok';
     await reconcileYardFromTickets();
   }catch(e){
@@ -2868,7 +3159,7 @@ async function pushToCloud(){
     const res = await fetch(syncUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({ tickets: ticketsForCloud, deletes: deletesToSend, catalog: equipmentCatalog, equipmentOwned: equipmentOwned, colorCatalog: colorCatalog, rigCatalog: rigCatalog, archivedRigs: archivedRigs, customerCatalog: customerCatalog, templateCatalog: templateCatalog, appSettings: appSettings, stamps: getStoreStamps() })
+      body: JSON.stringify({ token: syncToken, tickets: ticketsForCloud, deletes: deletesToSend, catalog: equipmentCatalog, equipmentOwned: equipmentOwned, colorCatalog: colorCatalog, rigCatalog: rigCatalog, archivedRigs: archivedRigs, customerCatalog: customerCatalog, templateCatalog: templateCatalog, appSettings: appSettings, stamps: getStoreStamps() })
     });
     // The response has to be checked. Previously this awaited the fetch and
     // then declared success regardless, so a server-side error showed a
@@ -2881,12 +3172,25 @@ async function pushToCloud(){
     // the exact push where something was discarded, disarming the guard that
     // stops the next pull from overwriting the local copy.
     let refused = [];
+    let discarded = [];
     try{
       const body = await res.json();
+      if(body && body.error === 'unauthorized'){ showSyncTokenWarning(); throw new Error('unauthorized'); }
       if(body && Array.isArray(body.rejected)) refused = body.rejected;
+      if(body && Array.isArray(body.staleTickets)) discarded = body.staleTickets;
+      if(body) adoptStoreStamps(body.stamps);
+      if(body) noteServerProtocol(body.protocol);
     }catch(e){ /* older backend returns no body worth reading */ }
 
-    if(deletesToSend.length) pendingDeletes = pendingDeletes.filter(id=>!deletesToSend.includes(id));
+    // Tickets the server threw away because it held a newer copy. This used
+    // to happen in silence, and the next pull then replaced the local copy -
+    // so the edit was gone from both sides with a green sync light.
+    if(discarded.length) showDiscardedTicketWarning(discarded);
+
+    if(deletesToSend.length){
+      pendingDeletes = pendingDeletes.filter(id=>!deletesToSend.includes(id));
+      savePendingDeletes();
+    }
 
     if(refused.length){
       // The other device holds newer data for these. Keep the flag set so a
@@ -3017,9 +3321,14 @@ async function connectToCloud(url){
   syncStatus = 'loading';
   render();
   try{
-    const res = await fetch(url, { method: 'GET' });
+    const res = await fetch(withToken(url), { method: 'GET' });
     if(!res.ok) throw new Error('Bad response');
     const data = await res.json();
+    if(data && data.error === 'unauthorized'){
+      syncStatus = 'error'; render();
+      alert('That web app answered, but refused the sync token.\n\nCheck the token matches the SYNC_TOKEN script property on the Apps Script side, then try again.');
+      return;
+    }
     const cloudTickets = Array.isArray(data.tickets) ? data.tickets : [];
     const cloudHasData = cloudTickets.length > 0;
     const localHasData = tickets.length > 0;
@@ -3034,13 +3343,13 @@ async function connectToCloud(url){
         `Click Cancel to UPLOAD this device's tickets instead (the shared sheet's data will be replaced).`
       );
       if(keepCloud){
-        await pullFromCloud();
+        await pullFromCloud(false, true);
       }else{
         await pushToCloud();
       }
     }else if(cloudHasData && !localHasData){
       // Nothing to lose locally - safe to pull the shared data down.
-      await pullFromCloud();
+      await pullFromCloud(false, true);
     }else{
       // Cloud is empty (or unreadable) - push whatever is on this device up,
       // even if that's also empty. Never overwrite local data with emptiness.
@@ -3200,6 +3509,16 @@ function renderSyncPanel(){
         <label>Web App URL</label>
         <input type="text" id="sync-url-input" placeholder="https://script.google.com/macros/s/.../exec" value="${escAttr(syncUrl)}">
       </div>
+      <div class="field" style="margin-bottom:10px;">
+        <label>Sync Token</label>
+        <input type="password" id="sync-token-input" placeholder="the SYNC_TOKEN from your Apps Script" value="${escAttr(syncToken)}" autocomplete="off">
+        <div style="font-size:11px; color:var(--ink-soft); margin-top:4px; line-height:1.5;">
+          The URL travels inside this page, so it can't be a secret. This token is what actually
+          protects your data, and it's stored on this device only &mdash; type it once here and once
+          on each other device. It never leaves in anything you publish or email.
+          ${syncToken ? '' : '<strong style="color:#B8691C;">Not set on this device yet.</strong>'}
+        </div>
+      </div>
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
         <button class="primary-btn" id="save-sync-url">Connect</button>
         <button class="ghost-btn" id="sync-now-btn" ${syncUrl?'':'disabled'}>Refresh Now</button>
@@ -3219,6 +3538,14 @@ function renderSyncPanel(){
         <input type="file" id="import-data-file" accept="application/json" style="display:none;">
       </div>
 
+      <h2 class="section-title">Well Charge Rules</h2>
+      <p style="font-size:13px; color:var(--ink-soft); margin-top:0;">
+        A starting amount to suggest when you add a well charge, per customer.
+        Leave the rig blank to cover every rig for that customer, or name one to add
+        an extra amount on top. Always editable on the ticket before you save.
+      </p>
+      ${renderChargeRules()}
+
       <h2 class="section-title">Overdue Alert</h2>
       <p style="font-size:13px; color:var(--ink-soft); margin-top:0;">
         Flag equipment as overdue once it's been out longer than this many days.
@@ -3230,6 +3557,28 @@ function renderSyncPanel(){
       </div>
     </div>
   `;
+}
+
+function renderChargeRules(){
+  const rules = chargeRules();
+  const head = `<div style="display:grid; grid-template-columns:1fr 1fr 82px 82px 1fr 30px; gap:8px; font-size:10px; text-transform:uppercase; letter-spacing:0.5px; color:var(--ink-soft); font-family:'IBM Plex Mono',monospace; padding-bottom:6px; border-bottom:2px solid var(--line);">
+      <div>Customer</div><div>Rig (optional)</div>
+      <div style="text-align:right;">Per day</div><div style="text-align:right;">Plus flat</div>
+      <div>Note on the charge</div><div></div>
+    </div>`;
+  const rows = rules.map((r,i)=>`
+    <div style="display:grid; grid-template-columns:1fr 1fr 82px 82px 1fr 30px; gap:8px; padding:7px 0; border-bottom:1px solid var(--line); align-items:center;">
+      <input type="text" data-rule-field="customer" data-rule-index="${i}" value="${escAttr(r.customer||'')}" placeholder="customer name">
+      <input type="text" data-rule-field="rig" data-rule-index="${i}" value="${escAttr(r.rig||'')}" placeholder="any rig">
+      <input type="number" step="0.01" min="0" data-rule-field="perDay" data-rule-index="${i}" value="${escAttr(r.perDay==null?'':r.perDay)}" style="text-align:right;">
+      <input type="number" step="0.01" min="0" data-rule-field="flatAdd" data-rule-index="${i}" value="${escAttr(r.flatAdd==null?'':r.flatAdd)}" style="text-align:right;">
+      <input type="text" data-rule-field="label" data-rule-index="${i}" value="${escAttr(r.label||'')}" placeholder="optional">
+      <button data-rule-remove="${i}" title="Remove this rule" style="background:none; border:none; padding:0; cursor:pointer; color:#B5432A; font-size:16px; font-family:inherit;">&times;</button>
+    </div>`).join('');
+  return `<div style="background:#fff; border:1.5px solid var(--line); border-radius:8px; padding:14px 16px;">
+    ${rules.length ? head + rows : '<p style="font-size:13px; color:var(--ink-soft); margin:0 0 10px 0;">No rules yet — adding a well charge will start blank and you type the amount.</p>'}
+    <button class="ghost-btn" id="add-charge-rule" style="font-size:12px; margin-top:12px;">+ Add Rule</button>
+  </div>`;
 }
 
 function renderGlobalSearchResults(){
@@ -3348,7 +3697,7 @@ function renderActionAlerts(){
         customer: t.customer || '—',
         pad: pad.name,
         billed, total,
-        message: `Last billed ${daysSince} days ago`,
+        message: `Last billed ${agoLabel(daysSince)}`,
         ticketId: t.id
       });
     }
@@ -3473,8 +3822,8 @@ function renderBillingStatus(){
           ${r.complete
             ? '<span style="font-size:11px; color:var(--green); font-family:\'IBM Plex Mono\',monospace;">PAD DONE</span>'
             : (r.daysSince !== null
-                ? `<span style="font-size:12px; color:${stale?'#B5432A':'var(--ink-soft)'}; font-family:'IBM Plex Mono',monospace;">${r.daysSince}d ago</span>`
-                : '<span style="font-size:11px; color:var(--ink-soft); font-family:\'IBM Plex Mono\',monospace;">NO BILLS</span>'
+                ? `<span style="font-size:12px; color:${stale?'#B5432A':'var(--ink-soft)'}; font-family:'IBM Plex Mono',monospace;">${escHtml(agoLabel(r.daysSince, {short:true}).toUpperCase())}</span>`
+                : '<span style="font-size:11px; color:var(--ink-soft); font-family:\'IBM Plex Mono\',monospace; white-space:nowrap;">NONE BILLED</span>'
               )
           }
         </div>
@@ -3762,6 +4111,7 @@ function renderTicketsList(){
     const isOut = !t.returnDate;
     const end = t.returnDate || todayStr();
     const days = daysBetween(t.deliveryDate, end);
+    const daysLabel = (days === null) ? '—' : `${days} day${days === 1 ? '' : 's'}`;
     const total = ticketTotal(t);
     const overdue = isTicketOverdue(t);
     const rows = t.equipment.map(e=>`
@@ -3781,7 +4131,7 @@ function renderTicketsList(){
           </div>
           <span class="status-pill ${overdue?'':(isOut?'status-out':'status-returned')}" ${overdue?'style="background:#FCEBEA; color:#B5432A;"':''}>${overdue?'Overdue':(isOut?'Out':'Returned')}</span>
         </div>
-        <div class="ticket-meta">${escHtml(t.customer||'—')} &nbsp;·&nbsp; Out: ${fmtDate(t.deliveryDate)} &nbsp;·&nbsp; ${isOut?('In: — ('+days+' days so far)'):('In: '+fmtDate(t.returnDate)+' ('+days+' days)')}</div>
+        <div class="ticket-meta">${escHtml(t.customer||'—')} &nbsp;·&nbsp; Out: ${fmtDate(t.deliveryDate)} &nbsp;·&nbsp; ${isOut?('In: — ('+daysLabel+' so far)'):('In: '+fmtDate(t.returnDate)+' ('+daysLabel+')')}</div>
         ${t.pdfUrl?`<div style="font-size:11px; color:#1E8A29; margin-bottom:6px;">Signed &middot; <a href="${escAttr(t.pdfUrl)}" target="_blank" rel="noopener" style="color:#2E5FA3; text-decoration:underline;">View signed PDF</a></div>`:''}
         <details class="equip-collapse">
           <summary style="cursor:pointer; font-family:'IBM Plex Mono',monospace; font-size:11px; text-transform:uppercase; letter-spacing:0.5px; color:var(--ink-soft); padding:6px 0; list-style:none; display:flex; align-items:center; gap:6px;">
@@ -3913,24 +4263,17 @@ function renderByRig(){
 
       padHtml += `<div style="background:#FCFAF3; border:1.5px solid var(--line); border-radius:6px; padding:12px; margin:8px 0;">`;
       padHtml += `<div style="display:flex; justify-content:space-between; align-items:center;">`;
-      padHtml += `<div style="font-weight:600; font-size:14px;">${escHtml(activePad.name)}</div>`;
+      padHtml += `<button data-edit-pad="${escAttr(primaryTicket.id)}" data-pad-index="${primaryTicket.pads.indexOf(activePad)}" title="Rename this pad or change its well count" style="background:none; border:none; padding:0; margin:0; cursor:pointer; font-weight:600; font-size:14px; font-family:inherit; color:inherit; text-align:left; text-decoration:underline dotted rgba(0,0,0,0.28); text-underline-offset:3px;">${escHtml(activePad.name)}</button>`;
       padHtml += `<span style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:${complete?'var(--green)':'var(--ink-soft)'};">${billed} of ${total} billed${complete?' ✓':''}</span>`;
       padHtml += `</div>`;
       padHtml += `<div style="background:var(--paper-2); border-radius:4px; height:6px; margin:6px 0;">`;
       padHtml += `<div style="background:${complete?'var(--green)':'var(--amber)'}; border-radius:4px; height:100%; width:${pct}%; transition:width 0.3s;"></div>`;
       padHtml += `</div>`;
       if(daysSince !== null){
-        padHtml += `<div style="font-size:11px; color:${staleWarning?'#B5432A':'var(--ink-soft)'};">${staleWarning?'⚠ ':''}Last billed ${daysSince} day${daysSince!==1?'s':''} ago</div>`;
+        padHtml += `<div style="font-size:11px; color:${staleWarning?'#B5432A':'var(--ink-soft)'};">${staleWarning?'⚠ ':''}Last billed ${escHtml(agoLabel(daysSince))}</div>`;
       }
       if(billed > 0){
-        padHtml += `<div style="margin-top:6px; font-size:12px; color:var(--ink-soft);">`;
-        activePad.billedWells.forEach((w, wi)=>{
-          padHtml += `<span style="display:inline-flex; align-items:center; gap:5px; background:var(--paper-2); border-radius:3px; padding:2px 4px 2px 6px; margin:2px 4px 2px 0;">`;
-          padHtml += `${fmtDate(w.date)}${w.label?' — '+escHtml(w.label):''}`;
-          padHtml += `<button data-unbill-well="${primaryTicket.id}" data-well-index="${wi}" title="Remove this billed well" style="background:none; border:none; padding:0 2px; margin:0; cursor:pointer; color:var(--ink-soft); font-size:13px; line-height:1; font-family:inherit;">&times;</button>`;
-          padHtml += `</span>`;
-        });
-        padHtml += `</div>`;
+        padHtml += renderBilledWellChips(primaryTicket.id, primaryTicket.pads.indexOf(activePad), activePad.billedWells);
       }
       padHtml += `<div style="display:flex; gap:8px; margin-top:10px; flex-wrap:wrap;">`;
       if(!complete){
@@ -3946,7 +4289,18 @@ function renderByRig(){
         padHtml += `<div style="font-size:11px; color:var(--ink-soft); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:4px;">Pad History</div>`;
         completedPads.forEach(p=>{
           const b = Array.isArray(p.billedWells) ? p.billedWells.length : 0;
-          padHtml += `<div style="font-size:12px; color:var(--ink-soft); padding:3px 0;">${escHtml(p.name)} — ${b} of ${p.totalWells} wells — ${fmtDate(p.startDate)} to ${fmtDate(p.completedDate||'')}</div>`;
+          const pi = primaryTicket.pads.indexOf(p);
+          // Finished pads used to be a summary line and nothing else, so a
+          // well misspelled on a pad that had moved on could not be corrected
+          // at all - which is exactly where the misspellings end up.
+          if(b > 0){
+            padHtml += `<details style="padding:2px 0;"><summary style="cursor:pointer; font-size:12px; color:var(--ink-soft); list-style:none;">▸ ${escHtml(p.name)} — ${b} of ${p.totalWells} wells — ${fmtDate(p.startDate)} to ${fmtDate(p.completedDate||'')}</summary>`;
+            padHtml += renderBilledWellChips(primaryTicket.id, pi, p.billedWells, {small:true});
+            padHtml += `<button data-edit-pad="${escAttr(primaryTicket.id)}" data-pad-index="${pi}" style="background:none; border:none; padding:0; margin:2px 0 4px 0; cursor:pointer; font-size:11px; color:#2E7D32; text-decoration:underline; font-family:inherit;">edit pad name</button>`;
+            padHtml += `</details>`;
+          } else {
+            padHtml += `<div style="font-size:12px; color:var(--ink-soft); padding:3px 0;">${escHtml(p.name)} — ${b} of ${p.totalWells} wells — ${fmtDate(p.startDate)} to ${fmtDate(p.completedDate||'')}</div>`;
+          }
         });
         padHtml += `</div>`;
       }
@@ -3960,6 +4314,7 @@ function renderByRig(){
 
     const ticketBlocks = rigTickets.map(t=>{
       const days = daysBetween(t.deliveryDate, todayStr());
+      const daysLabel = (days === null) ? '—' : String(days);
       const overdue = isTicketOverdue(t);
       const equipLines = t.equipment.map(e=>`
         <div class="rig-equip-row">
@@ -3973,7 +4328,7 @@ function renderByRig(){
         <div class="rig-ticket-block" ${overdue?'style="border-left:3px solid #B5432A;"':''}>
           <label class="rig-ticket-header">
             <span class="ticket-num" style="margin-left:0;">#${escHtml(t.ticketNumber||'—')}</span>
-            <span class="rig-equip-meta" style="margin-left:8px;">${escHtml(t.customer||'—')} · Out ${days} days</span>
+            <span class="rig-equip-meta" style="margin-left:8px;">${escHtml(t.customer||'—')} · ${days === null ? 'Out —' : ('Out '+days+' day'+(days===1?'':'s'))}</span>
             ${overdue?`<span class="status-pill" style="background:#FCEBEA; color:#B5432A; margin-left:auto;">Overdue</span>`:''}
           </label>
           <details class="equip-collapse">
@@ -4011,6 +4366,61 @@ function renderByRig(){
    not on a ticket. Some of it may be in the queue for rebuild or paint,
    which this view has no way of knowing unless a count recorded it.
 */
+/* ── THE COMPOSITION BAR ────────────────────────────────────────────
+   This used to be a single fill reading out ÷ owned - "how much of
+   this is on a rig". Which meant that the moment everything came
+   home, every bar on the page read empty. Right after a yard count,
+   when the numbers matter most, the whole column looked broken.
+
+   It now shows the whole fleet split into where the iron actually is,
+   in lifecycle order: ready at the yard -> out on a rig -> in the shop
+   -> back to ready. Anything left is iron that's home but in no bucket,
+   which stays as bare track and is named in the line underneath.
+
+   Colours are the app's own, but the ORDER is chosen so no two
+   adjacent segments collide under colour blindness - green beside
+   amber is the one pairing to avoid, so blue sits between them.
+   Verified with the palette validator: adjacent worst case dE 19.4
+   (deutan), 22.0 normal vision. Each segment is also named in text
+   below the bar, so identity is never carried by colour alone. */
+const YARD_COLORS = { ready:'#1E8A29', out:'#3A6EA5', shop:'#B8691C' };
+
+function inventoryBar(r, unaccounted){
+  // No owned figure, or a fleet of none. An always-empty track reads as
+  // a broken chart, so draw nothing and say why in words instead.
+  if(r.owned === null) return '';
+  if(!(r.owned > 0)) return `<div style="font-size:11px; color:var(--ink-soft); margin-top:6px;">none owned</div>`;
+
+  const total = r.owned;
+  const present = [
+    { qty: r.ready, color: YARD_COLORS.ready },
+    { qty: r.out,   color: YARD_COLORS.out },
+    { qty: r.shop,  color: YARD_COLORS.shop }
+  ].filter(x=>x.qty > 0);
+
+  const segs = present.map((x, i)=>{
+    const pct = Math.min(100, (x.qty/total)*100);
+    // 2px of surface between fills, taken out of the segment's own width
+    // (border-box) rather than added to it, so the bar still reads as a
+    // true proportion. Without a gap, neighbouring segments merge into one
+    // smear and the split stops being legible at 6px tall.
+    const gap = (i < present.length - 1) ? 'border-right:2px solid var(--paper-2); box-sizing:border-box;' : '';
+    return `<div style="width:${pct}%; background:${x.color}; ${gap}"></div>`;
+  }).join('');
+
+  return `<div style="display:flex; background:var(--paper-2); border-radius:3px; height:6px; overflow:hidden; margin-top:7px;">${segs}</div>`;
+}
+
+function yardLegend(){
+  const chip = (color, label)=>`<span style="display:inline-flex; align-items:center; gap:5px;">
+    <span style="width:9px; height:9px; border-radius:2px; background:${color}; flex-shrink:0;"></span>${label}</span>`;
+  return `<div style="display:flex; gap:14px; flex-wrap:wrap; font-size:11px; color:var(--ink-soft); margin:10px 0 2px 0;">
+    ${chip(YARD_COLORS.ready,'Ready at the yard')}${chip(YARD_COLORS.out,'Out on a rig')}${chip(YARD_COLORS.shop,'In the shop')}
+    <span style="display:inline-flex; align-items:center; gap:5px;">
+      <span style="width:9px; height:9px; border-radius:2px; background:var(--paper-2); border:1px solid var(--line); flex-shrink:0;"></span>Home but not counted into a bucket</span>
+  </div>`;
+}
+
 function renderFullInventory(){
   const out = outQtyByName();
   const names = new Set();
@@ -4038,16 +4448,26 @@ function renderFullInventory(){
   }
 
   if(rows.length === 0){
+    // Two different situations, and they used to give the same answer -
+    // filtering to a term that matches nothing told you to go add equipment.
     return `<h2 class="section-title">Full Inventory</h2>
-      <p style="font-size:13px; color:var(--ink-soft);">Nothing to show yet. Add equipment to the catalog, or use Fill From Tickets.</p>`;
+      <p style="font-size:13px; color:var(--ink-soft);">${inventorySearchTerm
+        ? `No equipment matches &ldquo;${escHtml(inventorySearchTerm)}&rdquo;.`
+        : 'Nothing to show yet. Add equipment to the catalog, or use Fill From Tickets.'}</p>`;
   }
 
   const withCount = rows.filter(r=>r.owned !== null);
   const totalOwned = withCount.reduce((s,r)=>s+r.owned, 0);
-  const totalOut = rows.reduce((s,r)=>s+r.out, 0);
+  // All three cards, and the percentage, count the SAME items - the ones
+  // with an owned figure. Out used to be summed across everything, so a
+  // never-counted item sitting on a ticket made the cards contradict each
+  // other (Owned 10 · Out 8 · On Hand 7) and could push the footer past
+  // 100% out. What that item contributes is now said separately instead.
+  const totalOut = withCount.reduce((s,r)=>s+r.out, 0);
   const totalOnHand = withCount.reduce((s,r)=>s+r.onHand, 0);
+  const uncountedOut = rows.filter(r=>r.owned === null).reduce((s,r)=>s+r.out, 0);
   const noCount = rows.filter(r=>r.owned === null).length;
-  const utilisation = totalOwned > 0 ? Math.round((totalOut/totalOwned)*100) : 0;
+  const utilisation = totalOwned > 0 ? Math.min(100, Math.round((totalOut/totalOwned)*100)) : 0;
   const totalReady = rows.reduce((s,r)=>s+r.ready, 0);
   const totalShop = rows.reduce((s,r)=>s+r.shop, 0);
 
@@ -4055,7 +4475,6 @@ function renderFullInventory(){
     const unknown = r.owned === null;
     // A bar reading how much of this item is out, so a glance down the
     // column shows what's working and what's sitting.
-    const pct = (!unknown && r.owned > 0) ? Math.min(100, Math.round((r.out/r.owned)*100)) : 0;
     const allOut = !unknown && r.onHand <= 0 && r.owned > 0;
     // Whatever is home but hasn't been placed in either yard bucket - iron
     // that was never counted, or came back before the shop queue existed.
@@ -4075,12 +4494,11 @@ function renderFullInventory(){
           ${unknown?'not set':r.onHand}
         </div>
       </div>
-      ${unknown?'':`<div style="background:var(--paper-2); border-radius:3px; height:5px; overflow:hidden; margin-top:7px;">
-        <div style="height:100%; width:${pct}%; background:${allOut?'#B5432A':'#33D63A'}; min-width:${r.out>0?'2px':'0'};"></div>
-      </div>`}
+      ${inventoryBar(r, unaccounted)}
       ${(r.ready>0 || r.shop>0) ? `<div style="display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:7px; flex-wrap:wrap;">
         <div style="font-size:11px; color:var(--ink-soft);">
           <span style="color:#1E8A29; font-weight:600;">${r.ready} ready</span>
+          ${r.out>0?` &middot; <span style="color:#3A6EA5; font-weight:600;">${r.out} out</span>`:''}
           &middot; <span style="color:${r.shop>0?'#B8691C':'var(--ink-soft)'};">${r.shop} in shop</span>
           ${unaccounted ? ` &middot; <span style="color:#B8691C;">${unaccounted} unaccounted</span>` : ''}
           ${overplaced ? ` &middot; <span style="color:#B5432A;">${overplaced} more marked ready than are home</span>` : ''}
@@ -4108,11 +4526,12 @@ function renderFullInventory(){
         <div style="text-align:center;">Out</div>
         <div style="text-align:center;">On Hand</div>
       </div>
+      ${yardLegend()}
       ${body}
       <div style="font-size:11px; color:var(--ink-soft); margin-top:12px; line-height:1.5;">
-        ${totalOwned>0?`${utilisation}% of your iron is out on tickets right now. `:''}On Hand means not on a ticket — some of it may still be in the queue for rebuild or paint.
+        ${totalOwned>0?`${utilisation}% of your iron is out on tickets right now. The bar under each item splits that item's whole fleet by where it is. `:''}On Hand means not on a ticket — some of it may still be in the queue for rebuild or paint.
         ${(totalReady>0||totalShop>0)?`<br>Returned iron goes into <strong>In Shop</strong> on its own. When the yard says a piece is through paint, tap <strong>Ready &#9656;</strong>.`:''}
-        ${noCount>0?`<br><strong style="color:#B8691C;">${noCount} item${noCount!==1?'s have':' has'} no owned count yet</strong> — count the yard, or use Fill From Tickets for a rough floor.`:''}
+        ${noCount>0?`<br><strong style="color:#B8691C;">${noCount} item${noCount!==1?'s have':' has'} no count on file</strong>${uncountedOut>0?` (${uncountedOut} unit${uncountedOut!==1?'s':''} of ${noCount!==1?'them':'it'} out on tickets, not counted in the totals above)`:''} — count the yard, or use Fill From Tickets for a rough floor.`:''}
       </div>
     </div>
   `;
@@ -4160,9 +4579,12 @@ function renderInventory(){
     names = names.filter(n=>n.toLowerCase().includes(s));
   }
 
+  // Both cards read the FILTERED set. Units was filtered and Types wasn't,
+  // so typing in the search box gave you "9 Equipment Types Out · 4 Total
+  // Units Out" - two numbers describing different populations, side by side.
   const totalUnitsOut = names.reduce((sum,n)=>sum+byName[n].totalQty, 0);
-  const distinctTypesOut = Object.keys(byName).length;
-  const overCapacityCount = Object.keys(byName).filter(n=>{
+  const distinctTypesOut = names.length;
+  const overCapacityCount = names.filter(n=>{
     const owned = equipmentOwned[n];
     return owned != null && owned > 0 && byName[n].totalQty > owned;
   }).length;
@@ -4175,12 +4597,26 @@ function renderInventory(){
     const hasOwned = owned != null && owned > 0;
     const pct = hasOwned ? Math.min(100, Math.round((info.totalQty/owned)*100)) : 0;
     const overCapacity = hasOwned && info.totalQty > owned;
+    const spare = hasOwned ? (owned - info.totalQty) : null;
+    // The bar used to change colour at 80% out - green below, amber above -
+    // with nothing on screen saying so, so it looked like it was making the
+    // rule up. Worse, green and amber mean something ELSE in the composition
+    // bars further down this same tab (ready / in shop). One colour, two
+    // meanings, one screen.
+    //
+    // Now the fill is the same blue that means "out on a rig" everywhere
+    // else, and "running low" is said in words, where it can be read.
+    const spareLabel = (spare === null) ? ''
+      : (spare < 0) ? ` · ${Math.abs(spare)} over capacity`
+      : (spare === 0) ? ' · no spare'
+      : ` · ${spare} spare`;
     const utilizationLabel = hasOwned
-      ? `${info.totalQty} of ${owned} out${overCapacity?' (over capacity!)':''}`
+      ? `${info.totalQty} of ${owned} out${spareLabel}`
       : `${info.totalQty} unit${info.totalQty!==1?'s':''} out`;
-    const barColor = overCapacity ? '#B5432A' : (pct >= 80 ? '#D9822B' : '#33D63A');
+    const barColor = overCapacity ? '#B5432A' : YARD_COLORS.out;
     const rows = info.lines.map(line=>{
       const days = daysBetween(line.deliveryDate, todayStr());
+      const daysLabel = (days === null) ? '—' : `${days} day${days === 1 ? '' : 's'}`;
       return `
         <div class="rig-equip-row">
           <div>
@@ -4188,14 +4624,14 @@ function renderInventory(){
             <div class="rig-equip-meta">Ticket #${escHtml(line.ticketNumber||'—')} · ${escHtml(line.customer||'—')}${line.bandColor?` · ${colorSwatch(line.bandColor)}${escHtml(line.bandColor)} band`:''}</div>
           </div>
           <div style="text-align:right;">
-            <div class="rig-equip-meta">${days} days out</div>
+            <div class="rig-equip-meta">${daysLabel} out</div>
           </div>
         </div>
       `;
     }).join('');
     return `<div class="rig-group">
       <h3><span>${escHtml(name)}</span><span>${utilizationLabel}</span></h3>
-      ${hasOwned?`<div style="height:5px; background:#E8EDE8;"><div style="height:100%; width:${pct}%; background:${barColor};"></div></div>`:''}
+      ${hasOwned?`<div style="height:6px; background:#E8EDE8; margin-top:3px; border-radius:3px; overflow:hidden;"><div style="height:100%; width:${pct}%; background:${barColor};"></div></div>`:''}
       ${rows}
     </div>`;
   }).join('');
@@ -4330,7 +4766,7 @@ function isPassThroughCustomer(name){
 // even when the description carries nothing else useful.
 /* ── RIG NAME CONSOLIDATION ────────────────────────────────────────
    Invoices are typed by hand, and not always the same way twice - the
-   same rig turns up as "Cactus 407", "CACTUS-407" and "Cactus Rig 407".
+   same rig turns up as "Acme 407", "ACME-407" and "Acme Rig 407".
    Grouping on the literal text split one rig into three rows.
 
    Every variant is resolved back to the spelling in the rig list, so
@@ -4339,7 +4775,7 @@ function isPassThroughCustomer(name){
    Rig names are almost always a contractor plus a number, which gives a
    reliable test: the numbers have to match, and if both names carry a
    distinguishing word that has to match too. So "Cactus Rig 407"
-   consolidates with "Cactus 407", a bare "407" consolidates with it as
+   consolidates with "Acme 407", a bare "407" consolidates with it as
    well, but "Patterson 407" stays separate - same number, different
    contractor, genuinely a different rig.
 */
@@ -4799,6 +5235,32 @@ function billingCheckStartDate(){
   return d > revStart ? d : revStart; // never reach back further than the data
 }
 
+/* ── WELL CHARGE RULES ─────────────────────────────────────────────
+   A per-customer day rate, optionally with an extra flat amount when a
+   particular rig is on the ticket. Kept in appSettings so the numbers ride
+   the private Sheet sync instead of living in a file that gets published.
+
+   A rule with a rig named beats one without, so "Firebird, any rig" and
+   "that customer on one named rig" can both exist, and the specific wins.
+*/
+function chargeRules(){
+  const r = appSettings.chargeRules;
+  return Array.isArray(r) ? r : [];
+}
+
+function matchChargeRule(customer, rig){
+  const c = String(customer||'').trim().toLowerCase();
+  const g = String(rig||'').trim().toLowerCase();
+  if(!c) return null;
+  const forCustomer = chargeRules().filter(r=>String(r.customer||'').trim().toLowerCase() === c);
+  if(!forCustomer.length) return null;
+  const withRig = forCustomer.find(r=>{
+    const rr = String(r.rig||'').trim().toLowerCase();
+    return rr && rr === g;
+  });
+  return withRig || forCustomer.find(r=>!String(r.rig||'').trim()) || null;
+}
+
 function billingCheckGraceDays(){
   const v = Number(appSettings.billingCheckGraceDays);
   return (v > 0) ? v : 7;
@@ -4813,18 +5275,37 @@ function isPerWellInvoice(inv){
 function buildBillingCheck(){
   const startDate = billingCheckStartDate();
   const invoices = (qbRevenueData && Array.isArray(qbRevenueData.invoices)) ? qbRevenueData.invoices : [];
-  // Both sides are cut off at the same date, or old invoices would look
-  // unmarked while the wells they belong to had been filtered away.
-  const perWell = invoices.filter(inv=>isPerWellInvoice(inv) && (!inv.date || inv.date >= startDate));
+  // The MATCHING pool is every per-well invoice, regardless of date.
+  //
+  // Cutting the invoices off at the same date as the wells produced false
+  // "no invoice" alarms: invoicing happens FIRST and the well is marked in
+  // the tracker afterwards, up to a week later. An invoice raised on 28 July
+  // for a well marked on 3 August sat outside a 1 August cutoff, its well was
+  // inside, and the well was reported unbilled when it had been invoiced.
+  //
+  // The cutoff still applies to which wells get checked and to the
+  // unmarked-invoice list below - just not to what a well may match against.
+  const perWell = invoices.filter(isPerWellInvoice);
 
-  // Every well marked billed in the tracker this year.
+  // EVERY well marked billed, regardless of date - the cutoff decides what
+  // gets REPORTED, not what may match.
+  //
+  // This is the mirror of the invoice-side bug: a well marked on 30 July
+  // against an invoice raised on 15 August sat outside a 1 August cutoff,
+  // so the well was dropped from the pool entirely and its invoice was
+  // reported as "in QuickBooks but not in the tracker" when it had been
+  // marked all along. Silverzone wells get marked when the operations guy
+  // gives a verbal status, which can easily precede the invoice.
   const marked = [];
   (tickets||[]).forEach(t=>{
     if(!Array.isArray(t.pads)) return;
     t.pads.forEach(pad=>{
       (Array.isArray(pad.billedWells)?pad.billedWells:[]).forEach(w=>{
-        if(!w || !w.date || w.date < startDate) return;
+        if(!w || !w.date) return;
         marked.push({
+          // Only wells from the cutoff forward are reported as missing;
+          // earlier ones may still match, so an invoice isn't left orphaned.
+          inRange: w.date >= startDate,
           ticketId: t.id,
           padId: pad.id || pad.name || '',
           // Every rig this ticket has been associated with. An invoice raised
@@ -4854,14 +5335,48 @@ function buildBillingCheck(){
   const rigChanged = [];   // matched by well, but invoiced under another rig
   const matchedByCount = []; // reconciled by count when the names disagreed
 
-  const wellsAgree = (a, b)=>{
+  // Words that appear in half the well names in the basin. They carry no
+  // identity, so they can't be the evidence two names are the same well.
+  const WELL_FILLER = ['unit','well','lease','pad','the','and','fee','state','tract','sec','section','com'];
+  const wellNums  = (s)=> (String(s||'').match(/\d+/g) || []);
+  const wellWords = (s)=> (String(s||'').toLowerCase().match(/[a-z]+/g) || [])
+                            .filter(w=>w.length >= 3 && WELL_FILLER.indexOf(w) === -1);
+  // One character out - "Neil" against "Neal". Anything looser starts
+  // pairing wells that only rhyme.
+  const nearWord = (a, b)=>{
+    if(a === b) return true;
+    if(a.length < 4 || b.length < 4) return false;
+    if(Math.abs(a.length - b.length) > 1) return false;
+    let i = 0, j = 0, edits = 0;
+    while(i < a.length && j < b.length){
+      if(a[i] === b[j]){ i++; j++; continue; }
+      if(++edits > 1) return false;
+      if(a.length > b.length) i++;
+      else if(b.length > a.length) j++;
+      else { i++; j++; }
+    }
+    return true;
+  };
+  const wellsAgree = (rawA, rawB)=>{
+    const a = normalizeTight(rawA), b = normalizeTight(rawB);
     if(!a || !b) return false;
     if(a === b) return true;
     // A short label is not evidence. "3" would otherwise match "neal5103h",
     // and match whichever invoice happened to come first.
     const shorter = a.length <= b.length ? a : b;
     if(shorter.length < 4) return false;
-    return a.indexOf(b) !== -1 || b.indexOf(a) !== -1;
+    if(a.indexOf(b) !== -1 || b.indexOf(a) !== -1) return true;
+    // Last resort: the same numbers, plus a name word that all but agrees.
+    // A well name is typed here and typed again on the invoice, so the words
+    // drift and reorder - "Suntura Unit ( Lower Clear Fork) 520" against
+    // "Suntura (Lower Clear Fork) Unit 520". The numbers are what actually
+    // identify the well; the words only have to rule out a different lease.
+    const na = wellNums(rawA), nb = wellNums(rawB);
+    if(!na.length || na.length !== nb.length) return false;
+    if(na.slice().sort().join('|') !== nb.slice().sort().join('|')) return false;
+    const wa = wellWords(rawA), wb = wellWords(rawB);
+    if(!wa.length || !wb.length) return false;
+    return wa.some(x=>wb.some(y=>nearWord(x, y)));
   };
   const rigsAgree = (a, b)=>{
     if(!a || !b) return true; // one side silent - the well name carries it
@@ -4878,12 +5393,11 @@ function buildBillingCheck(){
 
   marked.forEach(m=>{
     const mRig = normalizeTight(m.rig);
-    const mWell = normalizeTight(m.label);
 
     // Rig and well both agree. Preferred, and precise.
     let idx = perWell.findIndex((inv,i)=>{
       if(usedInvoices.has(i)) return false;
-      if(!wellsAgree(mWell, normalizeTight(inv.wellName))) return false;
+      if(!wellsAgree(m.label, inv.wellName)) return false;
       return rigsAgree(mRig, normalizeTight(inv.rig));
     });
 
@@ -4893,7 +5407,7 @@ function buildBillingCheck(){
     if(idx === -1){
       idx = perWell.findIndex((inv,i)=>{
         if(usedInvoices.has(i)) return false;
-        return wellsAgree(mWell, normalizeTight(inv.wellName));
+        return wellsAgree(m.label, inv.wellName);
       });
       if(idx !== -1) viaWellOnly = true;
     }
@@ -4935,11 +5449,24 @@ function buildBillingCheck(){
       .concat(discoveredRigs[key] || [])
       .filter(Boolean);
 
+    // Count matching is weaker evidence than a name match, so it gets a
+    // window. Without one, an open pool let a well marked last week pair
+    // with an unrelated invoice from March, purely because it was on the
+    // same rig and happened to be spare - which stopped a genuinely
+    // unbilled well from being flagged at all.
+    const wellDate = group[0].date || '';
+    const withinWindow = (invDate)=>{
+      if(!invDate || !wellDate) return true;
+      const days = (new Date(wellDate) - new Date(invDate)) / 86400000;
+      return days >= -14 && days <= 90;   // up to 90 days before, 14 after
+    };
+
     const spare = [];
     perWell.forEach((inv,i)=>{
       if(usedInvoices.has(i)) return;
       const iRig = normalizeTight(inv.rig);
       if(!iRig) return;
+      if(!withinWindow(inv.date)) return;
       const onLineage = lineage.some(r=>{
         const lr = normalizeTight(r);
         return lr && (lr === iRig || lr.indexOf(iRig) !== -1 || iRig.indexOf(lr) !== -1 || sameRigName(r, inv.rig));
@@ -4960,15 +5487,18 @@ function buildBillingCheck(){
 
   // Only now decide what's a problem and what's simply recent.
   leftover.forEach(m=>{
+    if(!m.inRange) return;   // before the cutoff: settled, not our business
     if(m.date > graceCutoff) tooRecent.push(m);
     else missing.push(m);
   });
 
   // Invoices with no matching marked well - usually just the tracker
   // lagging behind, which is the harmless direction.
-  const unmarked = perWell.filter((inv,i)=>!usedInvoices.has(i));
+  // Only invoices from the cutoff forward are worth reporting as unmarked -
+  // anything earlier is settled work we've been told not to re-examine.
+  const unmarked = perWell.filter((inv,i)=>!usedInvoices.has(i) && (!inv.date || inv.date >= startDate));
 
-  return { missing, tooRecent, unmarked, rigChanged, matchedByCount, perWellCount: perWell.length, markedCount: marked.length, grace: billingCheckGraceDays(), startDate: startDate, isScoped: !!appSettings.billingCheckStartDate };
+  return { missing, tooRecent, unmarked, rigChanged, matchedByCount, perWellCount: perWell.length, markedCount: marked.filter(m=>m.inRange).length, grace: billingCheckGraceDays(), startDate: startDate, isScoped: !!appSettings.billingCheckStartDate };
 }
 
 function renderBillingCheckFooter(c){
@@ -5088,7 +5618,9 @@ function renderReports(){
     if(!Array.isArray(t.pads)) return;
     t.pads.forEach(pad=>{
       const billed = Array.isArray(pad.billedWells) ? pad.billedWells : [];
-      const padDays = pad.completedDate && pad.startDate ? daysBetween(pad.startDate, pad.completedDate) : (pad.startDate ? daysBetween(pad.startDate, todayStr()) : 0);
+      const padDays = (pad.completedDate && pad.startDate ? daysBetween(pad.startDate, pad.completedDate)
+                     : pad.startDate ? daysBetween(pad.startDate, todayStr())
+                     : 0) || 0;
       
       allPads.push({
         customer: t.customer || 'Unknown',
@@ -5185,7 +5717,7 @@ function renderReports(){
   let custTableRows = '';
   custEntries.forEach(([name, stats])=>{
     const avgDays = stats.completedPads > 0 ? Math.round(stats.totalDays / stats.completedPads) : '—';
-    custTableRows += `<div style="display:grid; grid-template-columns:1fr 60px 60px 70px 70px; gap:8px; padding:10px 0; border-bottom:1px solid #E8EDE8; font-size:13px; align-items:center;">
+    custTableRows += `<div class="rpt" style="display:grid; grid-template-columns:1fr 60px 60px 70px 70px; gap:8px; padding:10px 0; border-bottom:1px solid #E8EDE8; font-size:13px; align-items:center;">
       <div style="font-weight:600;">${escHtml(name)}</div>
       <div style="text-align:center;">${stats.activeRigs.size}</div>
       <div style="text-align:center;">${stats.wells}</div>
@@ -5199,7 +5731,7 @@ function renderReports(){
   let rigTableRows = '';
   rigEntries.forEach(([name, stats])=>{
     const avgDays = stats.completedPads > 0 ? Math.round(stats.totalDays / stats.completedPads) : '—';
-    rigTableRows += `<div style="display:grid; grid-template-columns:1fr 1fr 60px 60px 70px; gap:8px; padding:10px 0; border-bottom:1px solid #E8EDE8; font-size:13px; align-items:center;">
+    rigTableRows += `<div class="rpt" style="display:grid; grid-template-columns:1fr 1fr 60px 60px 70px; gap:8px; padding:10px 0; border-bottom:1px solid #E8EDE8; font-size:13px; align-items:center;">
       <div style="font-weight:600;">${escHtml(name)}</div>
       <div style="color:#5B6660;">${escHtml(stats.customer)}</div>
       <div style="text-align:center;">${stats.wells}</div>
@@ -5221,7 +5753,7 @@ function renderReports(){
     const statusBadge = isComplete 
       ? `<span style="background:#D4EDDA; color:#155724; font-size:11px; padding:2px 8px; border-radius:4px;">Complete</span>`
       : `<span style="background:#FFF3CD; color:#856404; font-size:11px; padding:2px 8px; border-radius:4px;">Active</span>`;
-    padHistoryRows += `<div style="display:grid; grid-template-columns:1fr 1fr 1fr 60px 60px 50px; gap:8px; padding:10px 0; border-bottom:1px solid #E8EDE8; font-size:13px; align-items:center;">
+    padHistoryRows += `<div class="rpt" style="display:grid; grid-template-columns:1fr 1fr 1fr 60px 60px 50px; gap:8px; padding:10px 0; border-bottom:1px solid #E8EDE8; font-size:13px; align-items:center;">
       <div style="font-weight:600;">${escHtml(p.customer)}</div>
       <div>${escHtml(p.rig)}</div>
       <div>${escHtml(p.name)}</div>
@@ -5250,8 +5782,8 @@ function renderReports(){
     </div>
 
     <h2 class="section-title" style="margin-top:24px;">Customer Breakdown</h2>
-    <div style="background:#fff; border:1.5px solid #E8EDE8; border-radius:8px; padding:16px;">
-      <div style="display:grid; grid-template-columns:1fr 60px 60px 70px 70px; gap:8px; padding:0 0 8px 0; border-bottom:2px solid #14181A; font-size:11px; color:#5B6660; text-transform:uppercase; letter-spacing:0.5px;">
+    <div class="rpt-card" style="background:#fff; border:1.5px solid #E8EDE8; border-radius:8px; padding:16px;">
+      <div class="rpt" style="display:grid; grid-template-columns:1fr 60px 60px 70px 70px; gap:8px; padding:0 0 8px 0; border-bottom:2px solid #14181A; font-size:11px; color:#5B6660; text-transform:uppercase; letter-spacing:0.5px;">
         <div>Customer</div>
         <div style="text-align:center;">Rigs</div>
         <div style="text-align:center;">Wells</div>
@@ -5262,8 +5794,8 @@ function renderReports(){
     </div>
 
     <h2 class="section-title" style="margin-top:24px;">Rig Efficiency</h2>
-    <div style="background:#fff; border:1.5px solid #E8EDE8; border-radius:8px; padding:16px;">
-      <div style="display:grid; grid-template-columns:1fr 1fr 60px 60px 70px; gap:8px; padding:0 0 8px 0; border-bottom:2px solid #14181A; font-size:11px; color:#5B6660; text-transform:uppercase; letter-spacing:0.5px;">
+    <div class="rpt-card" style="background:#fff; border:1.5px solid #E8EDE8; border-radius:8px; padding:16px;">
+      <div class="rpt" style="display:grid; grid-template-columns:1fr 1fr 60px 60px 70px; gap:8px; padding:0 0 8px 0; border-bottom:2px solid #14181A; font-size:11px; color:#5B6660; text-transform:uppercase; letter-spacing:0.5px;">
         <div>Rig</div>
         <div>Customer</div>
         <div style="text-align:center;">Wells</div>
@@ -5277,8 +5809,8 @@ function renderReports(){
       <span>Pad History</span>
       <button id="toggle-pad-history" style="background:none; border:none; padding:0; color:#2E7D32; font-size:12px; text-transform:none; letter-spacing:0; text-decoration:underline; cursor:pointer; font-family:inherit;">${showPadHistory?'hide':`show ${sortedPads.length} pad${sortedPads.length!==1?'s':''}`}</button>
     </h2>
-    ${showPadHistory ? `<div style="background:#fff; border:1.5px solid #E8EDE8; border-radius:8px; padding:16px;">
-      <div style="display:grid; grid-template-columns:1fr 1fr 1fr 60px 60px 50px; gap:8px; padding:0 0 8px 0; border-bottom:2px solid #14181A; font-size:11px; color:#5B6660; text-transform:uppercase; letter-spacing:0.5px;">
+    ${showPadHistory ? `<div class="rpt-card" style="background:#fff; border:1.5px solid #E8EDE8; border-radius:8px; padding:16px;">
+      <div class="rpt" style="display:grid; grid-template-columns:1fr 1fr 1fr 60px 60px 50px; gap:8px; padding:0 0 8px 0; border-bottom:2px solid #14181A; font-size:11px; color:#5B6660; text-transform:uppercase; letter-spacing:0.5px;">
         <div>Customer</div>
         <div>Rig</div>
         <div>Pad</div>
@@ -5475,6 +6007,32 @@ function setupSignaturePad(canvasId, fieldName){
   canvas.onpointercancel = endStroke;
 }
 
+// Billed-well chips. The name is a button because well names get typed in a
+// hurry and then typed AGAIN on the invoice - "Neil 5101H" here against
+// "Neal 5101H" in QuickBooks. Correcting one used to mean removing the well
+// and re-adding it, which lost its billed date, so it mostly didn't happen.
+// Pads are addressed by INDEX, not id: pads created before ids existed
+// don't have one, and index is stable for as long as the list is rendered.
+function renderBilledWellChips(ticketId, padIndex, wells, opts){
+  const small = opts && opts.small;
+  const list = Array.isArray(wells) ? wells : [];
+  if(list.length === 0) return '';
+  const fs = small ? '11px' : '12px';
+  let h = `<div style="margin-top:6px; font-size:${fs}; color:var(--ink-soft);">`;
+  list.forEach((w, wi)=>{
+    h += `<span style="display:inline-flex; align-items:center; gap:2px; background:var(--paper-2); border-radius:3px; padding:2px 4px 2px 6px; margin:2px 4px 2px 0;">`;
+    h += `<button data-rename-well="${escAttr(ticketId)}" data-pad-index="${padIndex}" data-well-index="${wi}"
+            title="Rename this well"
+            style="background:none; border:none; padding:0; margin:0; cursor:pointer; color:inherit; font-size:${fs}; font-family:inherit; text-align:left; text-decoration:underline dotted rgba(0,0,0,0.28); text-underline-offset:3px;">${fmtDate(w.date)}${w.label?' — '+escHtml(w.label):''}</button>`;
+    h += `<button data-unbill-well="${escAttr(ticketId)}" data-pad-index="${padIndex}" data-well-index="${wi}"
+            title="Remove this billed well"
+            style="background:none; border:none; padding:0 2px; margin:0; cursor:pointer; color:var(--ink-soft); font-size:13px; line-height:1; font-family:inherit;">&times;</button>`;
+    h += `</span>`;
+  });
+  h += `</div>`;
+  return h;
+}
+
 function renderPadSection(t){
   const hasPads = Array.isArray(t.pads) && t.pads.length > 0;
   if(!hasPads) return '';
@@ -5490,6 +6048,7 @@ function renderPadSection(t){
     const total = activePad.totalWells || 0;
     const complete = billed >= total && total > 0;
     html += `<span style="color:${complete?'var(--green)':'var(--ink)'};">${escHtml(activePad.name)} — ${billed}/${total} billed${complete?' ✓':''}</span>`;
+    html += renderBilledWellChips(t.id, t.pads.indexOf(activePad), activePad.billedWells, {small:true});
   }
 
   if(completedPads.length > 0){
@@ -5501,6 +6060,7 @@ function renderPadSection(t){
     completedPads.forEach(p=>{
       const b = Array.isArray(p.billedWells) ? p.billedWells.length : 0;
       html += `<div style="font-size:11px; color:var(--ink-soft); padding:3px 0;">${escHtml(p.name)} — ${b}/${p.totalWells} wells — ${fmtDate(p.startDate)} to ${fmtDate(p.completedDate||'')}</div>`;
+      html += renderBilledWellChips(t.id, t.pads.indexOf(p), p.billedWells, {small:true});
     });
     html += `</div></details>`;
   }
@@ -5583,6 +6143,42 @@ function showStaleWriteWarning(keys){
   banner.innerHTML = '<span><strong>Not saved to the cloud</strong> &mdash; the other device has newer ' +
     escHtml(list) + '. Your changes are still on this device. Reload to take their copy, ' +
     'or make the change again on the device that has the newest data.</span>' +
+    '<span style="display:flex; gap:8px; flex-shrink:0;">' +
+    '<button id="stale-take-cloud" style="background:#fff; border:1px solid #fff; color:#8A4E12; padding:4px 12px; border-radius:4px; cursor:pointer; font-size:12px; white-space:nowrap; font-weight:600;">Take their copy</button>' +
+    '<button onclick="this.closest(\'#stale-write-banner\').remove()" style="background:none; border:1px solid #fff; color:#fff; padding:4px 12px; border-radius:4px; cursor:pointer; font-size:12px; white-space:nowrap;">Dismiss</button>' +
+    '</span>';
+  document.body.prepend(banner);
+  // Dismissing leaves this device unable to pull - the refusal keeps the
+  // unsynced flag set, and that flag turns every later pull into another
+  // refused push. Without this button the only way out was clearing storage.
+  const take = document.getElementById('stale-take-cloud');
+  if(take) take.onclick = async ()=>{
+    if(!confirm('Replace this device\'s copy with the shared sheet\'s?\n\nAnything changed here that has not reached the cloud will be lost.')) return;
+    banner.remove();
+    await pullFromCloud(false, true);
+  };
+}
+
+function showSyncTokenWarning(){
+  if(document.getElementById('sync-token-banner')) return;
+  const banner = document.createElement('div');
+  banner.id = 'sync-token-banner';
+  banner.style.cssText = 'position:fixed; top:0; left:0; right:0; background:#B5432A; color:#fff; padding:12px 20px; z-index:99999; font-family:Inter,sans-serif; font-size:14px; display:flex; justify-content:space-between; align-items:center; gap:12px;';
+  banner.innerHTML = '<span><strong>Sync token missing or wrong</strong> &mdash; the cloud refused this device. Nothing has been lost; your work is still here. Go to Settings &rarr; Cloud Sync and enter the token.</span>' +
+    '<button onclick="this.parentElement.remove()" style="background:none; border:1px solid #fff; color:#fff; padding:4px 12px; border-radius:4px; cursor:pointer; font-size:12px; white-space:nowrap;">Dismiss</button>';
+  document.body.prepend(banner);
+}
+
+function showDiscardedTicketWarning(labels){
+  const old = document.getElementById('discarded-ticket-banner');
+  if(old) old.remove();
+  const shown = labels.slice(0, 6).map(escHtml).join(', ');
+  const more = labels.length > 6 ? ' and ' + (labels.length - 6) + ' more' : '';
+  const banner = document.createElement('div');
+  banner.id = 'discarded-ticket-banner';
+  banner.style.cssText = 'position:fixed; top:0; left:0; right:0; background:#B8691C; color:#fff; padding:12px 20px; z-index:99999; font-family:Inter,sans-serif; font-size:14px; display:flex; justify-content:space-between; align-items:center; gap:12px;';
+  banner.innerHTML = '<span><strong>Edits not kept</strong> &mdash; the cloud already had a newer version of ' +
+    shown + more + ', so what you changed here was not saved. Reload to see the newer copy, then make the change again.</span>' +
     '<button onclick="this.parentElement.remove()" style="background:none; border:1px solid #fff; color:#fff; padding:4px 12px; border-radius:4px; cursor:pointer; font-size:12px; white-space:nowrap;">Dismiss</button>';
   document.body.prepend(banner);
 }
@@ -5774,6 +6370,8 @@ function attachHandlers(){
 
   const saveSyncBtn = document.getElementById('save-sync-url');
   if(saveSyncBtn) saveSyncBtn.onclick = async ()=>{
+    const tokenInput = document.getElementById('sync-token-input');
+    if(tokenInput) saveSyncToken(tokenInput.value);
     const input = document.getElementById('sync-url-input');
     const url = input.value.trim();
     if(!url){ alert('Please paste the Web App URL first.'); return; }
@@ -5857,6 +6455,35 @@ function attachHandlers(){
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
   };
+
+  const addChargeRuleBtn = document.getElementById('add-charge-rule');
+  if(addChargeRuleBtn) addChargeRuleBtn.onclick = async ()=>{
+    if(!Array.isArray(appSettings.chargeRules)) appSettings.chargeRules = [];
+    appSettings.chargeRules.push({ customer:'', rig:'', perDay:'', flatAdd:'', label:'' });
+    await saveAppSettings();
+    render();
+  };
+  document.querySelectorAll('[data-rule-field]').forEach(inp=>{
+    inp.onchange = async ()=>{
+      const i = parseInt(inp.dataset.ruleIndex, 10);
+      const rules = appSettings.chargeRules;
+      if(!Array.isArray(rules) || !rules[i]) return;
+      rules[i][inp.dataset.ruleField] = inp.value;
+      await saveAppSettings();
+    };
+  });
+  document.querySelectorAll('[data-rule-remove]').forEach(b=>{
+    b.onclick = async ()=>{
+      const i = parseInt(b.dataset.ruleRemove, 10);
+      const rules = appSettings.chargeRules;
+      if(!Array.isArray(rules) || !rules[i]) return;
+      const who = rules[i].customer || 'this rule';
+      if(!confirm(`Remove the charge rule for ${who}?`)) return;
+      rules.splice(i, 1);
+      await saveAppSettings();
+      render();
+    };
+  });
 
   const saveOverdueBtn = document.getElementById('save-overdue-threshold');
   if(saveOverdueBtn) saveOverdueBtn.onclick = async ()=>{
@@ -5997,25 +6624,24 @@ function attachHandlers(){
       if(el) el.oninput = ()=>{ draftTicket[ticketFieldMap[id]] = el.value; };
     });
 
-    // Suggests a well-charge amount for known customer/rig-specific rules
-    // (e.g. Firebird's $120/day, Cactus 407's extra casing charge) based on
-    // how many days have passed since the last well charge on this ticket
-    // (or since delivery, if this is the first one). Only a starting
-    // suggestion - always editable before saving.
+    // Suggests a well-charge amount from the rules in Settings, based on how
+    // many days have passed since the last well charge on this ticket (or
+    // since delivery, if this is the first one). Only a starting suggestion -
+    // always editable before saving.
+    //
+    // The rates used to be written into this file: a day rate and a rig
+    // surcharge, by name. That file is served to anybody who opens the app,
+    // so those were real numbers from the business sitting in public. They
+    // live in settings now, which syncs privately through the Sheet.
     function suggestWellChargeAmount(newEntryDate){
-      const cust = (draftTicket.customer||'').trim().toLowerCase();
-      const rig = (draftTicket.rig||'').trim().toLowerCase();
-      if(cust !== 'firebird energy ii') return { amount:'', label:'' };
+      const rule = matchChargeRule(draftTicket.customer, draftTicket.rig);
+      if(!rule) return { amount:'', label:'' };
       const sorted = draftWellCharges.slice().sort((a,b)=>(a.date||'').localeCompare(b.date||''));
       const lastDate = sorted.length ? sorted[sorted.length-1].date : draftTicket.deliveryDate;
-      const days = Math.max(1, daysBetween(lastDate || todayStr(), newEntryDate || todayStr()));
-      let amount = 120 * days;
-      let label = '';
-      if(rig === 'cactus 407'){
-        amount += 425;
-        label = 'Includes extra casing component';
-      }
-      return { amount: String(amount), label };
+      const days = billableDays(lastDate || todayStr(), newEntryDate || todayStr());
+      const amount = (Number(rule.perDay)||0) * days + (Number(rule.flatAdd)||0);
+      if(!(amount > 0)) return { amount:'', label:'' };
+      return { amount: String(amount), label: rule.label || '' };
     }
 
     const addWellChargeBtn = document.getElementById('add-well-charge');
@@ -6588,6 +7214,7 @@ function attachHandlers(){
         // remember it - otherwise a merge would just add it back from another
         // device's copy.
         if(!pendingDeletes.includes(b.dataset.delete)) pendingDeletes.push(b.dataset.delete);
+        savePendingDeletes();
         tickets = tickets.filter(x=>x.id!==b.dataset.delete);
         await saveTickets();
         render();
@@ -6623,11 +7250,20 @@ function attachHandlers(){
       };
     });
 
+    // Resolve the pad a chip belongs to. The index is authoritative; the old
+    // markup carried no pad at all and always meant the active one, so a
+    // missing index still falls back to that rather than doing nothing.
+    const padFromChip = (t, ds)=>{
+      const pi = parseInt(ds.padIndex, 10);
+      if(Array.isArray(t.pads) && pi >= 0 && t.pads[pi]) return t.pads[pi];
+      return getActivePad(t);
+    };
+
     document.querySelectorAll('[data-unbill-well]').forEach(b=>{
       b.onclick = async ()=>{
         const t = tickets.find(x=>x.id===b.dataset.unbillWell);
         if(!t) return;
-        const pad = getActivePad(t);
+        const pad = padFromChip(t, b.dataset);
         if(!pad || !Array.isArray(pad.billedWells)) return;
         const i = parseInt(b.dataset.wellIndex, 10);
         const w = pad.billedWells[i];
@@ -6635,6 +7271,67 @@ function attachHandlers(){
         const desc = w.label ? `"${w.label}"` : `the entry dated ${fmtDate(w.date)}`;
         if(!confirm(`Remove ${desc} from ${pad.name}?\n\nThis lowers the billed count for this pad.`)) return;
         pad.billedWells.splice(i, 1);
+        t.updatedAt = nowIso();
+        await saveTickets();
+        render();
+      };
+    });
+
+    document.querySelectorAll('[data-edit-pad]').forEach(b=>{
+      b.onclick = async ()=>{
+        const t = tickets.find(x=>x.id===b.dataset.editPad);
+        if(!t) return;
+        const pad = padFromChip(t, b.dataset);
+        if(!pad) return;
+        const billed = Array.isArray(pad.billedWells) ? pad.billedWells.length : 0;
+
+        const nextName = prompt('Pad name:', pad.name || '');
+        if(nextName === null) return;
+        const name = nextName.trim();
+        if(!name){ alert('A pad name is required.'); return; }
+
+        // The well count is asked for in the same breath because the two are
+        // usually wrong together - a pad gets renamed when its scope changed.
+        let count = pad.totalWells || 0;
+        const rawCount = prompt(`How many wells on ${name}?`, String(count));
+        if(rawCount !== null){
+          const n = parseInt(rawCount, 10);
+          if(!(n > 0)){ alert('Enter the number of wells as a whole number greater than 0. Nothing was changed.'); return; }
+          // Dropping the total below what's already billed would show
+          // "5 of 3 billed" and mark the pad complete on arithmetic alone.
+          if(n < billed){
+            alert(`${billed} well${billed!==1?'s are':' is'} already marked billed on this pad, so the total can't be ${n}. Remove a well first if that's wrong.`);
+            return;
+          }
+          count = n;
+        }
+
+        if(name === (pad.name||'') && count === (pad.totalWells||0)) return;
+        pad.name = name;
+        pad.totalWells = count;
+        t.updatedAt = nowIso();
+        await saveTickets();
+        render();
+      };
+    });
+
+    document.querySelectorAll('[data-rename-well]').forEach(b=>{
+      b.onclick = async ()=>{
+        const t = tickets.find(x=>x.id===b.dataset.renameWell);
+        if(!t) return;
+        const pad = padFromChip(t, b.dataset);
+        if(!pad || !Array.isArray(pad.billedWells)) return;
+        const i = parseInt(b.dataset.wellIndex, 10);
+        const w = pad.billedWells[i];
+        if(!w) return;
+        const next = prompt(`Well name on ${pad.name}:`, w.label || '');
+        if(next === null) return;              // cancelled - leave it alone
+        const trimmed = next.trim();
+        if(!trimmed){ alert('A well name or number is required.'); return; }
+        if(trimmed === (w.label||'')) return;   // no change, no save, no sync churn
+        w.label = trimmed;
+        // The billed DATE is deliberately untouched. It is what the Billing
+        // Check dates its grace window from, and a typo fix is not a re-bill.
         t.updatedAt = nowIso();
         await saveTickets();
         render();
@@ -6733,28 +7430,14 @@ function attachHandlers(){
         if(el){ el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
       };
     }
-    document.querySelectorAll('[data-select-ticket]').forEach(cb=>{
-      cb.onchange = ()=>{
-        const id = cb.dataset.selectTicket;
-        if(cb.checked) selectedTicketIds.add(id);
-        else selectedTicketIds.delete(id);
-        render();
-      };
-    });
-    const bulkReturnBtn = document.getElementById('bulk-return-btn');
-    if(bulkReturnBtn) bulkReturnBtn.onclick = async ()=>{
-      const count = selectedTicketIds.size;
-      if(count === 0) return;
-      if(!confirm(`Mark ${count} ticket${count!==1?'s':''} as returned today?`)) return;
-      const today = todayStr();
-      tickets.forEach(t=>{
-        if(selectedTicketIds.has(t.id)) t.returnDate = today;
-      });
-      selectedTicketIds.clear();
-      await saveTickets();
-      await reconcileYardFromTickets();
-      render();
-    };
+    // A bulk "mark these returned" used to live here, driven by a checkbox
+    // on each ticket header. The checkboxes were removed from the markup and
+    // these handlers were left behind, wiring themselves to elements that no
+    // longer exist - so the code read as a working feature while nothing
+    // could reach it. Removed rather than left to mislead the next reader.
+    // If bulk return comes back, it needs data-select-ticket on the ticket
+    // header and a #bulk-return-btn, and every touched ticket needs
+    // t.updatedAt = nowIso() or the server discards the change.
   }
 
   document.querySelectorAll('[data-mark-ready]').forEach(btn=>{
@@ -6845,7 +7528,19 @@ function attachHandlers(){
   if(countBack) countBack.onclick = ()=>{ countMode = 'counting'; render(); };
 
   const countApply = document.getElementById('count-apply');
-  if(countApply) countApply.onclick = async ()=>{ await applyCountSession(); };
+  if(countApply) countApply.onclick = async ()=>{
+    // One speed bump, and only for the case that's actually a hole in the
+    // record: something that has NEVER been counted. Not a block - a hard
+    // stop at the yard, on a phone, with gloves on, just means the count
+    // gets abandoned or a number gets invented.
+    const never = countableItemNames().filter(n=>
+      !(countSession.items[n] && countSession.items[n].counted) && !lastCountedFor(n));
+    if(never.length){
+      const list = never.slice(0,8).join(', ') + (never.length>8 ? ` and ${never.length-8} more` : '');
+      if(!confirm(`${never.length} item${never.length!==1?'s have':' has'} never been counted and ${never.length!==1?'are':'is'} not in this count:\n\n${list}\n\nApply anyway? Use "none here" on the count screen if ${never.length!==1?'they are':'it is'} genuinely not at the yard.`)) return;
+    }
+    await applyCountSession();
+  };
 
   const countDiscard = document.getElementById('count-discard');
   if(countDiscard) countDiscard.onclick = ()=>{
@@ -6970,9 +7665,9 @@ async function onSaveTicket(){
   // Save catalogs to local storage directly (pushToCloud already bundles
   // rig/customer data into the same request that saveTickets() below
   // triggers, so there's no need for three separate overlapping pushes).
-  try{ localStorage.setItem(RIG_CATALOG_KEY, JSON.stringify(rigCatalog)); }catch(e){ console.error('Could not save rig list', e); }
-  try{ localStorage.setItem(CUSTOMER_CATALOG_KEY, JSON.stringify(customerCatalog)); }catch(e){ console.error('Could not save customer list', e); }
-  try{ localStorage.setItem(CATALOG_KEY, JSON.stringify(equipmentCatalog)); }catch(e){ console.error('Could not save equipment list', e); }
+  try{ localStorage.setItem(RIG_CATALOG_KEY, JSON.stringify(rigCatalog)); }catch(e){ showStorageWarning('rig list', e); }
+  try{ localStorage.setItem(CUSTOMER_CATALOG_KEY, JSON.stringify(customerCatalog)); }catch(e){ showStorageWarning('customer list', e); }
+  try{ localStorage.setItem(CATALOG_KEY, JSON.stringify(equipmentCatalog)); }catch(e){ showStorageWarning('equipment list', e); }
 
   // Kick off saving (local write happens synchronously inside this, before
   // any network call) but don't wait on the cloud push before moving on -
@@ -7108,6 +7803,8 @@ async function init(){
   await loadCustomerCatalog();
   await loadTemplates();
   loadSyncUrl();
+  loadSyncToken();
+  loadPendingDeletes();
   await reconcileYardFromTickets();
   render();
   if(syncUrl){
