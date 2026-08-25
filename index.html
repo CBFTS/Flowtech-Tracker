@@ -1592,11 +1592,96 @@ async function reconcileYardFromTickets_(){
     }
   });
 
+  syncAllShopBatches();
   if(changed) await saveAppSettings();
   return changed;
 }
 
 // The one manual step, mirroring a message the yard already sends.
+/* ── HOW LONG IT'S BEEN AT THE INSPECTOR ───────────────────────────
+   The shop bucket is a quantity, not named pieces, so "6 in shop" can't
+   tell you that four of them have been gone three weeks and two went in
+   on Tuesday. Batches fix that: each arrival is stamped, and marking
+   pieces ready takes the oldest first - iron goes straight from the rig
+   to the inspector and can't be anywhere else, so first in really is
+   first out.
+
+   Batches are kept in step with the shop count by comparison rather than
+   by hooking every place that moves it. Returns, swaps, undone returns
+   and deleted tickets all move that number through different paths;
+   reconciling once afterwards catches every one of them and can't be
+   bypassed by a path added later.                                      */
+function shopBatchesFor(name){
+  const it = yardEntry(name);
+  if(!Array.isArray(it.batches)) it.batches = [];
+  return it.batches;
+}
+
+function syncShopBatches(name){
+  const inv = ensureInventoryCount();
+  const it = yardEntry(name);
+  const batches = shopBatchesFor(name);
+  const shop = Number(it.shop) || 0;
+  let sum = batches.reduce((s,x)=> s + (Number(x.qty)||0), 0);
+  if(sum === shop) return;
+
+  if(sum < shop){
+    // New arrivals. Stamped today - except on the very first run, where
+    // whatever is already in the queue arrived at some unknown past date
+    // and shouldn't be dated to the day this feature was installed.
+    batches.push({ qty: shop - sum, since: inv.shopBatchesInit ? todayStr() : null });
+  } else {
+    // The count fell without anything being marked ready - an undone
+    // return, a deleted ticket. Unwind the newest arrivals first, since
+    // that's what a reversal actually undoes.
+    let excess = sum - shop;
+    for(let i = batches.length - 1; i >= 0 && excess > 0; i--){
+      const take = Math.min(excess, Number(batches[i].qty) || 0);
+      batches[i].qty = (Number(batches[i].qty) || 0) - take;
+      excess -= take;
+      if(batches[i].qty <= 0) batches.splice(i, 1);
+    }
+  }
+}
+
+function syncAllShopBatches(){
+  const inv = ensureInventoryCount();
+  Object.keys(inv.items || {}).forEach(syncShopBatches);
+  inv.shopBatchesInit = true;   // from here on, arrivals are dated
+}
+
+// Whole days each batch has been at the inspector, oldest first.
+function shopWaits(name){
+  return shopBatchesFor(name)
+    .map(b=>({ qty: Number(b.qty)||0, since: b.since,
+               days: b.since ? daysBetween(b.since, todayStr()) : null }))
+    .filter(b=>b.qty > 0)
+    .sort((a,b)=>{
+      if(a.days === null) return -1;      // unknown age reads as oldest
+      if(b.days === null) return 1;
+      return b.days - a.days;
+    });
+}
+
+/* What turnaround has actually looked like. Built only from batches that
+   went in AND came out with both dates known, so the first few months
+   after install report nothing rather than something misleading. */
+function shopTurnaround(){
+  const inv = ensureInventoryCount();
+  const hist = Array.isArray(inv.shopHistory) ? inv.shopHistory : [];
+  const days = hist.map(h=>Number(h.days)).filter(d=>isFinite(d) && d >= 0);
+  if(days.length === 0) return null;
+  const sorted = days.slice().sort((a,b)=>a-b);
+  return {
+    count:  days.length,
+    typical: sorted[Math.floor(sorted.length / 2)],   // median, not mean -
+                                                      // one 40-day outlier
+                                                      // shouldn't set the
+                                                      // number you quote
+    worst:  sorted[sorted.length - 1]
+  };
+}
+
 async function markReadyFromShop(name){
   const it = yardEntry(name);
   if(it.shop <= 0) return;
@@ -1605,6 +1690,35 @@ async function markReadyFromShop(name){
   const qty = parseInt(raw, 10);
   if(!(qty > 0)){ alert('Enter a whole number greater than 0.'); return; }
   const move = Math.min(qty, it.shop);
+
+  // Oldest batches clear first, and each completed one records how long
+  // it actually took. That history is the whole point - it turns "how
+  // fast are they?" from a guess into your own number.
+  const inv = ensureInventoryCount();
+  if(!Array.isArray(inv.shopHistory)) inv.shopHistory = [];
+  const batches = shopBatchesFor(name);
+  batches.sort((a,b)=>{
+    if(!a.since) return -1;
+    if(!b.since) return 1;
+    return String(a.since).localeCompare(String(b.since));
+  });
+  let left = move;
+  for(let i = 0; i < batches.length && left > 0; i++){
+    const take = Math.min(left, Number(batches[i].qty) || 0);
+    if(batches[i].since){
+      const d = daysBetween(batches[i].since, todayStr());
+      if(d !== null && d >= 0){
+        inv.shopHistory.push({ name: name, qty: take, days: d, at: todayStr() });
+      }
+    }
+    batches[i].qty = (Number(batches[i].qty) || 0) - take;
+    left -= take;
+  }
+  for(let i = batches.length - 1; i >= 0; i--){ if(!(batches[i].qty > 0)) batches.splice(i, 1); }
+  // Two years of turnarounds is plenty to quote from and keeps the blob
+  // that rides the cloud sync from growing without limit.
+  if(inv.shopHistory.length > 400) inv.shopHistory = inv.shopHistory.slice(-400);
+
   it.shop -= move;
   it.ready += move;
   await saveAppSettings();
@@ -4786,6 +4900,29 @@ function renderFullInventory(){
           &middot; <span style="color:${r.shop>0?'#B8691C':'var(--ink-soft)'};">${r.shop} in shop</span>
           ${unaccounted ? ` &middot; <span style="color:#B8691C;">${unaccounted} unaccounted</span>` : ''}
           ${overplaced ? ` &middot; <span style="color:#B5432A;">${overplaced} more marked ready than are home</span>` : ''}
+          ${(function(){
+            if(!(r.shop > 0)) return '';
+            const w = shopWaits(r.name);
+            if(!w.length) return '';
+            const oldest = w[0];
+            const late = oldest.days !== null && oldest.days >= 14;
+            // Only the OLDEST date is stated as fact. Whichever pieces the
+            // inspector hands back first, if a batch went in on that date
+            // and the count hasn't cleared it, something has been waiting
+            // that long. Splitting the rest between batches assumes they
+            // work oldest-first, which nobody here actually knows - so the
+            // breakdown says it's an assumption instead of pretending.
+            const head = `<div style="font-size:11px; color:${late?'#B5432A':'var(--ink-soft)'}; margin-top:2px;">
+              ${r.shop} at the inspector${oldest.days === null
+                ? ' &middot; oldest went in before this was tracked'
+                : ' &middot; oldest has been there ' + oldest.days + ' day' + (oldest.days===1?'':'s') + (late ? ' — worth a call' : '')}</div>`;
+            const rest = w.length > 1
+              ? `<div style="font-size:10px; color:var(--ink-faint); margin-top:1px;">${
+                  w.map(x=>x.qty + (x.days===null?' (undated)':' since ' + fmtDate(x.since))).join(' &middot; ')
+                } &middot; split assumes oldest out first</div>`
+              : '';
+            return head + rest;
+          })()}
         </div>
         ${r.shop>0?`<button data-mark-ready="${escAttr(r.name)}" style="background:none; border:1px solid var(--line); border-radius:5px; padding:4px 9px; font-size:11px; cursor:pointer; font-family:inherit; white-space:nowrap;">Ready &#9656;</button>`:''}
       </div>` : ''}
@@ -4815,6 +4952,11 @@ function renderFullInventory(){
       <div style="font-size:11px; color:var(--ink-soft); margin-top:12px; line-height:1.5;">
         ${totalOwned>0?`${utilization}% of your iron is out on tickets right now. The bar under each item splits that item's whole fleet by where it is. `:''}On Hand means not on a ticket — some of it may still be in the queue for rebuild or paint.
         ${(totalReady>0||totalShop>0)?`<br>Returned iron goes into <strong>In Shop</strong> on its own. When the yard says a piece is through paint, tap <strong>Ready &#9656;</strong>.`:''}
+        ${(function(){ const t = shopTurnaround(); return t
+            ? `<br>Inspection turnaround, from ${t.count} batch${t.count!==1?'es':''} you've had back:
+               <strong>about ${t.typical} day${t.typical!==1?'s':''} typical</strong>, worst ${t.worst}.
+               Approximate — the app pairs arrivals to returns oldest-first, which may not be the order the shop works in.`
+            : `<br>Once a few batches have been through the shop and back, this will show what turnaround actually runs.`; })()}
         ${noCount>0?`<br><strong style="color:#B8691C;">${noCount} item${noCount!==1?'s have':' has'} no count on file</strong>${uncountedOut>0?` (${uncountedOut} unit${uncountedOut!==1?'s':''} of ${noCount!==1?'them':'it'} out on tickets, not counted in the totals above)`:''} — count the yard, or use Fill From Tickets for a rough floor.`:''}
       </div>
     </div>
@@ -7810,6 +7952,7 @@ function attachHandlers(){
       const sent = Math.min(qty, readyNow);
       it.ready = readyNow - sent;
       it.shop  = (Number(it.shop) || 0) + qty;
+      syncShopBatches(line.name);   // stamp its arrival at the inspector
 
       if(qty === onRig){
         line.bandColor = band.name;
