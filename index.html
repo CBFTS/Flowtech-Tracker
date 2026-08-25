@@ -2578,18 +2578,117 @@ const DEFAULT_CATALOG = [
   'Air Compressor', 'Water Transfer Line', 'Storage Tank'
 ];
 
-const DEFAULT_COLOR_CATALOG = [
-  'White', 'Green', 'Red', 'Orange', 'Blue', 'Yellow',
-  'Black', 'Silver', 'Brown', 'Pink', 'Purple', 'Gray'
+/* ── INSPECTION BANDS ──────────────────────────────────────────────
+   A band colour is a DATE, not a label. Flow-Tech's inspection scheme
+   assigns one colour per month of the year, so a piece of iron wearing a
+   Purple band was inspected in October. Twelve colours and a twelve-month
+   validity means a colour is unambiguous inside the window - anything
+   older than a year has already expired, so it can't be confused with a
+   fresh band of the same colour.
+
+   This table is the company's own scheme, confirmed against the current
+   chart. Another chart exists that disagrees on almost every month;
+   reading a band against it puts the date out by up to six months. That
+   is exactly why this belongs in the app rather than on a wall.        */
+const INSPECTION_BANDS = [
+  { month: 1,  name: 'Dark Blue',  hex: '#2E5FA3' },
+  { month: 2,  name: 'Brown',      hex: '#7A5230' },
+  { month: 3,  name: 'White',      hex: '#FFFFFF' },
+  { month: 4,  name: 'Red',        hex: '#C0392B' },
+  { month: 5,  name: 'Black',      hex: '#1B211C' },
+  { month: 6,  name: 'Tan',        hex: '#C89B3C' },
+  { month: 7,  name: 'Light Blue', hex: '#A8C8E0' },
+  { month: 8,  name: 'Yellow',     hex: '#E8DC20' },
+  { month: 9,  name: 'Grey',       hex: '#80806F' },
+  { month: 10, name: 'Purple',     hex: '#7B2FA3' },
+  { month: 11, name: 'Orange',     hex: '#E07B20' },
+  { month: 12, name: 'Green',      hex: '#5A8C2A' }
 ];
 
-// Loose mapping of common band color names to a CSS color for the swatch dot.
-// Falls back to no swatch if the name isn't recognized (e.g. a custom entry).
-const COLOR_SWATCH_MAP = {
-  white:'#FFFFFF', green:'#2E8B3D', red:'#C0392B', orange:'#D9822B',
-  blue:'#2E5FA3', yellow:'#E0C020', black:'#1B211C', silver:'#B8BCC0',
-  brown:'#7A5230', pink:'#E091AA', purple:'#7B4EA3', gray:'#8A8F94', grey:'#8A8F94'
+const MONTH_NAMES = ['January','February','March','April','May','June',
+                     'July','August','September','October','November','December'];
+
+// Values that appear on older tickets but aren't a month in this scheme.
+// Kept so existing data still renders, and reported rather than ignored -
+// a piece whose inspection date can't be worked out is not a piece to
+// forget about.
+const LEGACY_BANDS = {
+  'silver': 'Banded before the colour coding started — inspection date unknown.',
+  'blue':   'Ambiguous — this scheme has Dark Blue (January) and Light Blue (July), six months apart. Check the band and pick one.',
+  'pink':   'Not a colour in this scheme — check the band against the chart.',
+  'gray':   'Recorded as Gray; this scheme spells it Grey (September). Re-pick it to be sure.'
 };
+
+const DEFAULT_COLOR_CATALOG = INSPECTION_BANDS.map(b=>b.name);
+
+const COLOR_SWATCH_MAP = (function(){
+  const m = {};
+  INSPECTION_BANDS.forEach(b=>{ m[b.name.toLowerCase()] = b.hex; });
+  // Still drawn so old entries don't lose their dot entirely.
+  m['silver'] = '#B8BCC0';
+  m['blue']   = '#5C89C4';
+  m['pink']   = '#E091AA';
+  m['gray']   = m['grey'];
+  return m;
+})();
+
+function bandMonth(name){
+  const n = String(name||'').toLowerCase().trim();
+  const hit = INSPECTION_BANDS.find(b=>b.name.toLowerCase() === n);
+  return hit ? hit.month : null;
+}
+
+function inspectionValidityMonths(){
+  const v = Number(appSettings.inspectionValidityMonths);
+  return (v > 0) ? v : 12;
+}
+
+// How far ahead to start warning. The default is 60 days because ordering
+// replacement iron runs about a month - so this leaves a month of slack to
+// decide, order, and get the swap organised before the band runs out.
+function inspectionWarnDays(){
+  const v = Number(appSettings.inspectionWarnDays);
+  return (v > 0) ? v : 60;
+}
+
+/* Work out when a banded piece was inspected, and when it runs out.
+
+   The colour gives the MONTH. The year comes from context: a band can't
+   have been applied after the iron left the yard, so the newest matching
+   month on or before the delivery date is the one. That is the bit a
+   person squinting at a sticker can't do - two Purples look identical
+   whether they're from last October or the one before, and the app knows
+   which ticket each piece went out on. */
+function bandStatus(bandName, referenceDate){
+  const raw = String(bandName||'').trim();
+  if(!raw) return { state:'none' };
+  const month = bandMonth(raw);
+  if(month === null){
+    return { state:'unknown', note: LEGACY_BANDS[raw.toLowerCase()] || 'Not a colour in this scheme.' };
+  }
+
+  const ref = dayStart(referenceDate) || dayStart(todayStr());
+  if(!ref) return { state:'unknown', note:'No date to measure from.' };
+
+  // Newest occurrence of that month at or before the reference date.
+  let year = ref.getFullYear();
+  if((month - 1) > ref.getMonth()) year -= 1;
+
+  const inspected = new Date(year, month - 1, 1);
+  const expires   = new Date(year, month - 1 + inspectionValidityMonths(), 1);
+  const now       = dayStart(todayStr());
+  const daysLeft  = Math.round((expires - now) / 86400000);
+
+  return {
+    state: daysLeft <= 0 ? 'expired' : (daysLeft <= inspectionWarnDays() ? 'due' : 'ok'),
+    month: month,
+    inspectedLabel: MONTH_NAMES[month-1] + ' ' + year,
+    expiresLabel:   MONTH_NAMES[(month - 1 + inspectionValidityMonths()) % 12] + ' ' +
+                    (year + Math.floor((month - 1 + inspectionValidityMonths()) / 12)),
+    expires: expires,
+    daysLeft: daysLeft
+  };
+}
 
 async function loadCatalog(){
   try{
@@ -4446,6 +4545,108 @@ function yardLegend(){
   </div>`;
 }
 
+/* ── INSPECTION DUE ────────────────────────────────────────────────
+   Every banded line on every open ticket, grouped by the month its band
+   says it was inspected. This is the one deadline in the business that
+   arrives on a schedule instead of by phone call, and until now it lived
+   in somebody's head.
+
+   The pinch is that a swap needs the fleet twice over for a moment: a
+   replacement has to reach the rig before the expired piece comes off, or
+   you pull the rig's iron and risk the position. So each group also says
+   how many are sitting ready against how many will need replacing.      */
+function renderInspectionDue(){
+  const lines = [];
+  (tickets||[]).filter(t=>!t.returnDate).forEach(t=>{
+    (t.equipment||[]).forEach(e=>{
+      if(!e.name) return;
+      const st = bandStatus(e.bandColor, t.deliveryDate);
+      if(st.state === 'none') return;
+      lines.push({ name:e.name, qty:Number(e.qty)||0, rig:t.rig||'Unassigned rig',
+                   ticket:t.ticketNumber||'', band:e.bandColor, st:st });
+    });
+  });
+  if(lines.length === 0) return '';
+
+  const ready = {};
+  const inv = ensureInventoryCount();
+  Object.keys(inv.items||{}).forEach(n=>{ ready[n] = Number(inv.items[n].ready)||0; });
+
+  const groups = {};
+  lines.forEach(l=>{
+    // Unknowns are grouped by the BAND, not lumped together - Silver means
+    // "banded before the scheme" and Blue means "could be two months six
+    // apart". Same box, one note, and half the reason goes missing.
+    const key = (l.st.state === 'unknown') ? ('unknown:' + String(l.band||'').toLowerCase()) : l.st.expiresLabel;
+    if(!groups[key]) groups[key] = { label:key, state:l.st.state, expires:l.st.expires,
+                                     daysLeft:l.st.daysLeft, band:l.band, note:l.st.note, lines:[] };
+    groups[key].lines.push(l);
+  });
+
+  const order = Object.keys(groups).sort((a,b)=>{
+    const au = a.indexOf('unknown:') === 0, bu = b.indexOf('unknown:') === 0;
+    if(au && bu) return a.localeCompare(b);
+    if(au) return 1;
+    if(bu) return -1;
+    return groups[a].expires - groups[b].expires;
+  });
+
+  const card = (g)=>{
+    const total = g.lines.reduce((n,l)=>n+l.qty, 0);
+    const byName = {};
+    g.lines.forEach(l=>{
+      if(!byName[l.name]) byName[l.name] = { qty:0, rigs:{} };
+      byName[l.name].qty += l.qty;
+      byName[l.name].rigs[l.rig] = (byName[l.name].rigs[l.rig]||0) + l.qty;
+    });
+
+    const tone = g.state === 'expired' ? { bg:'#FCEBEA', line:'#E0A9A0', ink:'#B5432A' }
+               : g.state === 'due'     ? { bg:'#FFF8E6', line:'#E6D080', ink:'#8A6D10' }
+               : g.state === 'unknown' ? { bg:'#F1F4F1', line:'var(--line)', ink:'var(--ink-soft)' }
+               :                         { bg:'#fff',    line:'var(--line)', ink:'var(--ink-soft)' };
+
+    const heading = g.state === 'unknown'
+      ? (g.band ? escHtml(g.band) + ' — date unknown' : 'Inspection date unknown')
+      : (g.state === 'expired' ? 'Expired ' : 'Expires ') + g.label +
+        (g.state === 'expired' ? '' : ` &middot; ${g.daysLeft} day${g.daysLeft!==1?'s':''}`);
+
+    const rows = Object.keys(byName).sort().map(n=>{
+      const spare = ready[n] || 0;
+      const short = byName[n].qty - spare;
+      const where = Object.keys(byName[n].rigs).map(r=>escHtml(r)+(byName[n].rigs[r]>1?` (${byName[n].rigs[r]})`:'')).join(', ');
+      return `<div style="display:grid; grid-template-columns:1fr 78px 78px; gap:8px; padding:6px 0; border-top:1px solid ${tone.line}; font-size:12px; align-items:baseline;">
+        <div><strong>${escHtml(n)}</strong> <span style="color:var(--ink-soft);">&middot; ${where}</span></div>
+        <div style="text-align:right; font-family:'IBM Plex Mono',monospace;">${byName[n].qty} out</div>
+        <div style="text-align:right; font-family:'IBM Plex Mono',monospace; color:${short>0?'#B5432A':'#1E8A29'};">${short>0?('short '+short):(spare+' ready')}</div>
+      </div>`;
+    }).join('');
+
+    return `<div style="background:${tone.bg}; border:1.5px solid ${tone.line}; border-radius:8px; padding:12px 14px; margin-bottom:10px;">
+      <div style="display:flex; align-items:baseline; justify-content:space-between; gap:10px; flex-wrap:wrap;">
+        <div style="font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; font-size:13px; color:${tone.ink}; font-weight:600;">
+          ${colorSwatch(g.band)}${heading}
+        </div>
+        <div style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:${tone.ink};">${total} piece${total!==1?'s':''}</div>
+      </div>
+      ${g.note?`<div style="font-size:11px; color:${tone.ink}; margin-top:4px;">${escHtml(g.note)}</div>`:''}
+      ${rows}
+    </div>`;
+  };
+
+  const worst = order.find(k=>groups[k].state === 'expired' || groups[k].state === 'due');
+
+  return `<h2 class="section-title" style="margin-top:24px;">Inspection Due</h2>
+    <p style="font-size:12px; color:var(--ink-soft); margin-top:0;">
+      Worked out from the band colour on each ticket line — the colour is the month it was inspected,
+      and the year comes from when that ticket went out. Good for ${inspectionValidityMonths()} months.
+      <strong>Short</strong> means you don't have enough at the yard to swap them out when they run out.
+    </p>
+    ${order.map(k=>card(groups[k])).join('')}
+    ${worst?`<p style="font-size:11px; color:var(--ink-soft); margin-top:2px;">
+      A swap needs the replacement on the rig before the expired piece comes off, so anything showing short
+      is worth ordering now — lead time runs about a month.</p>`:''}`;
+}
+
 function renderFullInventory(){
   const out = outQtyByName();
   const names = new Set();
@@ -4679,6 +4880,7 @@ function renderInventory(){
       </div>
     </div>
     ${noMatches ? `<p style="font-size:13px; color:var(--ink-soft);">No equipment matches "${escHtml(inventorySearchTerm)}".</p>` : groups}
+    ${renderInspectionDue()}
     ${renderFullInventory()}
   `;
 }
