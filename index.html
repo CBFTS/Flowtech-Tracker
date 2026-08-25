@@ -2579,12 +2579,12 @@ const DEFAULT_CATALOG = [
 ];
 
 /* ── INSPECTION BANDS ──────────────────────────────────────────────
-   A band colour is a DATE, not a label. Flow-Tech's inspection scheme
-   assigns one colour per month of the year, so a piece of iron wearing a
-   Purple band was inspected in October. Twelve colours and a twelve-month
-   validity means a colour is unambiguous inside the window - anything
+   A band color is a DATE, not a label. Flow-Tech's inspection scheme
+   assigns one color per month of the year, so a piece of iron wearing a
+   Purple band was inspected in October. Twelve colors and a twelve-month
+   validity means a color is unambiguous inside the window - anything
    older than a year has already expired, so it can't be confused with a
-   fresh band of the same colour.
+   fresh band of the same color.
 
    This table is the company's own scheme, confirmed against the current
    chart. Another chart exists that disagrees on almost every month;
@@ -2613,9 +2613,9 @@ const MONTH_NAMES = ['January','February','March','April','May','June',
 // a piece whose inspection date can't be worked out is not a piece to
 // forget about.
 const LEGACY_BANDS = {
-  'silver': 'Banded before the colour coding started — inspection date unknown.',
+  'silver': 'Banded before the color coding started — inspection date unknown.',
   'blue':   'Ambiguous — this scheme has Dark Blue (January) and Light Blue (July), six months apart. Check the band and pick one.',
-  'pink':   'Not a colour in this scheme — check the band against the chart.',
+  'pink':   'Not a color in this scheme — check the band against the chart.',
   'gray':   'Recorded as Gray; this scheme spells it Grey (September). Re-pick it to be sure.'
 };
 
@@ -2645,7 +2645,7 @@ function inspectionValidityMonths(){
 
 // How far ahead to start warning. The default is 60 days because ordering
 // replacement iron runs about a month - so this leaves a month of slack to
-// decide, order, and get the swap organised before the band runs out.
+// decide, order, and get the swap organized before the band runs out.
 function inspectionWarnDays(){
   const v = Number(appSettings.inspectionWarnDays);
   return (v > 0) ? v : 60;
@@ -2653,7 +2653,7 @@ function inspectionWarnDays(){
 
 /* Work out when a banded piece was inspected, and when it runs out.
 
-   The colour gives the MONTH. The year comes from context: a band can't
+   The color gives the MONTH. The year comes from context: a band can't
    have been applied after the iron left the yard, so the newest matching
    month on or before the delivery date is the one. That is the bit a
    person squinting at a sticker can't do - two Purples look identical
@@ -2664,7 +2664,7 @@ function bandStatus(bandName, referenceDate){
   if(!raw) return { state:'none' };
   const month = bandMonth(raw);
   if(month === null){
-    return { state:'unknown', note: LEGACY_BANDS[raw.toLowerCase()] || 'Not a colour in this scheme.' };
+    return { state:'unknown', note: LEGACY_BANDS[raw.toLowerCase()] || 'Not a color in this scheme.' };
   }
 
   const ref = dayStart(referenceDate) || dayStart(todayStr());
@@ -2786,7 +2786,7 @@ function serverSupportsPerKeyStamps(){
 }
 
 // Only version 4 sends the sheet's stamps back. On anything older the local
-// stamps stay as they are, which is the behaviour that could lock a device
+// stamps stay as they are, which is the behavior that could lock a device
 // out - so the app says so rather than pretending it's protected.
 function serverSendsStamps(){
   return serverProtocol !== null && serverProtocol >= 4;
@@ -2924,7 +2924,7 @@ async function saveColorCatalog(){
   try{
     localStorage.setItem(COLOR_CATALOG_KEY, JSON.stringify(colorCatalog));
   }catch(e){
-    showStorageWarning('colour band list', e);
+    showStorageWarning('color band list', e);
   }
   if(syncUrl) await pushToCloud();
 }
@@ -4501,12 +4501,12 @@ function renderByRig(){
    -> back to ready. Anything left is iron that's home but in no bucket,
    which stays as bare track and is named in the line underneath.
 
-   Colours are the app's own, but the ORDER is chosen so no two
-   adjacent segments collide under colour blindness - green beside
+   Colors are the app's own, but the ORDER is chosen so no two
+   adjacent segments collide under color blindness - green beside
    amber is the one pairing to avoid, so blue sits between them.
    Verified with the palette validator: adjacent worst case dE 19.4
    (deutan), 22.0 normal vision. Each segment is also named in text
-   below the bar, so identity is never carried by colour alone. */
+   below the bar, so identity is never carried by color alone. */
 const YARD_COLORS = { ready:'#1E8A29', out:'#3A6EA5', shop:'#B8691C' };
 
 function inventoryBar(r, unaccounted){
@@ -4568,9 +4568,20 @@ function renderInspectionDue(){
   });
   if(lines.length === 0) return '';
 
-  const ready = {};
+  // "Short" counts READY iron only - what's at the yard, inspected, and
+  // could physically go out tomorrow to make the swap.
+  //
+  // Deliberately NOT counted: iron in the shop (that's a third-party queue
+  // with no promised date, so it isn't stock you can commit), and iron out
+  // on other rigs (it's holding a position). Shop is SHOWN though, because
+  // short 4 with 6 in the shop is a different morning from short 4 with an
+  // empty yard.
   const inv = ensureInventoryCount();
-  Object.keys(inv.items||{}).forEach(n=>{ ready[n] = Number(inv.items[n].ready)||0; });
+  const ready = {}, shopped = {};
+  Object.keys(inv.items||{}).forEach(n=>{
+    ready[n]   = Number(inv.items[n].ready)||0;
+    shopped[n] = Number(inv.items[n].shop)||0;
+  });
 
   const groups = {};
   lines.forEach(l=>{
@@ -4611,13 +4622,26 @@ function renderInspectionDue(){
         (g.state === 'expired' ? '' : ` &middot; ${g.daysLeft} day${g.daysLeft!==1?'s':''}`);
 
     const rows = Object.keys(byName).sort().map(n=>{
+      const counted = !!lastCountedFor(n);
       const spare = ready[n] || 0;
+      const inShop = shopped[n] || 0;
       const short = byName[n].qty - spare;
       const where = Object.keys(byName[n].rigs).map(r=>escHtml(r)+(byName[n].rigs[r]>1?` (${byName[n].rigs[r]})`:'')).join(', ');
-      return `<div style="display:grid; grid-template-columns:1fr 78px 78px; gap:8px; padding:6px 0; border-top:1px solid ${tone.line}; font-size:12px; align-items:baseline;">
+
+      // Never counted means we genuinely don't know what's at the yard.
+      // Saying "short 4" there would be a confident number with nothing
+      // behind it, which is worse than admitting the gap.
+      const verdict = !counted
+        ? `<span style="color:#B8691C;">no count on file</span>`
+        : short > 0
+          ? `<span style="color:#B5432A;">short ${short}</span>`
+          : `<span style="color:#1E8A29;">${spare} ready</span>`;
+
+      return `<div style="display:grid; grid-template-columns:1fr 74px 96px; gap:8px; padding:6px 0; border-top:1px solid ${tone.line}; font-size:12px; align-items:baseline;">
         <div><strong>${escHtml(n)}</strong> <span style="color:var(--ink-soft);">&middot; ${where}</span></div>
         <div style="text-align:right; font-family:'IBM Plex Mono',monospace;">${byName[n].qty} out</div>
-        <div style="text-align:right; font-family:'IBM Plex Mono',monospace; color:${short>0?'#B5432A':'#1E8A29'};">${short>0?('short '+short):(spare+' ready')}</div>
+        <div style="text-align:right; font-family:'IBM Plex Mono',monospace;">${verdict}${
+          inShop > 0 ? `<div style="font-size:10px; color:var(--ink-soft); font-weight:400;">+${inShop} in shop</div>` : ''}</div>
       </div>`;
     }).join('');
 
@@ -4637,9 +4661,11 @@ function renderInspectionDue(){
 
   return `<h2 class="section-title" style="margin-top:24px;">Inspection Due</h2>
     <p style="font-size:12px; color:var(--ink-soft); margin-top:0;">
-      Worked out from the band colour on each ticket line — the colour is the month it was inspected,
+      Worked out from the band color on each ticket line — the color is the month it was inspected,
       and the year comes from when that ticket went out. Good for ${inspectionValidityMonths()} months.
-      <strong>Short</strong> means you don't have enough at the yard to swap them out when they run out.
+      <strong>Short</strong> counts iron that's <em>ready</em> at the yard — the only stock you could
+      actually send out tomorrow. Anything at the inspector's is shown separately rather than counted,
+      since that queue has no promised date.
     </p>
     ${order.map(k=>card(groups[k])).join('')}
     ${worst?`<p style="font-size:11px; color:var(--ink-soft); margin-top:2px;">
@@ -4693,7 +4719,7 @@ function renderFullInventory(){
   const totalOnHand = withCount.reduce((s,r)=>s+r.onHand, 0);
   const uncountedOut = rows.filter(r=>r.owned === null).reduce((s,r)=>s+r.out, 0);
   const noCount = rows.filter(r=>r.owned === null).length;
-  const utilisation = totalOwned > 0 ? Math.min(100, Math.round((totalOut/totalOwned)*100)) : 0;
+  const utilization = totalOwned > 0 ? Math.min(100, Math.round((totalOut/totalOwned)*100)) : 0;
   const totalReady = rows.reduce((s,r)=>s+r.ready, 0);
   const totalShop = rows.reduce((s,r)=>s+r.shop, 0);
 
@@ -4755,7 +4781,7 @@ function renderFullInventory(){
       ${yardLegend()}
       ${body}
       <div style="font-size:11px; color:var(--ink-soft); margin-top:12px; line-height:1.5;">
-        ${totalOwned>0?`${utilisation}% of your iron is out on tickets right now. The bar under each item splits that item's whole fleet by where it is. `:''}On Hand means not on a ticket — some of it may still be in the queue for rebuild or paint.
+        ${totalOwned>0?`${utilization}% of your iron is out on tickets right now. The bar under each item splits that item's whole fleet by where it is. `:''}On Hand means not on a ticket — some of it may still be in the queue for rebuild or paint.
         ${(totalReady>0||totalShop>0)?`<br>Returned iron goes into <strong>In Shop</strong> on its own. When the yard says a piece is through paint, tap <strong>Ready &#9656;</strong>.`:''}
         ${noCount>0?`<br><strong style="color:#B8691C;">${noCount} item${noCount!==1?'s have':' has'} no count on file</strong>${uncountedOut>0?` (${uncountedOut} unit${uncountedOut!==1?'s':''} of ${noCount!==1?'them':'it'} out on tickets, not counted in the totals above)`:''} — count the yard, or use Fill From Tickets for a rough floor.`:''}
       </div>
@@ -4824,10 +4850,10 @@ function renderInventory(){
     const pct = hasOwned ? Math.min(100, Math.round((info.totalQty/owned)*100)) : 0;
     const overCapacity = hasOwned && info.totalQty > owned;
     const spare = hasOwned ? (owned - info.totalQty) : null;
-    // The bar used to change colour at 80% out - green below, amber above -
+    // The bar used to change color at 80% out - green below, amber above -
     // with nothing on screen saying so, so it looked like it was making the
     // rule up. Worse, green and amber mean something ELSE in the composition
-    // bars further down this same tab (ready / in shop). One colour, two
+    // bars further down this same tab (ready / in shop). One color, two
     // meanings, one screen.
     //
     // Now the fill is the same blue that means "out on a rig" everywhere
