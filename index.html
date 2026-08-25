@@ -2632,6 +2632,21 @@ const COLOR_SWATCH_MAP = (function(){
   return m;
 })();
 
+/* Which date to resolve a band's year against.
+
+   Normally it's the day the ticket went out - iron is banded before it
+   leaves, so the newest matching month on or before that is the one.
+
+   But iron gets swapped mid-ticket, and the piece that went out last week
+   has nothing to do with a delivery date from January. Without this, a band
+   applied yesterday resolved to the same month LAST year and showed up as
+   already expired - alarming, and wrong in the direction that makes you
+   distrust the screen. A swap stamps the line, and the stamp wins.        */
+function bandReferenceDate(equipLine, ticket){
+  if(equipLine && equipLine.bandSetAt) return equipLine.bandSetAt;
+  return ticket ? ticket.deliveryDate : todayStr();
+}
+
 function bandMonth(name){
   const n = String(name||'').toLowerCase().trim();
   const hit = INSPECTION_BANDS.find(b=>b.name.toLowerCase() === n);
@@ -4440,14 +4455,31 @@ function renderByRig(){
       const days = daysBetween(t.deliveryDate, todayStr());
       const daysLabel = (days === null) ? '—' : String(days);
       const overdue = isTicketOverdue(t);
-      const equipLines = t.equipment.map(e=>`
+      const equipLines = t.equipment.map((e, ei)=>{
+        // The band note now carries its date, so the rig list answers
+        // "when does this run out" without a trip to another tab.
+        const st = bandStatus(e.bandColor, bandReferenceDate(e, t));
+        const bandNote = e.bandColor
+          ? `${colorSwatch(e.bandColor)}${escHtml(e.bandColor)} band` +
+            (st.state === 'expired' ? ` &middot; <span style="color:#B5432A; font-weight:600;">expired ${escHtml(st.expiresLabel)}</span>`
+             : st.state === 'due'   ? ` &middot; <span style="color:#B8691C; font-weight:600;">expires ${escHtml(st.expiresLabel)}</span>`
+             : st.state === 'ok'    ? ` &middot; expires ${escHtml(st.expiresLabel)}`
+             : ` &middot; <span style="color:#B8691C;">date unknown</span>`)
+          : '';
+        const urgent = (st.state === 'expired' || st.state === 'due');
+        return `
         <div class="rig-equip-row">
           <div>
             <div class="rig-equip-name">${escHtml(e.name)} ${e.qty>1?('× '+e.qty):''}${e.serial?` <span style="color:var(--ink-soft); font-family:'IBM Plex Mono',monospace; font-size:11px; font-weight:400;">(S/N ${escHtml(e.serial)})</span>`:''}</div>
-            ${e.bandColor?`<div class="rig-equip-meta">${colorSwatch(e.bandColor)}${escHtml(e.bandColor)} band</div>`:''}
+            ${bandNote?`<div class="rig-equip-meta">${bandNote}</div>`:''}
+          </div>
+          <div style="text-align:right;">
+            <button data-swap-line="${escAttr(t.id)}" data-equip-index="${ei}"
+              title="Swap this iron out for a freshly inspected set"
+              style="background:none; border:1px solid ${urgent?'#E0A9A0':'var(--line)'}; border-radius:5px; padding:4px 9px; font-size:11px; cursor:pointer; font-family:inherit; white-space:nowrap; color:${urgent?'#B5432A':'var(--ink-soft)'};">Swap &#8646;</button>
           </div>
         </div>
-      `).join('');
+      `;}).join('');
       return `
         <div class="rig-ticket-block" ${overdue?'style="border-left:3px solid #B5432A;"':''}>
           <label class="rig-ticket-header">
@@ -4560,7 +4592,7 @@ function renderInspectionDue(){
   (tickets||[]).filter(t=>!t.returnDate).forEach(t=>{
     (t.equipment||[]).forEach(e=>{
       if(!e.name) return;
-      const st = bandStatus(e.bandColor, t.deliveryDate);
+      const st = bandStatus(e.bandColor, bandReferenceDate(e, t));
       if(st.state === 'none') return;
       lines.push({ name:e.name, qty:Number(e.qty)||0, rig:t.rig||'Unassigned rig',
                    ticket:t.ticketNumber||'', band:e.bandColor, st:st });
@@ -7723,6 +7755,81 @@ function attachHandlers(){
     // header and a #bulk-return-btn, and every touched ticket needs
     // t.updatedAt = nowIso() or the server discards the change.
   }
+
+  /* A swap is the movement this business actually makes: iron rides a rig
+     until its band expires, then an identical piece goes out and the expired
+     one comes back for rebuild, inspect and paint.
+
+     The yard ledger can't see it. It works on quantity changes, and a swap
+     changes nothing - same item, same count, same rig - so four pieces
+     coming home and four going out both went unrecorded, leaving Ready too
+     high and the shop queue empty. Which are the two numbers the shortage
+     warning is built on.
+
+     So this moves the buckets directly: the fresh set comes off Ready, the
+     expired set joins the shop queue, and the line takes the new band.
+     Reconcile leaves it alone afterwards because the ticket quantity is
+     untouched - exactly why it never noticed in the first place. */
+  document.querySelectorAll('[data-swap-line]').forEach(btn=>{
+    btn.onclick = async ()=>{
+      const t = tickets.find(x=>x.id === btn.dataset.swapLine);
+      if(!t) return;
+      const ei = parseInt(btn.dataset.equipIndex, 10);
+      const line = (t.equipment||[])[ei];
+      if(!line) return;
+
+      const onRig = Number(line.qty) || 0;
+      if(onRig < 1){ alert('There is no quantity on this line to swap.'); return; }
+
+      const rawQty = prompt(`How many ${line.name} are you swapping out on ${t.rig||'this rig'}?`, String(onRig));
+      if(rawQty === null) return;
+      const qty = parseInt(rawQty, 10);
+      if(!(qty > 0)){ alert('Enter a whole number greater than 0.'); return; }
+      if(qty > onRig){ alert(`Only ${onRig} on this line. Swap ${onRig} or fewer.`); return; }
+
+      const bands = INSPECTION_BANDS.map((b,i)=>`${i+1}. ${b.name} (${MONTH_NAMES[b.month-1]})`).join('\n');
+      const pick = prompt(`Band color on the iron going OUT - the month it was inspected:\n\n${bands}\n\nType the number or the color name.`, '');
+      if(pick === null) return;
+      const typed = String(pick).trim();
+      const byNum = INSPECTION_BANDS[parseInt(typed, 10) - 1];
+      const byName = INSPECTION_BANDS.find(b=>b.name.toLowerCase() === typed.toLowerCase());
+      const band = byNum || byName;
+      if(!band){ alert('That is not one of the twelve band colors. Nothing was changed.'); return; }
+
+      const it = yardEntry(line.name);
+      const readyNow = Number(it.ready) || 0;
+      if(readyNow < qty){
+        const msg = `The yard shows ${readyNow} ${line.name} ready, and you're sending ${qty}.\n\n` +
+          (lastCountedFor(line.name)
+            ? 'Swap anyway? Ready will stop at zero rather than go negative.'
+            : 'This item has never been counted, so that figure may just be missing. Swap anyway?');
+        if(!confirm(msg)) return;
+      }
+
+      // Fresh iron leaves the yard; expired iron joins the shop queue.
+      const sent = Math.min(qty, readyNow);
+      it.ready = readyNow - sent;
+      it.shop  = (Number(it.shop) || 0) + qty;
+
+      if(qty === onRig){
+        line.bandColor = band.name;
+        line.bandSetAt = todayStr();
+      } else {
+        // Partial swap: split the line so each half carries its own band,
+        // or the new date gets claimed by iron still on the rig under the old one.
+        line.qty = onRig - qty;
+        t.equipment.splice(ei + 1, 0, {
+          id: eqid(), name: line.name, serial: '', bandColor: band.name,
+          bandSetAt: todayStr(), qty: qty
+        });
+      }
+
+      t.updatedAt = nowIso();
+      await saveTickets();
+      await saveAppSettings();
+      render();
+    };
+  });
 
   document.querySelectorAll('[data-mark-ready]').forEach(btn=>{
     btn.onclick = async ()=> await markReadyFromShop(btn.dataset.markReady);
