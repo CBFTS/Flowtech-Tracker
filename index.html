@@ -5699,6 +5699,58 @@ function isPerWellInvoice(inv){
   return true;
 }
 
+// Names a well but is charged by the day - twelve days of basket rental on
+// the well it sat on. Kept OUT of the per-well pool on purpose: one of these
+// can legitimately cover several wells, so letting it be consumed like a
+// per-well invoice would let it absorb a genuinely unbilled well and hide it.
+function isDayRateInvoice(inv){
+  if(!inv || !inv.wellName) return false;
+  return inv.statedDays != null;
+}
+
+/* Two invoices, one well name.
+   A well legitimately gets invoiced twice - a re-bill, or charges added
+   after the fact. What is never legitimate is one NAME carrying two
+   different well identifiers. AFE and API are the fields an operator codes
+   against and they are assigned per well, so two of them under a single
+   name means the name is wrong on at least one invoice.
+
+   This is the failure the rest of the check cannot see: six wells, six
+   invoices, every amount right and every AFE right, and three well names
+   copied forward from the first three. Nothing is unbilled, nothing is
+   over-billed, so no alarm fires - the pad just quietly reconciles by
+   count forever instead of by name.
+
+   Deliberately NOT limited by the check's start date. These are found by
+   comparing invoices to each other, not to wells, and the copy-forward is
+   usually older than whatever window is being worked.
+*/
+function duplicateWellNames(invoices){
+  const byName = {};
+  (invoices||[]).forEach(inv=>{
+    const k = normalizeTight(inv && inv.wellName);
+    if(!k) return;
+    (byName[k] = byName[k] || []).push(inv);
+  });
+  const out = [];
+  Object.keys(byName).forEach(k=>{
+    const group = byName[k];
+    if(group.length < 2) return;
+    const ids = {};
+    group.forEach(i=>{
+      const id = normalizeTight(i.afe) + '|' + normalizeTight(i.api);
+      if(id !== '|') ids[id] = true;
+    });
+    if(Object.keys(ids).length < 2) return;   // same well, legitimately re-billed
+    out.push({
+      well: group[0].wellName,
+      rig: group[0].rig || '',
+      invoices: group.map(i=>({ doc: i.docNumber||'', afe: i.afe||'', api: i.api||'', date: i.date||'' }))
+    });
+  });
+  return out;
+}
+
 function buildBillingCheck(){
   const startDate = billingCheckStartDate();
   const invoices = (qbRevenueData && Array.isArray(qbRevenueData.invoices)) ? qbRevenueData.invoices : [];
@@ -5713,6 +5765,8 @@ function buildBillingCheck(){
   // The cutoff still applies to which wells get checked and to the
   // unmarked-invoice list below - just not to what a well may match against.
   const perWell = invoices.filter(isPerWellInvoice);
+  const dayRate = invoices.filter(isDayRateInvoice);
+  const duplicateWells = duplicateWellNames(invoices.filter(i=>i && i.wellName));
 
   // EVERY well marked billed, regardless of date - the cutoff decides what
   // gets REPORTED, not what may match.
@@ -5857,13 +5911,41 @@ function buildBillingCheck(){
     unmatched.push(m);
   });
 
+  // Pass one-and-a-half: a well billed on a day-rate invoice.
+  //
+  // Excluding day-rate invoices from the matching pool protected against one
+  // of them silently absorbing several wells, but it also meant a well billed
+  // ONLY that way could never clear - it sat red in "no invoice" forever,
+  // every time the page opened, with nothing to chase because the work was
+  // invoiced. So match them here, on the NAME only (count evidence is far too
+  // weak to hang a day-rate invoice on), never mark them used so one invoice
+  // can cover the several wells it legitimately covers, and report them in
+  // their own band rather than folding them in silently.
+  const dayRateBilled = [];
+  const stillUnmatched = [];
+  unmatched.forEach(m=>{
+    const mRig = normalizeTight(m.rig);
+    const hit = dayRate.find(inv=>{
+      if(!wellsAgree(m.label, inv.wellName)) return false;
+      return rigsAgree(mRig, normalizeTight(inv.rig));
+    });
+    if(hit){
+      if(m.inRange) dayRateBilled.push({
+        well: m.label, rig: hit.rig || m.rig, doc: hit.docNumber,
+        dates: hit.serviceDates || '', days: hit.statedDays, date: m.date
+      });
+      return;
+    }
+    stillUnmatched.push(m);
+  });
+
   // Pass two: reconcile by COUNT within each pad. Well names are typed by
   // hand in the tracker and typed again on the invoice, so they often don't
   // agree - "1-1H" against "Neal 5103H". Four wells billed on a pad against
   // four spare per-well invoices for that rig reconciles regardless of what
   // anybody called them.
   const byPad = {};
-  unmatched.forEach(m=>{
+  stillUnmatched.forEach(m=>{
     const key = m.ticketId + '|' + m.padId;
     if(!byPad[key]) byPad[key] = [];
     byPad[key].push(m);
@@ -5925,12 +6007,48 @@ function buildBillingCheck(){
   // anything earlier is settled work we've been told not to re-examine.
   const unmarked = perWell.filter((inv,i)=>!usedInvoices.has(i) && (!inv.date || inv.date >= startDate));
 
-  return { missing, tooRecent, unmarked, rigChanged, matchedByCount, perWellCount: perWell.length, markedCount: marked.filter(m=>m.inRange).length, grace: billingCheckGraceDays(), startDate: startDate, isScoped: !!appSettings.billingCheckStartDate };
+  return { missing, tooRecent, unmarked, rigChanged, matchedByCount, dayRateBilled, duplicateWells, perWellCount: perWell.length, markedCount: marked.filter(m=>m.inRange).length, grace: billingCheckGraceDays(), startDate: startDate, isScoped: !!appSettings.billingCheckStartDate };
+}
+
+function renderDuplicateWellBand(c){
+  const list = (c && c.duplicateWells) || [];
+  if(!list.length) return '';
+  const n = list.length;
+  return `<div style="background:#FFF8E6; border:1.5px solid #E6D080; border-radius:8px; padding:14px 16px; margin-bottom:12px;">
+    <div style="font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; font-size:13px; color:#8A6D10; font-weight:600; margin-bottom:4px;">
+      ${n} well name${n!==1?'s':''} on more than one invoice
+    </div>
+    <div style="font-size:12px; color:#8A6D10; margin-bottom:8px;">
+      Each of these names appears on two or more invoices carrying <strong>different AFE or API numbers</strong> &mdash; so they are different wells wearing the same name. The amounts are unaffected; the name is wrong on at least one. Usually an invoice copied forward without the well name being changed.
+    </div>
+    ${list.map(d=>`<div style="padding:8px 0; border-top:1px solid #E6D080; font-size:13px;">
+      <div style="font-weight:600;">${escHtml(d.well||'(no well name)')}${d.rig?` <span style="font-weight:400; color:#8A6D10;">&middot; ${escHtml(d.rig)}</span>`:''}</div>
+      ${d.invoices.map(i=>`<div style="font-size:11px; color:#8A6D10; padding-top:3px;">
+        ${escHtml(i.doc||'invoice')}${i.afe?' &middot; AFE '+escHtml(i.afe):''}${i.api?' &middot; API '+escHtml(i.api):''}${i.date?' &middot; '+escHtml(i.date):''}
+      </div>`).join('')}
+    </div>`).join('')}
+  </div>`;
+}
+
+function renderDayRateBand(c){
+  const list = (c && c.dayRateBilled) || [];
+  if(!list.length) return '';
+  const n = list.length;
+  return `<div style="background:#EEF4EE; border:1.5px solid #B7D9BB; border-radius:8px; padding:12px 14px; margin-bottom:12px;">
+    <div style="font-size:12px; color:#2E5B34;">
+      <strong>${n} well${n!==1?'s':''} billed on a day-rate invoice.</strong>
+      Charged by the day rather than per well, and the invoice names the well. Counted as billed &mdash; nothing to chase.
+    </div>
+    ${list.map(r=>`<div style="padding:6px 0; border-top:1px dashed #B7D9BB; font-size:12px;">
+      <span style="font-weight:600;">${escHtml(r.well||'(no name)')}</span>
+      <span style="color:#5B6660;"> &middot; ${escHtml(r.doc||'invoice')}${r.days?' &middot; '+r.days+' day'+(r.days!==1?'s':''):''}${r.dates?' &middot; '+escHtml(r.dates):''}</span>
+    </div>`).join('')}
+  </div>`;
 }
 
 function renderBillingCheckFooter(c){
   return `<div style="font-size:11px; color:var(--ink-soft); line-height:1.5; margin-top:10px;">
-    Compares wells marked billed in the tracker against per-well invoices in QuickBooks, matching on rig and well name. Day-rate invoices and generator rentals are left out — they don't map one to one with wells.
+    Compares wells marked billed in the tracker against invoices in QuickBooks, matching on rig and well name. Generator rentals are left out — they name no well. A day-rate invoice counts when it names the well, and is listed separately, since one can cover several wells.
     ${c.tooRecent.length?`<br>${c.tooRecent.length} well${c.tooRecent.length!==1?'s':''} marked in the last ${c.grace} days ${c.tooRecent.length!==1?'are':'is'} still inside the grace window.`:''}
     <div style="display:flex; align-items:center; gap:8px; margin-top:8px; flex-wrap:wrap;">
       <span>Checking from</span>
@@ -5951,7 +6069,9 @@ function renderBillingCheck(){
 
   const heading = `<h2 class="section-title" style="margin-top:24px;">Billing Check</h2>`;
 
-  if(c.missing.length === 0 && c.unmarked.length === 0){
+  // Duplicated well names are a real finding, so they must not sit under a
+  // banner reading "Everything lines up".
+  if(c.missing.length === 0 && c.unmarked.length === 0 && c.duplicateWells.length === 0){
     return `${heading}
       <div style="background:#EEF4EE; border:1.5px solid #B7D9BB; border-radius:8px; padding:14px 16px; font-size:13px;">
         <strong style="color:#1E8A29;">Everything lines up.</strong>
@@ -5960,6 +6080,8 @@ function renderBillingCheck(){
           ${c.tooRecent.length?`${c.tooRecent.length} marked in the last ${c.grace} days ${c.tooRecent.length!==1?'are':'is'} not checked yet.`:''}
         </div>
       </div>
+      ${renderDuplicateWellBand(c)}
+      ${renderDayRateBand(c)}
       ${c.rigChanged.length?`<div style="background:#EEF4EE; border:1.5px solid #B7D9BB; border-radius:8px; padding:12px 14px; margin-top:10px; font-size:12px; color:#2E5B34;">
         <strong>${c.rigChanged.length} well${c.rigChanged.length!==1?'s':''} matched under a different rig</strong> — ${c.rigChanged.map(r=>escHtml(r.well)+' (invoiced as '+escHtml(r.invoiceRig)+')').join(', ')}. Normal after a rig transfer.
       </div>`:''}
@@ -5997,6 +6119,9 @@ function renderBillingCheck(){
       ${c.unmarked.length>15?`<div style="font-size:11px; color:#8A6D10; padding-top:6px;">Showing the first 15 of ${c.unmarked.length}.</div>`:''}
     </div>`;
   }
+
+  out += renderDuplicateWellBand(c);
+  out += renderDayRateBand(c);
 
   if(c.matchedByCount.length > 0){
     out += `<div style="background:#EEF4EE; border:1.5px solid #B7D9BB; border-radius:8px; padding:12px 14px; margin-bottom:12px;">
