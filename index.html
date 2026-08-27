@@ -1217,7 +1217,7 @@ function countableItemNames(){
   (equipmentCatalog||[]).forEach(n=>{ if(n) names.add(n); });
   Object.keys(outQtyByName()).forEach(n=>names.add(n));
   if(countSession && countSession.items) Object.keys(countSession.items).forEach(n=>names.add(n));
-  return Array.from(names).sort((a,b)=>a.localeCompare(b));
+  return Array.from(names).sort(compareEquipNames);
 }
 
 function startCountSession(){
@@ -1967,7 +1967,7 @@ function peakConcurrentByItem(){
 function seedProposal(){
   const peaks = peakConcurrentByItem();
   const blanks = [], conflicts = [], fine = [];
-  Object.keys(peaks).sort((a,b)=>a.localeCompare(b)).forEach(name=>{
+  Object.keys(peaks).sort(compareEquipNames).forEach(name=>{
     const p = peaks[name];
     if(p.peak <= 0) return;
     const owned = equipmentOwned[name];
@@ -2210,7 +2210,7 @@ function printCountSheet(){
   // is supposed to surface.
   const names = Array.from(new Set(
     (equipmentCatalog||[]).concat(Object.keys(outByName))
-  )).filter(Boolean).sort((a,b)=>a.localeCompare(b));
+  )).filter(Boolean).sort(compareEquipNames);
 
   const symbolSvg = document.querySelector('svg.logo-symbol') ? document.querySelector('svg.logo-symbol').outerHTML : '';
   const nameSvg = document.querySelector('svg.logo-name') ? document.querySelector('svg.logo-name').outerHTML : '';
@@ -4094,7 +4094,7 @@ function renderBillingStatus(){
 }
 
 function renderNewTicket(){
-  const catalogOptions = equipmentCatalog.slice().sort((a,b)=>a.localeCompare(b))
+  const catalogOptions = equipmentCatalog.slice().sort(compareEquipNames)
     .map(name=>`<option value="${escAttr(name)}">${escHtml(name)}</option>`).join('');
   const colorOptions = colorCatalog.slice()
     .map(name=>`<option value="${escAttr(name)}">${escHtml(name)}</option>`).join('');
@@ -4135,7 +4135,7 @@ function renderNewTicket(){
     <div class="manage-catalog">
       <label style="display:block;margin-bottom:8px;">Manage equipment list</label>
       <p style="font-size:11px; color:var(--ink-soft); margin:-4px 0 8px 0;">Set "Total Owned" to see utilization (how much of your fleet is out) in the Inventory tab. Leave blank if you don't want to track it for that item.</p>
-      ${equipmentCatalog.slice().sort((a,b)=>a.localeCompare(b)).map(name=>`
+      ${equipmentCatalog.slice().sort(compareEquipNames).map(name=>`
         <div class="catalog-item">
           <span>${escHtml(name)}</span>
           <span style="display:flex; align-items:center; gap:8px;">
@@ -4767,7 +4767,7 @@ function renderInspectionDue(){
       : (g.state === 'expired' ? 'Expired ' : 'Expires ') + g.label +
         (g.state === 'expired' ? '' : ` &middot; ${g.daysLeft} day${g.daysLeft!==1?'s':''}`);
 
-    const rows = Object.keys(byName).sort().map(n=>{
+    const rows = Object.keys(byName).sort(compareEquipNames).map(n=>{
       const counted = !!lastCountedFor(n);
       const spare = ready[n] || 0;
       const inShop = shopped[n] || 0;
@@ -4826,7 +4826,7 @@ function renderFullInventory(){
   Object.keys(out).forEach(n=>names.add(n));
   Object.keys(equipmentOwned||{}).forEach(n=>names.add(n));
 
-  let rows = Array.from(names).sort((a,b)=>a.localeCompare(b)).map(name=>{
+  let rows = Array.from(names).sort(compareEquipNames).map(name=>{
     const ownedRaw = equipmentOwned[name];
     const owned = (ownedRaw != null && ownedRaw !== '') ? Number(ownedRaw) : null;
     const outQty = out[name] || 0;
@@ -4999,7 +4999,7 @@ function renderInventory(){
     });
   });
 
-  let names = Object.keys(byName).sort((a,b)=>a.localeCompare(b));
+  let names = Object.keys(byName).sort(compareEquipNames);
   if(inventorySearchTerm){
     const s = inventorySearchTerm.toLowerCase();
     names = names.filter(n=>n.toLowerCase().includes(s));
@@ -5102,6 +5102,38 @@ function renderInventory(){
 // "Neal 5104H", "neal 5104 h" and "NEAL-5104-H" all become "neal5104h".
 function normalizeTight(s){
   return String(s||'').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+/* ── EQUIPMENT NAME ORDER ──────────────────────────────────────────
+   Equipment names lead with a casing size: 5 1/2", 7 5/8", 13 3/8".
+   Sorted as plain text those come out 10 3/4, 11 3/4, 13 3/8, 5 1/2, 6,
+   7 5/8, 7 - because "1" sorts before "5", and the space in 7 5/8 sorts
+   before the quote mark in 7". Nobody reads a rack that way.
+
+   So pull the leading size out as a number - whole plus fraction - and
+   sort on that first. Items with no size (Cementation Equipment Basket)
+   go after the sized ones, alphabetically. Same size, different item
+   falls back to the name, which keeps 8 RD and BTC of one size together.
+*/
+function equipSize(name){
+  const m = String(name||'').trim().match(/^(\d+)(?:\s+(\d+)\s*\/\s*(\d+))?\s*(?:"|''|in\b|inch\b)/i);
+  if(!m) return null;
+  const whole = Number(m[1]);
+  if(!isFinite(whole)) return null;
+  const num = m[2] ? Number(m[2]) : 0;
+  const den = m[3] ? Number(m[3]) : 0;
+  return (den > 0) ? whole + (num / den) : whole;
+}
+
+function compareEquipNames(a, b){
+  const sa = equipSize(a), sb = equipSize(b);
+  if(sa !== null && sb === null) return -1;   // sized iron first
+  if(sa === null && sb !== null) return 1;
+  if(sa !== null && sb !== null && sa !== sb) return sa - sb;
+  // Plain compare, not numeric: within one size it puts the pup joint first
+  // and leaves the 8 RD and BTC swages of that size next to each other.
+  // Numeric ordering read "20#" as twenty and split the two swages apart.
+  return String(a||'').localeCompare(String(b||''), undefined, { sensitivity: 'base' });
 }
 
 function normalizeForMatch(s){
