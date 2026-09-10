@@ -924,7 +924,7 @@ function matchInvoiceRule(inv){
 }
 
 let syncStatus = 'idle'; // idle | saving | loading | ok | error
-const APP_BUILD = '151';  // shown in the sync panel - bump on every release
+const APP_BUILD = '152';  // shown in the sync panel - bump on every release
 let pushInProgress = false; // true while a push is in flight — blocks auto-pull to prevent race conditions
 // Bumped by every local save. pullFromCloud captures it before its fetch and
 // re-checks it after: pushInProgress only stops a pull STARTING mid-push, it
@@ -6054,9 +6054,23 @@ function buildBillingCheck(){
   // lagging behind, which is the harmless direction.
   // Only invoices from the cutoff forward are worth reporting as unmarked -
   // anything earlier is settled work we've been told not to re-examine.
-  const unmarked = perWell.filter((inv,i)=>!usedInvoices.has(i) && (!inv.date || inv.date >= startDate));
+  const spare = perWell.filter((inv,i)=>!usedInvoices.has(i) && (!inv.date || inv.date >= startDate));
 
-  return { missing, tooRecent, unmarked, rigChanged, matchedByCount, duplicateWells, perWellCount: perWell.length, markedCount: marked.filter(m=>m.inRange).length, grace: billingCheckGraceDays(), startDate: startDate, isScoped: !!appSettings.billingCheckStartDate };
+  // A well can legitimately carry TWO invoices - iron gets swapped mid-well,
+  // so a second rental period on the same well is billed separately. The
+  // tracker holds one "well billed" entry per well (the pad's x-of-y count
+  // depends on that), so the second invoice has nothing left to claim it and
+  // used to be reported as "not marked billed" - pointing at the tracker when
+  // the tracker was right. Split them: an orphan whose well IS marked is a
+  // second invoice, not a missed one.
+  const unmarked = [];        // no marked well by this name - worth chasing
+  const extraInvoices = [];   // well already matched - a swap or a re-bill
+  spare.forEach(inv=>{
+    const seen = marked.some(m=>m.label && wellsAgree(m.label, inv.wellName));
+    (seen ? extraInvoices : unmarked).push(inv);
+  });
+
+  return { missing, tooRecent, unmarked, extraInvoices, rigChanged, matchedByCount, duplicateWells, perWellCount: perWell.length, markedCount: marked.filter(m=>m.inRange).length, grace: billingCheckGraceDays(), startDate: startDate, isScoped: !!appSettings.billingCheckStartDate };
 }
 
 function renderDuplicateWellBand(c){
@@ -6075,6 +6089,22 @@ function renderDuplicateWellBand(c){
       ${d.invoices.map(i=>`<div style="font-size:11px; color:#8A6D10; padding-top:3px;">
         ${escHtml(i.doc||'invoice')}${i.afe?' &middot; AFE '+escHtml(i.afe):''}${i.api?' &middot; API '+escHtml(i.api):''}${i.date?' &middot; '+escHtml(i.date):''}
       </div>`).join('')}
+    </div>`).join('')}
+  </div>`;
+}
+
+function renderExtraInvoiceBand(c){
+  const list = (c && c.extraInvoices) || [];
+  if(!list.length) return '';
+  const n = list.length;
+  return `<div style="background:#EEF4EE; border:1.5px solid #B7D9BB; border-radius:8px; padding:12px 14px; margin-bottom:12px;">
+    <div style="font-size:12px; color:#2E5B34;">
+      <strong>${n} second invoice${n!==1?'s':''} for a well already matched.</strong>
+      The well is marked billed and matched another invoice, so this one is over and above it &mdash; normally an equipment swap that started a fresh rental period on the same well, or a re-bill. Nothing missing in the tracker.
+    </div>
+    ${list.map(inv=>`<div style="padding:6px 0; border-top:1px dashed #B7D9BB; font-size:12px;">
+      <span style="font-weight:600;">${escHtml(inv.wellName||'(no well name)')}</span>
+      <span style="color:#5B6660;"> &middot; ${escHtml(inv.rig||'no rig')} &middot; ${escHtml(inv.docNumber||'')} &middot; ${escHtml(inv.date||'')}</span>
     </div>`).join('')}
   </div>`;
 }
@@ -6114,6 +6144,7 @@ function renderBillingCheck(){
         </div>
       </div>
       ${renderDuplicateWellBand(c)}
+      ${renderExtraInvoiceBand(c)}
       ${c.rigChanged.length?`<div style="background:#EEF4EE; border:1.5px solid #B7D9BB; border-radius:8px; padding:12px 14px; margin-top:10px; font-size:12px; color:#2E5B34;">
         <strong>${c.rigChanged.length} well${c.rigChanged.length!==1?'s':''} matched under a different rig</strong> — ${c.rigChanged.map(r=>escHtml(r.well)+' (invoiced as '+escHtml(r.invoiceRig)+')').join(', ')}. Normal after a rig transfer.
       </div>`:''}
@@ -6153,6 +6184,7 @@ function renderBillingCheck(){
   }
 
   out += renderDuplicateWellBand(c);
+  out += renderExtraInvoiceBand(c);
 
   if(c.matchedByCount.length > 0){
     out += `<div style="background:#EEF4EE; border:1.5px solid #B7D9BB; border-radius:8px; padding:12px 14px; margin-bottom:12px;">
