@@ -5924,9 +5924,20 @@ function buildBillingCheck(){
     if(!wa.length || !wb.length) return false;
     return wa.some(x=>wb.some(y=>nearWord(x, y)));
   };
-  const rigsAgree = (a, b)=>{
+  // Takes the ORIGINAL spellings, not normalized ones. sameRigName splits a
+  // rig into a contractor word and a number, and normalizeTight has already
+  // thrown away the space that separates them: "Ensign T124" becomes
+  // "ensignt124", whose word token is "ensignt" and no longer equals the
+  // "ensign" from "Ensign 124". Feeding it pre-normalized text quietly
+  // disabled the whole token comparison, so a rig invoiced under a slightly
+  // different spelling kept getting reported as a different rig - and
+  // renaming the rig in the tracker could not fix it, because the two names
+  // still failed to compare.
+  const rigsAgree = (rawA, rawB)=>{
+    const a = normalizeTight(rawA), b = normalizeTight(rawB);
     if(!a || !b) return true; // one side silent - the well name carries it
-    return a === b || a.indexOf(b) !== -1 || b.indexOf(a) !== -1 || sameRigName(a, b);
+    if(a === b || a.indexOf(b) !== -1 || b.indexOf(a) !== -1) return true;
+    return sameRigName(rawA, rawB);
   };
 
   // Pass one: match on names. Anything that fails is set aside rather than
@@ -5944,7 +5955,7 @@ function buildBillingCheck(){
     let idx = perWell.findIndex((inv,i)=>{
       if(usedInvoices.has(i)) return false;
       if(!wellsAgree(m.label, inv.wellName)) return false;
-      return rigsAgree(mRig, normalizeTight(inv.rig));
+      return rigsAgree(m.rig, inv.rig);
     });
 
     // The well name alone. Specific enough to stand by itself, and the rig
@@ -5967,7 +5978,7 @@ function buildBillingCheck(){
       }
       if(viaWellOnly){
         const inv = perWell[idx];
-        if(inv.rig && m.rig && !rigsAgree(mRig, normalizeTight(inv.rig))){
+        if(inv.rig && m.rig && !rigsAgree(m.rig, inv.rig)){
           rigChanged.push({ well: m.label, trackerRig: m.rig, invoiceRig: inv.rig, doc: inv.docNumber, date: m.date });
         }
       }
