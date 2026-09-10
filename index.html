@@ -925,6 +925,13 @@ function matchInvoiceRule(inv){
 
 let syncStatus = 'idle'; // idle | saving | loading | ok | error
 let pushInProgress = false; // true while a push is in flight — blocks auto-pull to prevent race conditions
+// Bumped by every local save. pullFromCloud captures it before its fetch and
+// re-checks it after: pushInProgress only stops a pull STARTING mid-push, it
+// does nothing about a pull already in flight when the user changes something.
+// That pull returns with data predating the change and overwrites it - the
+// well that appears, vanishes, then comes back on the next sync.
+let localChangeSeq = 0;
+function noteLocalChange(){ localChangeSeq++; }
 let showSyncPanel = false;
 let autoSyncTimer = null;
 
@@ -2833,6 +2840,7 @@ async function loadCatalog(){
 }
 
 async function saveCatalog(){
+  noteLocalChange();
   stampStore('catalog');
   try{
     localStorage.setItem(CATALOG_KEY, JSON.stringify(equipmentCatalog));
@@ -2853,6 +2861,7 @@ async function loadEquipmentOwned(){
 }
 
 async function saveEquipmentOwned(){
+  noteLocalChange();
   stampStore('equipmentOwned');
   try{
     localStorage.setItem(EQUIPMENT_OWNED_KEY, JSON.stringify(equipmentOwned));
@@ -3011,6 +3020,7 @@ function stampChangedSettingKeys(){
 }
 
 async function saveAppSettings(){
+  noteLocalChange();
   if(serverSupportsPerKeyStamps()) stampChangedSettingKeys();
   else {
     // Older script, or nothing heard from it yet. Whole-object stamping is
@@ -3049,6 +3059,7 @@ async function loadColorCatalog(){
 }
 
 async function saveColorCatalog(){
+  noteLocalChange();
   stampStore('colorCatalog');
   try{
     localStorage.setItem(COLOR_CATALOG_KEY, JSON.stringify(colorCatalog));
@@ -3069,6 +3080,7 @@ async function loadRigCatalog(){
 }
 
 async function saveRigCatalog(){
+  noteLocalChange();
   stampStore('rigCatalog');
   try{
     localStorage.setItem(RIG_CATALOG_KEY, JSON.stringify(rigCatalog));
@@ -3089,6 +3101,7 @@ async function loadArchivedRigs(){
 }
 
 async function saveArchivedRigs(){
+  noteLocalChange();
   stampStore('archivedRigs');
   try{
     localStorage.setItem(ARCHIVED_RIGS_KEY, JSON.stringify(archivedRigs));
@@ -3109,6 +3122,7 @@ async function loadCustomerCatalog(){
 }
 
 async function saveCustomerCatalog(){
+  noteLocalChange();
   stampStore('customerCatalog');
   try{
     localStorage.setItem(CUSTOMER_CATALOG_KEY, JSON.stringify(customerCatalog));
@@ -3138,6 +3152,7 @@ async function loadTemplates(){
 }
 
 async function saveTemplates(){
+  noteLocalChange();
   stampStore('templateCatalog');
   try{
     localStorage.setItem(TEMPLATE_KEY, JSON.stringify(templateCatalog));
@@ -3269,10 +3284,21 @@ async function pullFromCloud(silent, force){
   if(!silent) syncStatus = 'loading';
   render();
   try{
+    const seqAtStart = localChangeSeq;
     const res = await fetch(withToken(syncUrl), { method: 'GET' });
     if(!res.ok) throw new Error('Bad response');
     const data = await res.json();
     if(data && data.error === 'unauthorized'){ showSyncTokenWarning(); throw new Error('unauthorized'); }
+    // Something was saved locally while this request was in the air, so this
+    // response is already out of date. Applying it would wipe that change.
+    // Drop it and push instead - the next pull will bring the merged truth.
+    if(localChangeSeq !== seqAtStart && !force){
+      console.warn('Discarding pull - local changes landed while it was in flight.');
+      syncStatus = 'ok';
+      render();
+      await pushToCloud();
+      return;
+    }
     noteServerProtocol(data.protocol);
     if(Array.isArray(data.tickets)){
       // Photos and hand-drawn signatures made ON THIS DEVICE are never sent
@@ -3603,6 +3629,7 @@ async function loadTickets(){
 }
 
 async function saveTickets(){
+  noteLocalChange();
   try{
     localStorage.setItem(STORAGE_KEY, JSON.stringify(tickets));
   }catch(e){
