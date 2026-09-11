@@ -924,7 +924,7 @@ function matchInvoiceRule(inv){
 }
 
 let syncStatus = 'idle'; // idle | saving | loading | ok | error
-const APP_BUILD = '152';  // shown in the sync panel - bump on every release
+const APP_BUILD = '153';  // shown in the sync panel - bump on every release
 let pushInProgress = false; // true while a push is in flight — blocks auto-pull to prevent race conditions
 // Bumped by every local save. pullFromCloud captures it before its fetch and
 // re-checks it after: pushInProgress only stops a pull STARTING mid-push, it
@@ -2367,6 +2367,251 @@ function printCountSheet(){
   </div>
   <div class="print-footer">
     <span>Flow-Tech Systems LLC &middot; ${names.length} item${names.length!==1?'s':''} &middot; ${totalOwned} on file &middot; ${totalOut} out</span>
+    <span>Printed ${printedAt}</span>
+  </div>
+</body>
+</html>`;
+
+  printWindow.document.write(html);
+  printWindow.document.close();
+  setTimeout(()=>{ printWindow.focus(); printWindow.print(); }, 400);
+}
+
+// A read-only picture of the yard for somebody who doesn't run the app.
+// It answers one question - what could go out tomorrow - and then says
+// where the rest of the iron is, so the answer can be trusted without
+// opening the tracker to check it.
+function printInventorySheet(){
+  const outQty = outQtyByName();
+  const inv = ensureInventoryCount();
+
+  const names = new Set();
+  (equipmentCatalog||[]).forEach(n=>{ if(n) names.add(n); });
+  Object.keys(outQty).forEach(n=>names.add(n));
+  Object.keys(equipmentOwned||{}).forEach(n=>names.add(n));
+  Object.keys(inv.items||{}).forEach(n=>names.add(n));
+
+  const all = Array.from(names).filter(Boolean).sort(compareEquipNames).map(name=>{
+    const ownedRaw = equipmentOwned[name];
+    const owned = (ownedRaw != null && ownedRaw !== '') ? Number(ownedRaw) : null;
+    const gone = outQty[name] || 0;
+    const y = inv.items[name] || { ready:0, shop:0 };
+    const ready = Number(y.ready)||0;
+    const shop = Number(y.shop)||0;
+    const onHand = owned === null ? null : owned - gone;
+    // Home, but in neither yard bucket - never counted, or back before the
+    // shop queue existed. Negative means MORE is marked ready than is
+    // actually home, which is a different problem and gets said differently.
+    const gap = (onHand !== null && (ready>0 || shop>0)) ? (onHand - ready - shop) : 0;
+    // A zero in a bucket only means zero if the item has ever been placed
+    // in the buckets at all. Otherwise it means nobody has said - and a
+    // printed 0 under Ready would read as "we have none", which is worse
+    // than saying nothing.
+    return { name, owned, out: gone, ready, shop, onHand, bucketed: (ready>0 || shop>0),
+             unplaced: gap > 0 ? gap : 0, overplaced: gap < 0 ? -gap : 0 };
+  });
+
+  // A catalogue line with no count, nothing out and nothing in either yard
+  // bucket says nothing at all about availability. It gets counted in the
+  // footer rather than padding the table with dashes.
+  const rows = all.filter(r=>r.owned !== null || r.out > 0 || r.ready > 0 || r.shop > 0);
+  const silent = all.length - rows.length;
+
+  const symbolSvg = document.querySelector('svg.logo-symbol') ? document.querySelector('svg.logo-symbol').outerHTML : '';
+  const nameSvg = document.querySelector('svg.logo-name') ? document.querySelector('svg.logo-name').outerHTML : '';
+  const printedAt = new Date().toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+
+  const statusFor = (r)=>{
+    if(r.owned === null) return '<span class="warn">no count on file</span>';
+    if(r.overplaced) return `<span class="bad">${r.overplaced} more marked ready than are home</span>`;
+    if(r.onHand <= 0 && r.owned > 0) return '<span class="bad">all out</span>';
+    if(r.unplaced) return `<span class="warn">${r.unplaced} not yet placed</span>`;
+    if(r.shop > 0 && r.ready === 0) return '<span class="warn">all home iron in shop</span>';
+    return '';
+  };
+
+  const body = rows.map((r,i)=>`<tr class="${i%2===1?'alt-row':''}">
+      <td>${escHtml(r.name)}</td>
+      <td class="num">${r.owned === null ? '<span class="warn">—</span>' : r.owned}</td>
+      <td class="num out">${r.out || '—'}</td>
+      <td class="num home">${r.onHand === null ? '—' : r.onHand}</td>
+      <td class="num ready">${r.bucketed ? r.ready : '—'}</td>
+      <td class="num shop">${r.bucketed ? r.shop : '—'}</td>
+      <td class="status">${statusFor(r)}</td>
+    </tr>`).join('');
+
+  // Where the out iron actually is. Without this the sheet says 14 are out
+  // and stops, which is the point at which somebody phones to ask.
+  const openTickets = tickets.filter(t=>!t.returnDate);
+  const rigs = {};
+  openTickets.forEach(t=>{
+    const key = t.rig || 'Unassigned rig';
+    if(!rigs[key]) rigs[key] = { rig:key, customer:t.customer||'', qty:0, items:{}, since:t.deliveryDate||'' };
+    (t.equipment||[]).forEach(e=>{
+      const n = e.name || 'Unnamed';
+      const q = Number(e.qty)||0;
+      rigs[key].items[n] = (rigs[key].items[n]||0) + q;
+      rigs[key].qty += q;
+    });
+    if(t.deliveryDate && (!rigs[key].since || t.deliveryDate < rigs[key].since)) rigs[key].since = t.deliveryDate;
+  });
+  const rigList = Object.keys(rigs).sort((a,b)=>rigs[b].qty - rigs[a].qty);
+  const outRows = rigList.map((k,i)=>{
+    const g = rigs[k];
+    const items = Object.keys(g.items).sort(compareEquipNames)
+      .map(n=>`${escHtml(n)} <span class="q">&times;${g.items[n]}</span>`).join(' &nbsp;&middot;&nbsp; ');
+    return `<tr class="${i%2===1?'alt-row':''}">
+      <td><strong>${escHtml(g.rig)}</strong><div class="sub">${escHtml(g.customer||'—')}${g.since?` &middot; out since ${fmtDate(g.since)}`:''}</div></td>
+      <td class="num out">${g.qty}</td>
+      <td class="items">${items}</td>
+    </tr>`;
+  }).join('');
+
+  const counted = rows.filter(r=>r.owned !== null);
+  const totalOwned = counted.reduce((s,r)=>s+r.owned, 0);
+  const totalOut = counted.reduce((s,r)=>s+r.out, 0);
+  const totalHome = counted.reduce((s,r)=>s+r.onHand, 0);
+  const totalReady = rows.reduce((s,r)=>s+r.ready, 0);
+  const totalShop = rows.reduce((s,r)=>s+r.shop, 0);
+  const anyBuckets = (totalReady + totalShop) > 0;
+  const noCount = rows.filter(r=>r.owned === null).length;
+
+  const printWindow = window.open('', '_blank', 'width=850,height=1100');
+  if(!printWindow){
+    alert('Your browser blocked the print window. Please allow pop-ups for this page and try again.');
+    return;
+  }
+
+  const html = `
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Inventory Availability</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: 'Inter', Arial, sans-serif;
+    color: #1B211C;
+    max-width: 780px;
+    margin: 0 auto;
+    padding: 36px;
+    border: 1px solid #D3DED4;
+  }
+  .print-header {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    border-bottom: 4px solid #33D63A; padding-bottom: 16px; margin-bottom: 8px;
+  }
+  .print-header .logos { display: flex; align-items: center; gap: 14px; }
+  .print-header svg.logo-symbol { height: 46px; width: auto; }
+  .print-header svg.logo-name { height: 24px; width: auto; }
+  .sheet-badge {
+    font-family: 'IBM Plex Mono', monospace;
+    background: #14181A; color: #33D63A;
+    padding: 8px 16px; border-radius: 6px; font-size: 13px;
+    letter-spacing: 1px; white-space: nowrap;
+  }
+  h1 {
+    font-family: 'Oswald', sans-serif; font-weight: 600; font-size: 20px;
+    text-transform: uppercase; letter-spacing: 2px; margin: 22px 0 4px 0; color: #14181A;
+  }
+  h2 {
+    font-family: 'Oswald', sans-serif; font-weight: 600; font-size: 14px;
+    text-transform: uppercase; letter-spacing: 1.5px; margin: 26px 0 8px 0; color: #14181A;
+  }
+  .contact { font-family:'IBM Plex Mono',monospace; font-size:10px; color:#5B6660; margin-bottom:4px; }
+  .cards { display:grid; grid-template-columns:repeat(5,1fr); gap:8px; margin:14px 0 18px 0; }
+  .card { border:1px solid #E8EDE8; border-radius:8px; padding:10px 8px; background:#FAFCF9; text-align:center; }
+  .card .n { font-family:'Oswald',sans-serif; font-size:22px; font-weight:600; line-height:1.1; }
+  .card .l { font-family:'IBM Plex Mono',monospace; font-size:8.5px; text-transform:uppercase;
+             letter-spacing:0.5px; color:#5B6660; margin-top:3px; }
+  table { width: 100%; border-collapse: collapse; margin-bottom: 8px; }
+  th {
+    text-align: left; font-family: 'IBM Plex Mono', monospace; font-size: 9.5px;
+    text-transform: uppercase; letter-spacing: 0.5px;
+    background: #14181A; color: #F4F7F4; padding: 9px 8px;
+  }
+  th.num, td.num { text-align: center; }
+  td { padding: 0 8px; border-bottom: 1px solid #E8EDE8; font-size: 12.5px; height: 28px; }
+  tr.alt-row td { background: #FAFCF9; }
+  td.home  { font-weight:600; }
+  td.ready { font-weight:600; color:#1E8A29; }
+  td.shop  { color:#B8691C; }
+  td.out   { color:#3A6EA5; }
+  td.status { font-size:10.5px; color:#5B6660; }
+  .warn { color:#B8691C; }
+  .bad  { color:#B5432A; font-weight:500; }
+  td.items { font-size:10.5px; color:#5B6660; line-height:1.5; padding:6px 8px; }
+  td.items .q { font-family:'IBM Plex Mono',monospace; color:#1B211C; }
+  td .sub { font-size:10px; color:#5B6660; font-weight:400; margin-top:1px; }
+  .note {
+    font-size: 11px; color: #5B6660; border-top: 1.5px dashed #D3DED4;
+    padding-top: 10px; margin-top: 6px; line-height: 1.55;
+  }
+  .print-footer {
+    display: flex; justify-content: space-between;
+    font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #5B6660;
+    border-top: 1px solid #E8EDE8; padding-top: 10px; margin-top: 14px;
+  }
+  @media print {
+    body { border: none; padding: 0; }
+    tr { page-break-inside: avoid; }
+    h2 { page-break-after: avoid; break-after: avoid; }
+    thead { display: table-header-group; }
+  }
+</style>
+</head>
+<body>
+  <div class="print-header">
+    <div class="logos">${symbolSvg}${nameSvg}</div>
+    <div class="sheet-badge">INVENTORY</div>
+  </div>
+  <div class="contact">985-860-9919 &middot; chrisbull@flow-techsystemsllc.com</div>
+  <h1>Inventory &amp; Availability</h1>
+  <div class="cards">
+    <div class="card"><div class="n">${totalOwned}</div><div class="l">Owned</div></div>
+    <div class="card"><div class="n" style="color:#3A6EA5;">${totalOut}</div><div class="l">Out On Rigs</div></div>
+    <div class="card"><div class="n">${totalHome}</div><div class="l">At The Yard</div></div>
+    <div class="card"><div class="n" style="color:#1E8A29;">${totalReady}</div><div class="l">Ready To Go</div></div>
+    <div class="card"><div class="n" style="color:#B8691C;">${totalShop}</div><div class="l">In Shop</div></div>
+  </div>
+  ${rows.length ? `<table>
+    <thead>
+      <tr>
+        <th>Equipment</th>
+        <th class="num">Owned</th>
+        <th class="num">Out</th>
+        <th class="num">At Yard</th>
+        <th class="num">Ready</th>
+        <th class="num">In Shop</th>
+        <th>Status</th>
+      </tr>
+    </thead>
+    <tbody>${body}</tbody>
+  </table>` : `<div class="note" style="border-top:none; margin-top:0; padding-top:0;">
+    <strong>Nothing on file yet.</strong> Once the yard has been counted, or equipment has been out on a ticket,
+    it will be listed here.</div>`}
+  ${rows.length ? `<div class="note">
+    <strong>At Yard</strong> is everything owned that isn't out on a ticket &mdash; it's home, but some of it may still
+    be waiting on inspection, rebuild or paint.
+    <strong>Ready</strong> is the part of that which is through the shop and could load out tomorrow; that is the
+    number to quote a customer.
+    ${anyBuckets ? '' : '<br>Nothing is split into Ready / In Shop yet &mdash; until the yard buckets are used, At Yard is the best available figure.'}
+    ${noCount>0?`<br><strong class="warn">${noCount} item${noCount!==1?'s have':' has'} no count on file</strong> &mdash; those rows show what's out, but not what's owned.`:''}
+    ${silent>0?`<br>${silent} catalogue item${silent!==1?'s are':' is'} not listed: nothing owned, nothing out, nothing in the yard buckets.`:''}
+  </div>` : ''}
+  ${rigList.length ? `<h2>Where The Out Iron Is</h2>
+  <table>
+    <thead>
+      <tr><th>Rig</th><th class="num">Units</th><th>Equipment</th></tr>
+    </thead>
+    <tbody>${outRows}</tbody>
+  </table>` : `<h2>Where The Out Iron Is</h2>
+  <div class="note" style="border-top:none; margin-top:0;">Nothing is out right now &mdash; every asset is home.</div>`}
+  <div class="print-footer">
+    <span>Flow-Tech Systems LLC &middot; ${rows.length} item${rows.length!==1?'s':''} &middot; ${rigList.length} rig${rigList.length!==1?'s':''} out</span>
     <span>Printed ${printedAt}</span>
   </div>
 </body>
@@ -5008,6 +5253,7 @@ function renderInventory(){
         <button class="primary-btn" id="start-count-btn">Count Inventory</button>
         <button class="ghost-btn" id="seed-from-tickets-btn">Fill From Tickets</button>
         <button class="ghost-btn" id="print-count-sheet-btn">Print Count Sheet</button>
+        <button class="ghost-btn" id="print-inventory-btn">Print Inventory</button>
       </div>
       ${renderFullInventory()}
     `;
@@ -5105,6 +5351,7 @@ function renderInventory(){
         <button class="ghost-btn" id="start-count-btn" style="font-size:12px;">Count Inventory</button>
         <button class="ghost-btn" id="seed-from-tickets-btn" style="font-size:12px;">Fill From Tickets</button>
         <button class="ghost-btn" id="print-count-sheet-btn" style="font-size:12px;">Print Count Sheet</button>
+        <button class="ghost-btn" id="print-inventory-btn" style="font-size:12px;">Print Inventory</button>
       </div>
     </div>
     ${noMatches ? `<p style="font-size:13px; color:var(--ink-soft);">No equipment matches "${escHtml(inventorySearchTerm)}".</p>` : groups}
@@ -8171,6 +8418,9 @@ function attachHandlers(){
 
   const countSheetBtn = document.getElementById('print-count-sheet-btn');
   if(countSheetBtn) countSheetBtn.onclick = ()=> printCountSheet();
+
+  const invPrintBtn = document.getElementById('print-inventory-btn');
+  if(invPrintBtn) invPrintBtn.onclick = ()=> printInventorySheet();
 
   const seedBtn = document.getElementById('seed-from-tickets-btn');
   if(seedBtn) seedBtn.onclick = ()=>{ countMode = 'seed'; render(); };
