@@ -924,7 +924,7 @@ function matchInvoiceRule(inv){
 }
 
 let syncStatus = 'idle'; // idle | saving | loading | ok | error
-const APP_BUILD = '153';  // shown in the sync panel - bump on every release
+const APP_BUILD = '155';  // shown in the sync panel - bump on every release
 let pushInProgress = false; // true while a push is in flight — blocks auto-pull to prevent race conditions
 // Bumped by every local save. pullFromCloud captures it before its fetch and
 // re-checks it after: pushInProgress only stops a pull STARTING mid-push, it
@@ -1771,6 +1771,57 @@ function equipmentRenameImpact(oldName, newName){
   return { ticketCount, lineCount, templateCount, mergeInto: existing || null };
 }
 
+/* ── MADE-TO-ORDER ITEMS ───────────────────────────────────────────
+   Some iron is cut for one connection combination - crossover subs,
+   forged lift caps - and there is no sensible number of them to keep
+   on the shelf, because the combinations outnumber anything you'd
+   stock. Owning one is the normal state, not a shortage.
+
+   Without this flag the availability sheet has to guess, and both
+   available guesses are wrong: by quantity, a 11 3/4" 8 RD swage you
+   only own one of gets treated as a special when it is ordinary stock;
+   by name, the app is silently pattern-matching text the user never
+   agreed to. So it is a checkbox he sets, stored in appSettings so it
+   syncs, and the sheet reads it rather than inferring anything.
+*/
+function madeToOrderSet(){
+  if(!Array.isArray(appSettings.madeToOrder)) appSettings.madeToOrder = [];
+  return appSettings.madeToOrder;
+}
+function isMadeToOrder(name){
+  return madeToOrderSet().indexOf(name) !== -1;
+}
+function setMadeToOrder(name, on){
+  const list = madeToOrderSet();
+  const at = list.indexOf(name);
+  if(on && at === -1) list.push(name);
+  if(!on && at !== -1) list.splice(at, 1);
+  saveAppSettings();
+}
+
+// The five pieces the user identified as made to order, ticked once on
+// upgrade so he doesn't have to find them in the list. It runs a single
+// time and only over names already in the catalog: after that the
+// checkbox is his, and unticking one has to stick even though this code
+// still runs on every start.
+const MADE_TO_ORDER_SEED = [
+  'NC 50 Forged Lift Cap',
+  'NC50 B x 5 1/2" BTC X/O',
+  'NC50 B x 8 5/8" BTC X/O',
+  'NC50 B x 9 5/8" BTC X/O',
+  '8 5/8" 32# HCL-80 Offline Cement Pup Joint'
+];
+function seedMadeToOrderOnce(){
+  if(appSettings.madeToOrderSeeded) return false;
+  appSettings.madeToOrderSeeded = true;
+  let hits = 0;
+  MADE_TO_ORDER_SEED.forEach(n=>{
+    if((equipmentCatalog||[]).indexOf(n) !== -1 && !isMadeToOrder(n)){ madeToOrderSet().push(n); hits++; }
+  });
+  saveAppSettings();
+  return hits > 0;
+}
+
 async function renameEquipment(oldName, newName){
   if(!newName || newName === oldName) return false;
 
@@ -1826,6 +1877,15 @@ async function renameEquipment(oldName, newName){
   (templateCatalog||[]).forEach(tpl=>{
     (tpl.items||[]).forEach(i=>{ if(i.name === oldName) i.name = target; });
   });
+
+  // 7b. the made-to-order flag - an eighth place the name is a key, and
+  //     the one most easily forgotten, because nothing looks broken when
+  //     it is missed: the item simply starts being reported as a shortage
+  //     again under its new name.
+  if(isMadeToOrder(oldName)){
+    setMadeToOrder(oldName, false);
+    setMadeToOrder(target, true);
+  }
 
   // 7. a count session left open on this device
   if(countSession && countSession.items && countSession.items[oldName]){
@@ -2417,6 +2477,21 @@ function printInventorySheet(){
   const rows = all.filter(r=>r.owned !== null || r.out > 0 || r.ready > 0 || r.shop > 0);
   const silent = all.length - rows.length;
 
+  // Ready and In Shop only earn their columns when they say something At
+  // Yard doesn't. With an empty shop queue and every home piece marked
+  // ready, all three columns print the same number on every row - three
+  // columns carrying one fact, which makes the sheet look busier and less
+  // trustworthy, not more complete. They come back on their own the moment
+  // iron is actually in the queue or home but unplaced.
+  const showBuckets = rows.some(r=>r.shop > 0 || r.unplaced > 0 || r.overplaced > 0);
+
+  // Nothing at the yard is only news for iron you'd normally have a spare
+  // of. Quantity looked like a proxy for that and isn't: a 11 3/4" 8 RD
+  // swage you own one of is ordinary stock worth chasing, while a crossover
+  // sub you own one of is doing exactly what it was made for. Only the tag
+  // knows the difference, so only the tag decides.
+  const noneAvailable = rows.filter(r=>r.owned !== null && r.onHand <= 0 && !isMadeToOrder(r.name));
+
   const symbolSvg = document.querySelector('svg.logo-symbol') ? document.querySelector('svg.logo-symbol').outerHTML : '';
   const nameSvg = document.querySelector('svg.logo-name') ? document.querySelector('svg.logo-name').outerHTML : '';
   const printedAt = new Date().toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
@@ -2424,7 +2499,15 @@ function printInventorySheet(){
   const statusFor = (r)=>{
     if(r.owned === null) return '<span class="warn">no count on file</span>';
     if(r.overplaced) return `<span class="bad">${r.overplaced} more marked ready than are home</span>`;
-    if(r.onHand <= 0 && r.owned > 0) return '<span class="bad">all out</span>';
+    // A single-unit item that's out has nothing left by definition. Saying
+    // "none available" there implies a fleet that ran dry, when really it's
+    // a one-off doing exactly what it was bought to do - the zero under At
+    // Yard already says everything true about it.
+    if(r.onHand <= 0 && r.owned > 0){
+      return isMadeToOrder(r.name)
+        ? '<span class="soft">made to order</span>'
+        : '<span class="bad">none available</span>';
+    }
     if(r.unplaced) return `<span class="warn">${r.unplaced} not yet placed</span>`;
     if(r.shop > 0 && r.ready === 0) return '<span class="warn">all home iron in shop</span>';
     return '';
@@ -2435,8 +2518,8 @@ function printInventorySheet(){
       <td class="num">${r.owned === null ? '<span class="warn">—</span>' : r.owned}</td>
       <td class="num out">${r.out || '—'}</td>
       <td class="num home">${r.onHand === null ? '—' : r.onHand}</td>
-      <td class="num ready">${r.bucketed ? r.ready : '—'}</td>
-      <td class="num shop">${r.bucketed ? r.shop : '—'}</td>
+      ${showBuckets ? `<td class="num ready">${r.bucketed ? r.ready : '—'}</td>
+      <td class="num shop">${r.bucketed ? r.shop : '—'}</td>` : ''}
       <td class="status">${statusFor(r)}</td>
     </tr>`).join('');
 
@@ -2522,7 +2605,11 @@ function printInventorySheet(){
     text-transform: uppercase; letter-spacing: 1.5px; margin: 26px 0 8px 0; color: #14181A;
   }
   .contact { font-family:'IBM Plex Mono',monospace; font-size:10px; color:#5B6660; margin-bottom:4px; }
-  .cards { display:grid; grid-template-columns:repeat(5,1fr); gap:8px; margin:14px 0 18px 0; }
+  .cards { display:grid; grid-template-columns:repeat(${showBuckets?5:3},1fr); gap:8px; margin:14px 0 18px 0; }
+  .short { border:1px solid #E6D080; background:#FFF8E6; border-radius:8px; padding:12px 16px;
+           margin:0 0 18px 0; font-size:12.5px; color:#6B5410; }
+  .short-list { margin-top:6px; font-size:12px; line-height:1.65; }
+  .short-list .q { font-family:'IBM Plex Mono',monospace; font-size:11px; color:#8A6D10; }
   .card { border:1px solid #E8EDE8; border-radius:8px; padding:10px 8px; background:#FAFCF9; text-align:center; }
   .card .n { font-family:'Oswald',sans-serif; font-size:22px; font-weight:600; line-height:1.1; }
   .card .l { font-family:'IBM Plex Mono',monospace; font-size:8.5px; text-transform:uppercase;
@@ -2543,6 +2630,7 @@ function printInventorySheet(){
   td.status { font-size:10.5px; color:#5B6660; }
   .warn { color:#B8691C; }
   .bad  { color:#B5432A; font-weight:500; }
+  .soft { color:#8A938C; }
   td.items { font-size:10.5px; color:#5B6660; line-height:1.5; padding:6px 8px; }
   td.items .q { font-family:'IBM Plex Mono',monospace; color:#1B211C; }
   td .sub { font-size:10px; color:#5B6660; font-weight:400; margin-top:1px; }
@@ -2573,10 +2661,14 @@ function printInventorySheet(){
   <div class="cards">
     <div class="card"><div class="n">${totalOwned}</div><div class="l">Owned</div></div>
     <div class="card"><div class="n" style="color:#3A6EA5;">${totalOut}</div><div class="l">Out On Rigs</div></div>
-    <div class="card"><div class="n">${totalHome}</div><div class="l">At The Yard</div></div>
-    <div class="card"><div class="n" style="color:#1E8A29;">${totalReady}</div><div class="l">Ready To Go</div></div>
-    <div class="card"><div class="n" style="color:#B8691C;">${totalShop}</div><div class="l">In Shop</div></div>
+    <div class="card"><div class="n" style="color:#1E8A29;">${totalHome}</div><div class="l">At The Yard</div></div>
+    ${showBuckets ? `<div class="card"><div class="n" style="color:#1E8A29;">${totalReady}</div><div class="l">Ready To Go</div></div>
+    <div class="card"><div class="n" style="color:#B8691C;">${totalShop}</div><div class="l">In Shop</div></div>` : ''}
   </div>
+  ${noneAvailable.length ? `<div class="short">
+    <strong>Nothing available right now &mdash;</strong> every unit is out on a rig.
+    <div class="short-list">${noneAvailable.map(r=>`${escHtml(r.name)} <span class="q">(${r.owned} owned, all out)</span>`).join('<br>')}</div>
+  </div>` : ''}
   ${rows.length ? `<table>
     <thead>
       <tr>
@@ -2584,8 +2676,7 @@ function printInventorySheet(){
         <th class="num">Owned</th>
         <th class="num">Out</th>
         <th class="num">At Yard</th>
-        <th class="num">Ready</th>
-        <th class="num">In Shop</th>
+        ${showBuckets ? '<th class="num">Ready</th><th class="num">In Shop</th>' : ''}
         <th>Status</th>
       </tr>
     </thead>
@@ -2594,11 +2685,13 @@ function printInventorySheet(){
     <strong>Nothing on file yet.</strong> Once the yard has been counted, or equipment has been out on a ticket,
     it will be listed here.</div>`}
   ${rows.length ? `<div class="note">
-    <strong>At Yard</strong> is everything owned that isn't out on a ticket &mdash; it's home, but some of it may still
-    be waiting on inspection, rebuild or paint.
-    <strong>Ready</strong> is the part of that which is through the shop and could load out tomorrow; that is the
-    number to quote a customer.
-    ${anyBuckets ? '' : '<br>Nothing is split into Ready / In Shop yet &mdash; until the yard buckets are used, At Yard is the best available figure.'}
+    <strong>At Yard</strong> is everything owned that isn't out on a ticket &mdash; it's home and available to go out.
+    ${showBuckets ? `<strong>Ready</strong> is the part of that which is through the shop and could load out tomorrow;
+      that is the number to quote a customer.`
+     : `Nothing is in the shop queue right now, so everything at the yard is ready to load.`}
+    ${rows.some(r=>isMadeToOrder(r.name)) ? `<br>Items marked <em>made to order</em> are cut for one connection
+    combination, so being out is their normal state and they are not counted as a shortage.` : ''}
+    ${totalOwned>0?`${Math.min(100,Math.round((totalOut/totalOwned)*100))}% of the fleet is out on rigs.`:''}
     ${noCount>0?`<br><strong class="warn">${noCount} item${noCount!==1?'s have':' has'} no count on file</strong> &mdash; those rows show what's out, but not what's owned.`:''}
     ${silent>0?`<br>${silent} catalogue item${silent!==1?'s are':' is'} not listed: nothing owned, nothing out, nothing in the yard buckets.`:''}
   </div>` : ''}
@@ -4407,11 +4500,14 @@ function renderNewTicket(){
   const manageSection = showManageCatalog ? `
     <div class="manage-catalog">
       <label style="display:block;margin-bottom:8px;">Manage equipment list</label>
-      <p style="font-size:11px; color:var(--ink-soft); margin:-4px 0 8px 0;">Set "Total Owned" to see utilization (how much of your fleet is out) in the Inventory tab. Leave blank if you don't want to track it for that item.</p>
+      <p style="font-size:11px; color:var(--ink-soft); margin:-4px 0 8px 0;">Set "Total Owned" to see utilization (how much of your fleet is out) in the Inventory tab. Leave blank if you don't want to track it for that item. Tick <strong>Special</strong> for made-to-order pieces &mdash; crossovers, lift caps &mdash; so the printed inventory sheet doesn't report them as a shortage when they're out.</p>
       ${equipmentCatalog.slice().sort(compareEquipNames).map(name=>`
         <div class="catalog-item">
           <span>${escHtml(name)}</span>
           <span style="display:flex; align-items:center; gap:8px;">
+            <label title="Made to order — a special cut for one connection, so running out is normal and it won't be reported as a shortage" style="display:flex; align-items:center; gap:4px; font-size:11px; color:var(--ink-soft); cursor:pointer; white-space:nowrap;">
+              <input type="checkbox" data-made-to-order="${escAttr(name)}" ${isMadeToOrder(name)?'checked':''} style="margin:0; cursor:pointer;">Special
+            </label>
             <input type="number" min="0" placeholder="Owned" value="${equipmentOwned[name]!=null?equipmentOwned[name]:''}" data-owned-qty="${escAttr(name)}" style="width:70px; font-size:12px; padding:4px 6px;">
             <button class="catalog-remove" data-catalog-rename="${escAttr(name)}" title="Rename — updates every ticket too" style="font-size:13px;">&#9998;</button>
             <button class="catalog-remove" data-catalog-remove="${escAttr(name)}" title="Remove from list">×</button>
@@ -7768,6 +7864,9 @@ function attachHandlers(){
           if(rec.out) delete rec.out[name];
           if(rec.back) delete rec.back[name];
         });
+        // and the made-to-order flag, or re-adding the name later brings
+        // back a setting the user never chose for it
+        setMadeToOrder(name, false);
 
         await saveCatalog();
         await saveEquipmentOwned();
@@ -7811,6 +7910,16 @@ function attachHandlers(){
         render();
       };
     });
+    document.querySelectorAll('[data-made-to-order]').forEach(cb=>{
+      cb.onchange = ()=>{
+        // No re-render: this row has an owned box that may be mid-edit, and
+        // redrawing would take the focus and drop the keystrokes. The only
+        // thing on screen that depends on the flag is the printed sheet,
+        // which reads it fresh every time it runs.
+        setMadeToOrder(cb.dataset.madeToOrder, cb.checked);
+      };
+    });
+
     document.querySelectorAll('[data-owned-qty]').forEach(inp=>{
       inp.onchange = async ()=>{
         const name = inp.dataset.ownedQty;
@@ -8777,6 +8886,7 @@ async function init(){
   loadSyncUrl();
   loadSyncToken();
   loadPendingDeletes();
+  seedMadeToOrderOnce();
   await reconcileYardFromTickets();
   render();
   if(syncUrl){
