@@ -634,7 +634,7 @@
        of dragging the whole page with it; columns stay aligned and the
        header scrolls with the rows. */
     .rpt-card{overflow-x:auto; -webkit-overflow-scrolling:touch;}
-    .rpt{min-width:520px;}
+    .rpt{min-width:600px;}
     .filter-bar{flex-direction:column; align-items:stretch;}
     .signature-row{flex-direction:column;}
     .signature-canvas{width:100%; height:120px;}
@@ -924,7 +924,7 @@ function matchInvoiceRule(inv){
 }
 
 let syncStatus = 'idle'; // idle | saving | loading | ok | error
-const APP_BUILD = '155';  // shown in the sync panel - bump on every release
+const APP_BUILD = '156';  // shown in the sync panel - bump on every release
 let pushInProgress = false; // true while a push is in flight — blocks auto-pull to prevent race conditions
 // Bumped by every local save. pullFromCloud captures it before its fetch and
 // re-checks it after: pushInProgress only stops a pull STARTING mid-push, it
@@ -6602,27 +6602,53 @@ function renderReports(){
         });
       });
 
+      // Days per well. The pad is the unit that has a start and an end, so
+      // the rate is that pad's days divided by the wells drilled on it, and
+      // batch-drilling three wells at once stops reading as one fast pad.
+      //
+      // The divisor is the wells actually BILLED, not the count planned when
+      // the pad was opened. Planned is a forecast and forecasts change; a
+      // billed well is one that happened and got invoiced. The usual risk
+      // with that choice - a pad closing before its wells are marked, which
+      // would divide by a number still climbing - doesn't arise here,
+      // because wells get billed at the start of a pad rather than the end.
+      //
+      // A pad with nothing billed is skipped rather than counted as zero
+      // wells: dividing by it is meaningless, and treating it as "no time
+      // spent" would quietly pull every average down. They're counted so
+      // the footnote can say how many were left out.
+      const padWellCount = billed.length;
+      const contributes = padDays > 0 && padWellCount > 0;
+      const isDone = pad.status === 'complete';
+
+      const addPadTo = (bucket)=>{
+        bucket.wells += billed.length;
+        bucket.pads++;
+        if(isDone && padDays > 0){
+          bucket.totalDays += padDays;
+          bucket.completedPads++;
+        }
+        if(contributes){
+          if(isDone){ bucket.doneDays += padDays; bucket.doneWells += padWellCount; }
+          else       { bucket.liveDays += padDays; bucket.liveWells += padWellCount; }
+        } else if(padDays > 0){
+          bucket.skippedPads++;
+        }
+      };
+      const freshBucket = ()=>({ wells:0, pads:0, totalDays:0, completedPads:0,
+                                 doneDays:0, doneWells:0, liveDays:0, liveWells:0, skippedPads:0 });
+
       // Customer stats
       const cust = t.customer || 'Unknown';
-      if(!customerStats[cust]) customerStats[cust] = { wells: 0, pads: 0, totalDays: 0, completedPads: 0, activeRigs: new Set() };
-      customerStats[cust].wells += billed.length;
-      customerStats[cust].pads++;
+      if(!customerStats[cust]) customerStats[cust] = Object.assign(freshBucket(), { activeRigs: new Set() });
+      addPadTo(customerStats[cust]);
       if(!t.returnDate) customerStats[cust].activeRigs.add(t.rig);
-      if(pad.status === 'complete' && padDays > 0){
-        customerStats[cust].totalDays += padDays;
-        customerStats[cust].completedPads++;
-      }
 
       // Rig stats
       const rig = t.rig || 'Unknown';
-      if(!rigStats[rig]) rigStats[rig] = { wells: 0, pads: 0, totalDays: 0, completedPads: 0, customer: cust };
-      rigStats[rig].wells += billed.length;
-      rigStats[rig].pads++;
+      if(!rigStats[rig]) rigStats[rig] = Object.assign(freshBucket(), { customer: cust });
+      addPadTo(rigStats[rig]);
       rigStats[rig].customer = cust;
-      if(pad.status === 'complete' && padDays > 0){
-        rigStats[rig].totalDays += padDays;
-        rigStats[rig].completedPads++;
-      }
     });
   });
 
@@ -6637,6 +6663,31 @@ function renderReports(){
   const completedPads = allPads.filter(p=>p.status==='complete');
   const avgDaysOnPad = completedPads.length > 0 ? Math.round(completedPads.reduce((s,p)=>s+p.days,0) / completedPads.length) : '—';
   const activeRigCount = tickets.filter(t=>!t.returnDate).length;
+
+  // Summed on both sides before dividing, deliberately. Averaging each pad's
+  // own rate would give a one-well pad that dragged the same weight as an
+  // eight-well pad that went fine - the same distortion this replaces, just
+  // moved somewhere less visible.
+  const rate = (days, wells)=> wells > 0 ? Math.round(days / wells) : null;
+  const fleetDoneDays  = completedPads.reduce((n,p)=>n + (p.billedCount>0 ? p.days : 0), 0);
+  const fleetDoneWells = completedPads.reduce((n,p)=>n + (p.days>0 ? p.billedCount : 0), 0);
+  const avgDaysPerWell = rate(fleetDoneDays, fleetDoneWells);
+  const skippedPadCount = allPads.filter(p=>p.status==='complete' && p.days>0 && p.billedCount===0).length;
+
+  // One cell: the settled rate, with the pad still running shown underneath
+  // rather than folded in. A pad that is still going has a day count that is
+  // still growing, so averaging it into the finished ones would report a
+  // number that moves on its own every morning. Shown separately it stays
+  // readable - and a rig sitting on one pad for a year is visible while it
+  // happens instead of landing in the average all at once on the day it moves.
+  const daysPerWellCell = (b)=>{
+    const done = rate(b.doneDays, b.doneWells);
+    const live = rate(b.liveDays, b.liveWells);
+    return `<div style="text-align:center; line-height:1.35;">
+      <div>${done === null ? '—' : done + ' d'}</div>
+      ${live !== null ? `<div style="font-size:10px; color:#B8691C;">${live} d running</div>` : ''}
+    </div>`;
+  };
 
   // Wells billed by month
   const monthMap = {};
@@ -6675,12 +6726,13 @@ function renderReports(){
   let custTableRows = '';
   custEntries.forEach(([name, stats])=>{
     const avgDays = stats.completedPads > 0 ? Math.round(stats.totalDays / stats.completedPads) : '—';
-    custTableRows += `<div class="rpt" style="display:grid; grid-template-columns:1fr 60px 60px 70px 70px; gap:8px; padding:10px 0; border-bottom:1px solid #E8EDE8; font-size:13px; align-items:center;">
+    custTableRows += `<div class="rpt" style="display:grid; grid-template-columns:1fr 52px 52px 52px 66px 78px; gap:8px; padding:10px 0; border-bottom:1px solid #E8EDE8; font-size:13px; align-items:center;">
       <div style="font-weight:600;">${escHtml(name)}</div>
       <div style="text-align:center;">${stats.activeRigs.size}</div>
       <div style="text-align:center;">${stats.wells}</div>
       <div style="text-align:center;">${stats.pads}</div>
       <div style="text-align:center;">${avgDays}${avgDays!=='—'?' d':''}</div>
+      ${daysPerWellCell(stats)}
     </div>`;
   });
 
@@ -6689,12 +6741,13 @@ function renderReports(){
   let rigTableRows = '';
   rigEntries.forEach(([name, stats])=>{
     const avgDays = stats.completedPads > 0 ? Math.round(stats.totalDays / stats.completedPads) : '—';
-    rigTableRows += `<div class="rpt" style="display:grid; grid-template-columns:1fr 1fr 60px 60px 70px; gap:8px; padding:10px 0; border-bottom:1px solid #E8EDE8; font-size:13px; align-items:center;">
+    rigTableRows += `<div class="rpt" style="display:grid; grid-template-columns:1fr 1fr 52px 52px 66px 78px; gap:8px; padding:10px 0; border-bottom:1px solid #E8EDE8; font-size:13px; align-items:center;">
       <div style="font-weight:600;">${escHtml(name)}</div>
       <div style="color:#5B6660;">${escHtml(stats.customer)}</div>
       <div style="text-align:center;">${stats.wells}</div>
       <div style="text-align:center;">${stats.pads}</div>
       <div style="text-align:center;">${avgDays}${avgDays!=='—'?' d':''}</div>
+      ${daysPerWellCell(stats)}
     </div>`;
   });
 
@@ -6724,12 +6777,20 @@ function renderReports(){
   return `
     <h2 class="section-title">Reports</h2>
 
-    <div class="summary-cards" style="grid-template-columns:repeat(4,1fr);">
-      <div class="summary-card"><div class="num">${wellsThisMonth}</div><div class="lbl">Wells This Month</div></div>
-      <div class="summary-card"><div class="num">${wellsThisQuarter}</div><div class="lbl">Wells ${thisQuarterLabel}</div></div>
+    <div class="summary-cards" style="grid-template-columns:repeat(5,1fr);">
+      <div class="summary-card"><div class="num">${wellsThisMonth}</div><div class="lbl">Billed This Month</div></div>
+      <div class="summary-card"><div class="num">${wellsThisQuarter}</div><div class="lbl">Billed ${thisQuarterLabel}</div></div>
       <div class="summary-card"><div class="num">${wellsAllTime}</div><div class="lbl">Wells All Time</div></div>
       <div class="summary-card"><div class="num">${avgDaysOnPad}</div><div class="lbl">Avg Days on Pad</div></div>
+      <div class="summary-card"><div class="num">${avgDaysPerWell === null ? '—' : avgDaysPerWell}</div><div class="lbl">Avg Days per Well</div></div>
     </div>
+    <p style="font-size:11px; color:#5B6660; margin:-14px 0 20px 0; line-height:1.55;">
+      <strong>Days/Well</strong> is a pad's days divided by the wells billed on it, so a rig batch-drilling three wells
+      at once no longer reads as one fast pad. Finished pads only; a pad still running shows underneath in amber as
+      <em>d running</em>, and is not mixed into the average while its day count is still climbing.
+      ${skippedPadCount>0?`<br>${skippedPadCount} finished pad${skippedPadCount!==1?'s have':' has'} no billed wells, so ${skippedPadCount!==1?'they are':'it is'} left out of Days/Well.`:''}
+      <br>Wells are counted by the date they were <em>billed</em>, not drilled — billing a pad up front puts them all in that month.
+    </p>
 
     ${renderRevenueByCustomer()}
     ${renderBillingCheck()}
@@ -6741,24 +6802,26 @@ function renderReports(){
 
     <h2 class="section-title" style="margin-top:24px;">Customer Breakdown</h2>
     <div class="rpt-card" style="background:#fff; border:1.5px solid #E8EDE8; border-radius:8px; padding:16px;">
-      <div class="rpt" style="display:grid; grid-template-columns:1fr 60px 60px 70px 70px; gap:8px; padding:0 0 8px 0; border-bottom:2px solid #14181A; font-size:11px; color:#5B6660; text-transform:uppercase; letter-spacing:0.5px;">
+      <div class="rpt" style="display:grid; grid-template-columns:1fr 52px 52px 52px 66px 78px; gap:8px; padding:0 0 8px 0; border-bottom:2px solid #14181A; font-size:11px; color:#5B6660; text-transform:uppercase; letter-spacing:0.5px;">
         <div>Customer</div>
         <div style="text-align:center;">Rigs</div>
         <div style="text-align:center;">Wells</div>
         <div style="text-align:center;">Pads</div>
-        <div style="text-align:center;">Avg Days</div>
+        <div style="text-align:center;">Days/Pad</div>
+        <div style="text-align:center;">Days/Well</div>
       </div>
       ${custTableRows || '<div style="padding:16px 0; color:#5B6660; font-size:13px;">No data yet.</div>'}
     </div>
 
     <h2 class="section-title" style="margin-top:24px;">Rig Efficiency</h2>
     <div class="rpt-card" style="background:#fff; border:1.5px solid #E8EDE8; border-radius:8px; padding:16px;">
-      <div class="rpt" style="display:grid; grid-template-columns:1fr 1fr 60px 60px 70px; gap:8px; padding:0 0 8px 0; border-bottom:2px solid #14181A; font-size:11px; color:#5B6660; text-transform:uppercase; letter-spacing:0.5px;">
+      <div class="rpt" style="display:grid; grid-template-columns:1fr 1fr 52px 52px 66px 78px; gap:8px; padding:0 0 8px 0; border-bottom:2px solid #14181A; font-size:11px; color:#5B6660; text-transform:uppercase; letter-spacing:0.5px;">
         <div>Rig</div>
         <div>Customer</div>
         <div style="text-align:center;">Wells</div>
         <div style="text-align:center;">Pads</div>
-        <div style="text-align:center;">Avg Days</div>
+        <div style="text-align:center;">Days/Pad</div>
+        <div style="text-align:center;">Days/Well</div>
       </div>
       ${rigTableRows || '<div style="padding:16px 0; color:#5B6660; font-size:13px;">No data yet.</div>'}
     </div>
