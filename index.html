@@ -924,7 +924,7 @@ function matchInvoiceRule(inv){
 }
 
 let syncStatus = 'idle'; // idle | saving | loading | ok | error
-const APP_BUILD = '156';  // shown in the sync panel - bump on every release
+const APP_BUILD = '159';  // shown in the sync panel - bump on every release
 let pushInProgress = false; // true while a push is in flight — blocks auto-pull to prevent race conditions
 // Bumped by every local save. pullFromCloud captures it before its fetch and
 // re-checks it after: pushInProgress only stops a pull STARTING mid-push, it
@@ -1820,6 +1820,47 @@ function seedMadeToOrderOnce(){
   });
   saveAppSettings();
   return hits > 0;
+}
+
+/* ── EDITING A PAD'S DATES ──────────────────────────────────────────
+   Days on Pad is the metric everything else is derived from, and both of
+   its dates come from when a button was tapped rather than when the rig
+   actually moved. Tap Rig Move four days late and that pad reads four days
+   long while the next reads four days short - and the wells stay where
+   they were billed, so the rate on both pads is wrong in opposite
+   directions.
+
+   No amount of care at tap time fixes that, because the rig doesn't move
+   on a schedule that matches when you're holding a phone. So the dates are
+   editable after the fact instead.
+*/
+function promptPadDate(label, current, opts){
+  const o = opts || {};
+  const raw = prompt(`${label}\n\nYYYY-MM-DD${o.allowBlank ? ' — leave blank if the pad is still running.' : ''}`,
+                     current || '');
+  if(raw === null) return undefined;           // cancelled - caller leaves it alone
+  const v = String(raw).trim();
+  if(!v){
+    if(o.allowBlank) return '';
+    alert('A date is required. Nothing was changed.');
+    return undefined;
+  }
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(v)){
+    alert(`"${v}" isn't a date in YYYY-MM-DD form. Nothing was changed.`);
+    return undefined;
+  }
+  const d = new Date(v + 'T00:00:00');
+  // Date() happily accepts 2026-02-31 and rolls it into March, so the round
+  // trip is what actually proves the day exists.
+  if(isNaN(d.getTime()) || d.toISOString().slice(0,10) !== v){
+    alert(`There is no such date as ${v}. Nothing was changed.`);
+    return undefined;
+  }
+  if(v > todayStr()){
+    alert(`${fmtDate(v)} is in the future. Nothing was changed.`);
+    return undefined;
+  }
+  return v;
 }
 
 async function renameEquipment(oldName, newName){
@@ -4885,7 +4926,7 @@ function renderByRig(){
 
       padHtml += `<div style="background:#FCFAF3; border:1.5px solid var(--line); border-radius:6px; padding:12px; margin:8px 0;">`;
       padHtml += `<div style="display:flex; justify-content:space-between; align-items:center;">`;
-      padHtml += `<button data-edit-pad="${escAttr(primaryTicket.id)}" data-pad-index="${primaryTicket.pads.indexOf(activePad)}" title="Rename this pad or change its well count" style="background:none; border:none; padding:0; margin:0; cursor:pointer; font-weight:600; font-size:14px; font-family:inherit; color:inherit; text-align:left; text-decoration:underline dotted rgba(0,0,0,0.28); text-underline-offset:3px;">${escHtml(activePad.name)}</button>`;
+      padHtml += `<button data-edit-pad="${escAttr(primaryTicket.id)}" data-pad-index="${primaryTicket.pads.indexOf(activePad)}" title="Edit this pad — name, well count, and the dates the rig arrived and left" style="background:none; border:none; padding:0; margin:0; cursor:pointer; font-weight:600; font-size:14px; font-family:inherit; color:inherit; text-align:left; text-decoration:underline dotted rgba(0,0,0,0.28); text-underline-offset:3px;">${escHtml(activePad.name)}</button>`;
       padHtml += `<span style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:${complete?'var(--green)':'var(--ink-soft)'};">${billed} of ${total} billed${complete?' ✓':''}</span>`;
       padHtml += `</div>`;
       padHtml += `<div style="background:var(--paper-2); border-radius:4px; height:6px; margin:6px 0;">`;
@@ -4904,28 +4945,18 @@ function renderByRig(){
       padHtml += `<button class="ghost-btn" data-rig-move="${primaryTicket.id}" style="font-size:12px; padding:7px 14px;">${complete?'Pad Complete — Rig Move':'Rig Move'}</button>`;
       padHtml += `</div>`;
 
-      // Completed pad history
-      const completedPads = Array.isArray(primaryTicket.pads) ? primaryTicket.pads.filter(p=>p.status==='complete') : [];
-      if(completedPads.length > 0){
-        padHtml += `<div style="margin-top:10px; border-top:1px solid var(--line); padding-top:8px;">`;
-        padHtml += `<div style="font-size:11px; color:var(--ink-soft); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:4px;">Pad History</div>`;
-        completedPads.forEach(p=>{
-          const b = Array.isArray(p.billedWells) ? p.billedWells.length : 0;
-          const pi = primaryTicket.pads.indexOf(p);
-          // Finished pads used to be a summary line and nothing else, so a
-          // well misspelled on a pad that had moved on could not be corrected
-          // at all - which is exactly where the misspellings end up.
-          if(b > 0){
-            padHtml += `<details style="padding:2px 0;"><summary style="cursor:pointer; font-size:12px; color:var(--ink-soft); list-style:none;">▸ ${escHtml(p.name)} — ${b} of ${p.totalWells} wells — ${fmtDate(p.startDate)} to ${fmtDate(p.completedDate||'')}</summary>`;
-            padHtml += renderBilledWellChips(primaryTicket.id, pi, p.billedWells, {small:true});
-            padHtml += `<button data-edit-pad="${escAttr(primaryTicket.id)}" data-pad-index="${pi}" style="background:none; border:none; padding:0; margin:2px 0 4px 0; cursor:pointer; font-size:11px; color:#2E7D32; text-decoration:underline; font-family:inherit;">edit pad name</button>`;
-            padHtml += `</details>`;
-          } else {
-            padHtml += `<div style="font-size:12px; color:var(--ink-soft); padding:3px 0;">${escHtml(p.name)} — ${b} of ${p.totalWells} wells — ${fmtDate(p.startDate)} to ${fmtDate(p.completedDate||'')}</div>`;
-          }
-        });
-        padHtml += `</div>`;
-      }
+      padHtml += padHistoryHtml(primaryTicket);
+      padHtml += `</div>`;
+    } else if(primaryTicket && Array.isArray(primaryTicket.pads) && primaryTicket.pads.some(p=>p.status==='complete')) {
+      // Every pad finished but the iron is still out - the rig is between
+      // pads. This used to fall through to "No pad tracking on this rig
+      // yet", which is plainly untrue when the history is sitting right
+      // there, and it put that history (and the only way to correct a pad's
+      // dates) out of reach at exactly the moment it's being looked at.
+      padHtml = `<div style="background:#FCFAF3; border:1.5px solid var(--line); border-radius:6px; padding:12px; margin:8px 0;">
+        <div style="font-size:13px; color:var(--ink-soft); margin-bottom:8px;">No pad running right now &mdash; every pad on this ticket is complete.</div>
+        <button class="ghost-btn" data-add-pad="${primaryTicket.id}" style="font-size:12px; padding:7px 14px;">+ Add Pad</button>`;
+      padHtml += padHistoryHtml(primaryTicket);
       padHtml += `</div>`;
     } else if(primaryTicket) {
       padHtml = `<div style="background:#FCFAF3; border:1.5px solid var(--line); border-radius:6px; padding:12px; margin:8px 0;">
@@ -6559,6 +6590,36 @@ function renderBillingCheck(){
   return out;
 }
 
+// The finished pads on a ticket, with the controls to correct them. Shared
+// by the rig-has-an-active-pad view and the between-pads view, which used
+// to be the branch that claimed there was no pad tracking at all.
+function padHistoryHtml(t){
+  const completedPads = Array.isArray(t.pads) ? t.pads.filter(p=>p.status==='complete') : [];
+  if(completedPads.length === 0) return '';
+  let out = `<div style="margin-top:10px; border-top:1px solid var(--line); padding-top:8px;">`;
+  out += `<div style="font-size:11px; color:var(--ink-soft); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:4px;">Pad History</div>`;
+  completedPads.forEach(p=>{
+    const b = Array.isArray(p.billedWells) ? p.billedWells.length : 0;
+    const pi = t.pads.indexOf(p);
+    const days = daysBetween(p.startDate, p.completedDate);
+    const span = `${fmtDate(p.startDate)} to ${fmtDate(p.completedDate||'')}${days !== null ? ` &middot; ${days} day${days===1?'':'s'}` : ''}`;
+    // Finished pads used to be a summary line and nothing else, so a well
+    // misspelled on a pad that had moved on could not be corrected at all -
+    // which is exactly where the misspellings end up.
+    if(b > 0){
+      out += `<details style="padding:2px 0;"><summary style="cursor:pointer; font-size:12px; color:var(--ink-soft); list-style:none;">&#9656; ${escHtml(p.name)} — ${b} of ${p.totalWells} wells — ${span}</summary>`;
+      out += renderBilledWellChips(t.id, pi, p.billedWells, {small:true});
+      out += `<button data-edit-pad="${escAttr(t.id)}" data-pad-index="${pi}" style="background:none; border:none; padding:0; margin:2px 0 4px 0; cursor:pointer; font-size:11px; color:#2E7D32; text-decoration:underline; font-family:inherit;">edit pad name or dates</button>`;
+      out += `</details>`;
+    } else {
+      out += `<div style="font-size:12px; color:var(--ink-soft); padding:3px 0;">${escHtml(p.name)} — ${b} of ${p.totalWells} wells — ${span}
+        <button data-edit-pad="${escAttr(t.id)}" data-pad-index="${pi}" style="background:none; border:none; padding:0; margin-left:6px; cursor:pointer; font-size:11px; color:#2E7D32; text-decoration:underline; font-family:inherit;">edit</button></div>`;
+    }
+  });
+  out += `</div>`;
+  return out;
+}
+
 function renderReports(){
   const now = new Date();
   const thisMonth = now.getFullYear() + '-' + String(now.getMonth()+1).padStart(2,'0');
@@ -6617,9 +6678,17 @@ function renderReports(){
       // wells: dividing by it is meaningless, and treating it as "no time
       // spent" would quietly pull every average down. They're counted so
       // the footnote can say how many were left out.
-      const padWellCount = billed.length;
-      const contributes = padDays > 0 && padWellCount > 0;
+      // A finished pad divides by the wells actually BILLED - verified, and
+      // the Billing Check already polices it. A pad still RUNNING has to use
+      // the planned count instead, because wells here get billed when the pad
+      // is done: an open pad has nothing billed on it almost by definition,
+      // so dividing by billed would leave every in-progress rig blank, which
+      // is precisely the rig you want to see.
       const isDone = pad.status === 'complete';
+      const padWellCount = isDone
+        ? billed.length
+        : ((Number(pad.totalWells) || 0) || billed.length);
+      const contributes = padDays > 0 && padWellCount > 0;
 
       const addPadTo = (bucket)=>{
         bucket.wells += billed.length;
@@ -6628,6 +6697,7 @@ function renderReports(){
           bucket.totalDays += padDays;
           bucket.completedPads++;
         }
+        if(!isDone) bucket.openWells += Math.max(0, padWellCount - billed.length);
         if(contributes){
           if(isDone){ bucket.doneDays += padDays; bucket.doneWells += padWellCount; }
           else       { bucket.liveDays += padDays; bucket.liveWells += padWellCount; }
@@ -6636,7 +6706,8 @@ function renderReports(){
         }
       };
       const freshBucket = ()=>({ wells:0, pads:0, totalDays:0, completedPads:0,
-                                 doneDays:0, doneWells:0, liveDays:0, liveWells:0, skippedPads:0 });
+                                 doneDays:0, doneWells:0, liveDays:0, liveWells:0,
+                                 skippedPads:0, openWells:0 });
 
       // Customer stats
       const cust = t.customer || 'Unknown';
@@ -6661,7 +6732,17 @@ function renderReports(){
   }).length;
   const wellsAllTime = allWells.length;
   const completedPads = allPads.filter(p=>p.status==='complete');
-  const avgDaysOnPad = completedPads.length > 0 ? Math.round(completedPads.reduce((s,p)=>s+p.days,0) / completedPads.length) : '—';
+  // A completed pad with no usable day count - no start date recorded, or
+  // opened and closed the same day - is a gap in the record, not a pad that
+  // took no time. It used to sit in this card's denominator contributing
+  // zero to the numerator, while the Days/Pad column beneath excluded it
+  // entirely, so the headline could read lower than every single row under
+  // it. Both now use the same rule, and the ones left out get counted so
+  // the footnote can say so instead of the number quietly being wrong.
+  const datedPads = completedPads.filter(p=>p.days > 0);
+  const undatedPads = completedPads.length - datedPads.length;
+  const avgDaysOnPad = datedPads.length > 0
+    ? Math.round(datedPads.reduce((s,p)=>s+p.days,0) / datedPads.length) : '—';
   const activeRigCount = tickets.filter(t=>!t.returnDate).length;
 
   // Summed on both sides before dividing, deliberately. Averaging each pad's
@@ -6669,10 +6750,10 @@ function renderReports(){
   // eight-well pad that went fine - the same distortion this replaces, just
   // moved somewhere less visible.
   const rate = (days, wells)=> wells > 0 ? Math.round(days / wells) : null;
-  const fleetDoneDays  = completedPads.reduce((n,p)=>n + (p.billedCount>0 ? p.days : 0), 0);
-  const fleetDoneWells = completedPads.reduce((n,p)=>n + (p.days>0 ? p.billedCount : 0), 0);
+  const fleetDoneDays  = datedPads.reduce((n,p)=>n + (p.billedCount>0 ? p.days : 0), 0);
+  const fleetDoneWells = datedPads.reduce((n,p)=>n + p.billedCount, 0);
   const avgDaysPerWell = rate(fleetDoneDays, fleetDoneWells);
-  const skippedPadCount = allPads.filter(p=>p.status==='complete' && p.days>0 && p.billedCount===0).length;
+  const skippedPadCount = datedPads.filter(p=>p.billedCount===0).length;
 
   // One cell: the settled rate, with the pad still running shown underneath
   // rather than folded in. A pad that is still going has a day count that is
@@ -6680,6 +6761,14 @@ function renderReports(){
   // number that moves on its own every morning. Shown separately it stays
   // readable - and a rig sitting on one pad for a year is visible while it
   // happens instead of landing in the average all at once on the day it moves.
+  // Wells counts what's been billed. Mid-pad that reads short of what's
+  // actually being drilled, which looks like the app losing wells rather
+  // than the pad simply not being billed yet - so the planned count on any
+  // open pad is said alongside it instead of left to be inferred.
+  const wellsCell = (b)=> b.openWells > 0
+    ? `${b.wells}<div style="font-size:10px; color:#B8691C;">+${b.openWells} on pad</div>`
+    : `${b.wells}`;
+
   const daysPerWellCell = (b)=>{
     const done = rate(b.doneDays, b.doneWells);
     const live = rate(b.liveDays, b.liveWells);
@@ -6729,7 +6818,7 @@ function renderReports(){
     custTableRows += `<div class="rpt" style="display:grid; grid-template-columns:1fr 52px 52px 52px 66px 78px; gap:8px; padding:10px 0; border-bottom:1px solid #E8EDE8; font-size:13px; align-items:center;">
       <div style="font-weight:600;">${escHtml(name)}</div>
       <div style="text-align:center;">${stats.activeRigs.size}</div>
-      <div style="text-align:center;">${stats.wells}</div>
+      <div style="text-align:center;">${wellsCell(stats)}</div>
       <div style="text-align:center;">${stats.pads}</div>
       <div style="text-align:center;">${avgDays}${avgDays!=='—'?' d':''}</div>
       ${daysPerWellCell(stats)}
@@ -6744,7 +6833,7 @@ function renderReports(){
     rigTableRows += `<div class="rpt" style="display:grid; grid-template-columns:1fr 1fr 52px 52px 66px 78px; gap:8px; padding:10px 0; border-bottom:1px solid #E8EDE8; font-size:13px; align-items:center;">
       <div style="font-weight:600;">${escHtml(name)}</div>
       <div style="color:#5B6660;">${escHtml(stats.customer)}</div>
-      <div style="text-align:center;">${stats.wells}</div>
+      <div style="text-align:center;">${wellsCell(stats)}</div>
       <div style="text-align:center;">${stats.pads}</div>
       <div style="text-align:center;">${avgDays}${avgDays!=='—'?' d':''}</div>
       ${daysPerWellCell(stats)}
@@ -6789,7 +6878,12 @@ function renderReports(){
       at once no longer reads as one fast pad. Finished pads only; a pad still running shows underneath in amber as
       <em>d running</em>, and is not mixed into the average while its day count is still climbing.
       ${skippedPadCount>0?`<br>${skippedPadCount} finished pad${skippedPadCount!==1?'s have':' has'} no billed wells, so ${skippedPadCount!==1?'they are':'it is'} left out of Days/Well.`:''}
-      <br>Wells are counted by the date they were <em>billed</em>, not drilled — billing a pad up front puts them all in that month.
+      ${undatedPads>0?`<br>${undatedPads} finished pad${undatedPads!==1?'s have':' has'} no usable start date, so ${undatedPads!==1?'they are':'it is'} left out of both day figures.`:''}
+      <br>A pad runs from the day it was opened to the day you hit <strong>Move Rig</strong> — so it counts days the rig
+      sat after drilling finished, and the first pad on a ticket starts at delivery, before spud. Billing a well
+      doesn't move either date.
+      <br>Wells counts what's been billed; an open pad's planned wells show beneath it in amber. A pad still running
+      divides by its planned count, since its wells aren't billed until it closes.
     </p>
 
     ${renderRevenueByCustomer()}
@@ -8371,7 +8465,43 @@ function attachHandlers(){
           count = n;
         }
 
-        if(name === (pad.name||'') && count === (pad.totalWells||0)) return;
+        // Dates come last: name and count are the common edit, and asking
+        // for dates first would make the quick rename a four-prompt chore.
+        let startDate = pad.startDate || '';
+        let completedDate = pad.completedDate || '';
+        const isDone = pad.status === 'complete';
+
+        const nextStart = promptPadDate(`When did the rig arrive on ${name}?`, startDate);
+        if(nextStart !== undefined) startDate = nextStart;
+
+        if(isDone){
+          const nextEnd = promptPadDate(`When did the rig leave ${name}?`, completedDate, { allowBlank:true });
+          if(nextEnd !== undefined) completedDate = nextEnd;
+        }
+
+        if(startDate && completedDate && completedDate < startDate){
+          alert(`${name} would end (${fmtDate(completedDate)}) before it started (${fmtDate(startDate)}). Nothing was changed.`);
+          return;
+        }
+        // A well billed outside the pad's window means the boundary is in the
+        // wrong place - which is the whole reason these are editable, so it
+        // says so plainly rather than saving a window the data contradicts.
+        const strays = (Array.isArray(pad.billedWells) ? pad.billedWells : [])
+          .filter(w=>w.date && ((startDate && w.date < startDate) || (completedDate && w.date > completedDate)));
+        if(strays.length && !confirm(
+            `${strays.length} well${strays.length!==1?'s were':' was'} billed outside ${fmtDate(startDate)}`+
+            `${completedDate?` – ${fmtDate(completedDate)}`:' onward'}:\n\n`+
+            strays.slice(0,6).map(w=>`• ${w.label||'(unnamed)'} — ${fmtDate(w.date)}`).join('\n')+
+            `${strays.length>6?`\n…and ${strays.length-6} more`:''}\n\n`+
+            `That usually means the pad boundary belongs somewhere else. Save these dates anyway?`)){
+          return;
+        }
+
+        const unchanged = name === (pad.name||'') && count === (pad.totalWells||0)
+          && startDate === (pad.startDate||'') && completedDate === (pad.completedDate||'');
+        if(unchanged) return;
+        pad.startDate = startDate;
+        if(isDone) pad.completedDate = completedDate;
         pad.name = name;
         pad.totalWells = count;
         t.updatedAt = nowIso();
