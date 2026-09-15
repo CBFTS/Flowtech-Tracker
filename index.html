@@ -924,7 +924,7 @@ function matchInvoiceRule(inv){
 }
 
 let syncStatus = 'idle'; // idle | saving | loading | ok | error
-const APP_BUILD = '159';  // shown in the sync panel - bump on every release
+const APP_BUILD = '160';  // shown in the sync panel - bump on every release
 let pushInProgress = false; // true while a push is in flight — blocks auto-pull to prevent race conditions
 // Bumped by every local save. pullFromCloud captures it before its fetch and
 // re-checks it after: pushInProgress only stops a pull STARTING mid-push, it
@@ -3070,6 +3070,36 @@ function withToken(url){
   if(!syncToken) return url;
   return url + (url.indexOf('?') === -1 ? '?' : '&') + 'token=' + encodeURIComponent(syncToken);
 }
+
+/* Why the cloud said no, kept so it can be read back later.
+
+   "Sync token missing or wrong" was shown for two unrelated failures: the
+   server rejecting a token it was sent, and this device never attaching one
+   in the first place. withToken() returns the bare URL when syncToken is
+   empty, so the second case went out as a perfectly valid anonymous request,
+   came back unauthorized, and got reported as though the token were wrong -
+   pointing at the one thing that wasn't the problem.
+
+   They need different words, and the last one needs to survive the banner
+   being dismissed, because "every now and then" can't be diagnosed from a
+   message that's already gone. */
+let lastSyncFailure = null;   // { at, phase, reason, hadToken, status }
+function noteSyncFailure(phase, reason, extra){
+  lastSyncFailure = Object.assign({
+    at: new Date().toISOString(), phase: phase, reason: reason,
+    hadToken: !!syncToken, tokenLen: syncToken ? syncToken.length : 0
+  }, extra || {});
+  try{ localStorage.setItem('flowtech_equipment_tracker_lastsyncfail', JSON.stringify(lastSyncFailure)); }catch(e){}
+}
+function loadLastSyncFailure(){
+  try{ const raw = localStorage.getItem('flowtech_equipment_tracker_lastsyncfail');
+       lastSyncFailure = raw ? JSON.parse(raw) : null; }catch(e){ lastSyncFailure = null; }
+}
+// True when this device is set up to sync but has nothing to authenticate
+// with - worth catching before the request, not after the refusal.
+function missingTokenForSync(){
+  return !!syncUrl && !syncToken;
+}
 const SETTINGS_KEY = 'flowtech_equipment_tracker_settings';
 
 const DEFAULT_CATALOG = [
@@ -3664,11 +3694,20 @@ async function pullFromCloud(silent, force){
   if(!silent) syncStatus = 'loading';
   render();
   try{
+    if(missingTokenForSync()){
+      noteSyncFailure('pull', 'no-token-on-device');
+      showSyncTokenWarning('missing');
+      throw new Error('no token');
+    }
     const seqAtStart = localChangeSeq;
     const res = await fetch(withToken(syncUrl), { method: 'GET' });
     if(!res.ok) throw new Error('Bad response');
     const data = await res.json();
-    if(data && data.error === 'unauthorized'){ showSyncTokenWarning(); throw new Error('unauthorized'); }
+    if(data && data.error === 'unauthorized'){
+      noteSyncFailure('pull', 'server-refused-token', { status: res.status });
+      showSyncTokenWarning('refused');
+      throw new Error('unauthorized');
+    }
     // Something was saved locally while this request was in the air, so this
     // response is already out of date. Applying it would wipe that change.
     // Drop it and push instead - the next pull will bring the merged truth.
@@ -3809,7 +3848,11 @@ async function pushToCloud(){
     let discarded = [];
     try{
       const body = await res.json();
-      if(body && body.error === 'unauthorized'){ showSyncTokenWarning(); throw new Error('unauthorized'); }
+      if(body && body.error === 'unauthorized'){
+        noteSyncFailure('push', 'server-refused-token', { status: res.status });
+        showSyncTokenWarning('refused');
+        throw new Error('unauthorized');
+      }
       if(body && Array.isArray(body.rejected)) refused = body.rejected;
       if(body && Array.isArray(body.staleTickets)) discarded = body.staleTickets;
       if(body) adoptStoreStamps(body.stamps);
@@ -4116,6 +4159,13 @@ function render(){
   attachHandlers();
 }
 
+function fmtDateTime_(iso){
+  if(!iso) return '';
+  const d = new Date(iso);
+  if(isNaN(d.getTime())) return String(iso);
+  return d.toLocaleString(undefined, { dateStyle:'medium', timeStyle:'short' });
+}
+
 function syncStatusLabel(){
   if(syncStatus === 'saving') return 'Saving...';
   if(syncStatus === 'loading') return 'Loading...';
@@ -4155,6 +4205,16 @@ function renderSyncPanel(){
             ? 'Saved on this device (' + syncToken.length + ' characters).'
             : 'Not set on this device yet.'}</strong>
         </div>
+        ${lastSyncFailure ? `<div style="margin-top:10px; border:1px solid #E0A9A0; background:#FCEBEA; border-radius:6px; padding:10px 12px; font-size:12px; color:#8A3520; line-height:1.55;">
+          <strong>Last sync refusal &mdash; ${escHtml(fmtDateTime_(lastSyncFailure.at))}</strong><br>
+          ${lastSyncFailure.reason === 'no-token-on-device'
+            ? `The <strong>${escHtml(lastSyncFailure.phase)}</strong> was stopped before it left this device, because no token was saved here. The cloud never saw it.`
+            : `The cloud refused a token this device <strong>did</strong> send on a ${escHtml(lastSyncFailure.phase)}${lastSyncFailure.status?` (HTTP ${escHtml(String(lastSyncFailure.status))})`:''} &mdash; ${lastSyncFailure.tokenLen} characters long at the time.`}
+          ${(lastSyncFailure.reason !== 'no-token-on-device' && syncToken && lastSyncFailure.tokenLen && lastSyncFailure.tokenLen !== syncToken.length)
+            ? `<br><strong>The token was ${escHtml(String(lastSyncFailure.tokenLen))} characters then and is ${syncToken.length} now</strong> &mdash; it changed on this device between the refusal and now, which is what a half-typed token looks like.`
+            : ''}
+          <br><button id="clear-sync-failure" style="background:none; border:1px solid #C98C7C; color:#8A3520; padding:3px 10px; border-radius:4px; font-size:11px; cursor:pointer; font-family:inherit; margin-top:7px;">Clear this note</button>
+        </div>` : ''}
       </div>
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
         <button class="primary-btn" id="save-sync-url">Connect</button>
@@ -7274,12 +7334,15 @@ function showStaleWriteWarning(keys){
   };
 }
 
-function showSyncTokenWarning(){
+function showSyncTokenWarning(kind){
   if(document.getElementById('sync-token-banner')) return;
+  const noToken = (kind === 'missing');
   const banner = document.createElement('div');
   banner.id = 'sync-token-banner';
   banner.style.cssText = 'position:fixed; top:0; left:0; right:0; background:#B5432A; color:#fff; padding:12px 20px; z-index:99999; font-family:Inter,sans-serif; font-size:14px; display:flex; justify-content:space-between; align-items:center; gap:12px;';
-  banner.innerHTML = '<span><strong>Sync token missing or wrong</strong> &mdash; the cloud refused this device. Nothing has been lost; your work is still here. Go to Settings &rarr; Cloud Sync and enter the token.</span>' +
+  banner.innerHTML = '<span>' + (noToken
+      ? '<strong>No sync token on this device</strong> &mdash; nothing was sent, so nothing was refused. Your work is still here and still saved locally. Go to Settings &rarr; Cloud Sync and enter the token to start syncing again.'
+      : '<strong>The cloud refused this device\'s token</strong> &mdash; it was sent but not accepted. Nothing has been lost; your work is still here. Check Settings &rarr; Cloud Sync against the SYNC_TOKEN on the Apps Script side.') + '</span>' +
     '<button onclick="this.parentElement.remove()" style="background:none; border:1px solid #fff; color:#fff; padding:4px 12px; border-radius:4px; cursor:pointer; font-size:12px; white-space:nowrap;">Dismiss</button>';
   document.body.prepend(banner);
 }
@@ -7501,15 +7564,49 @@ function attachHandlers(){
         : 'Not set on this device yet.';
       el.style.color = syncToken ? '#1E8A29' : '#B8691C';
     };
-    const keep = ()=>{ saveSyncToken(tokenField.value); paintTokenState(); };
-    tokenField.oninput = keep;
-    tokenField.onchange = keep;
+    /* This used to save on every keystroke.
+
+       Two ways that bites. Retyping the token saves each partial prefix as
+       it's typed, and the 30-second auto-sync fires against whatever prefix
+       happened to be stored at that instant - so the cloud refuses a token
+       that looks perfectly correct by the time anyone goes and looks at it.
+       And a password manager filling this field (it is type=password;
+       autocomplete=off is widely ignored) silently replaces a good token
+       with some other saved password.
+
+       Saving on commit instead means the value is only written once the
+       field is finished with, and an empty box never quietly wipes a working
+       token - clearing it now has to be meant. */
+    let tokenAtFocus = syncToken;
+    tokenField.onfocus = ()=>{ tokenAtFocus = syncToken; };
+    tokenField.onchange = ()=>{
+      const next = tokenField.value.trim();
+      if(!next && tokenAtFocus){
+        if(!confirm('Clear the sync token on this device?\n\nSyncing stops until a token is entered again. Your work stays here either way.')){
+          tokenField.value = tokenAtFocus;
+          paintTokenState();
+          return;
+        }
+      }
+      saveSyncToken(next);
+      paintTokenState();
+    };
   }
+
+  const clearFail = document.getElementById('clear-sync-failure');
+  if(clearFail) clearFail.onclick = ()=>{
+    lastSyncFailure = null;
+    try{ localStorage.removeItem('flowtech_equipment_tracker_lastsyncfail'); }catch(e){}
+    render();
+  };
 
   const saveSyncBtn = document.getElementById('save-sync-url');
   if(saveSyncBtn) saveSyncBtn.onclick = async ()=>{
     const tokenInput = document.getElementById('sync-token-input');
-    if(tokenInput) saveSyncToken(tokenInput.value);
+    // An empty box here means the field was never touched, not that the
+    // token should be thrown away - taking it literally disconnected a
+    // working device on a plain "Save".
+    if(tokenInput && tokenInput.value.trim()) saveSyncToken(tokenInput.value);
     const input = document.getElementById('sync-url-input');
     const url = input.value.trim();
     if(!url){ alert('Please paste the Web App URL first.'); return; }
@@ -7521,7 +7618,7 @@ function attachHandlers(){
   const syncNowBtn = document.getElementById('sync-now-btn');
   if(syncNowBtn) syncNowBtn.onclick = ()=>{
     const tf = document.getElementById('sync-token-input');
-    if(tf) saveSyncToken(tf.value);   // whatever is in the box is what we mean
+    if(tf && tf.value.trim()) saveSyncToken(tf.value);   // but never a blank over a good one
     pullFromCloud();
   };
 
@@ -9078,6 +9175,7 @@ async function init(){
   await loadTemplates();
   loadSyncUrl();
   loadSyncToken();
+  loadLastSyncFailure();
   loadPendingDeletes();
   seedMadeToOrderOnce();
   await reconcileYardFromTickets();
