@@ -924,7 +924,7 @@ function matchInvoiceRule(inv){
 }
 
 let syncStatus = 'idle'; // idle | saving | loading | ok | error
-const APP_BUILD = '160';  // shown in the sync panel - bump on every release
+const APP_BUILD = '162';  // shown in the sync panel - bump on every release
 let pushInProgress = false; // true while a push is in flight — blocks auto-pull to prevent race conditions
 // Bumped by every local save. pullFromCloud captures it before its fetch and
 // re-checks it after: pushInProgress only stops a pull STARTING mid-push, it
@@ -6280,15 +6280,31 @@ function buildBillingCheck(){
   const marked = [];
   (tickets||[]).forEach(t=>{
     if(!Array.isArray(t.pads)) return;
-    t.pads.forEach(pad=>{
-      (Array.isArray(pad.billedWells)?pad.billedWells:[]).forEach(w=>{
+    t.pads.forEach((pad, padIdx)=>{
+      (Array.isArray(pad.billedWells)?pad.billedWells:[]).forEach((w, wellIdx)=>{
         if(!w || !w.date) return;
         marked.push({
+          // Enough to write back to this exact well when the pairing is
+          // confirmed by hand from the Billing Check.
+          padIdx: padIdx,
+          wellIdx: wellIdx,
+          // A docNumber put here by confirming a suggestion. Once set, this
+          // well is tied to that invoice and no matching is attempted again.
+          invDoc: (w.invDoc || ''),
+          // Set by answering "not invoiced" on a suggestion. Stops the same
+          // guess being offered over and over once it has been rejected.
+          noInvoice: !!w.noInvoice,
           // Only wells from the cutoff forward are reported as missing;
           // earlier ones may still match, so an invoice isn't left orphaned.
           inRange: w.date >= startDate,
           ticketId: t.id,
           padId: pad.id || pad.name || '',
+          // The pad's own work window. An invoice cannot be raised for a well
+          // before the rig ever arrived on its pad, and that single fact is
+          // what stops a newly marked well being reconciled by count against
+          // an older invoice that belongs to a different well on the same rig.
+          padStart: pad.startDate || '',
+          padEnd: pad.completedDate || '',
           // Every rig this ticket has been associated with. An invoice raised
           // before a rig transfer names the old one.
           rigLineage: [t.rig].concat((Array.isArray(t.previousRigs)?t.previousRigs:[]).map(p=>p&&p.rig)).filter(Boolean),
@@ -6314,7 +6330,9 @@ function buildBillingCheck(){
   const missing = [];      // marked billed, no invoice found - money at risk
   const tooRecent = [];    // marked billed but inside the grace window
   const rigChanged = [];   // matched by well, but invoiced under another rig
-  const matchedByCount = []; // reconciled by count when the names disagreed
+  const matchedByCount = []; // kept for compatibility; nothing writes to it now
+  const needsConfirm = [];   // a candidate invoice exists, but only by count
+  const suggested = new Set(); // invoices held back for a suggestion, not matched
 
   // Words that appear in half the well names in the basin. They carry no
   // identity, so they can't be the evidence two names are the same well.
@@ -6383,8 +6401,30 @@ function buildBillingCheck(){
   // Rigs learned from invoices that matched wells on the same pad.
   const discoveredRigs = {};
 
+  const linkedByHand = [];   // confirmed against a named invoice by the user
+  const brokenLinks = [];    // confirmed once, but that invoice is gone now
+
   marked.forEach(m=>{
     const mRig = normalizeTight(m.rig);
+
+    // Pass zero: a pairing the user confirmed by hand. This is the only kind
+    // of evidence stronger than a name match, because a person looked at the
+    // invoice and said yes. It is also what makes the whole check work on
+    // rigs where the typed label never matches the invoice - confirm it once
+    // and it is settled for good, instead of being re-guessed every load.
+    if(m.invDoc){
+      const li = perWell.findIndex((inv,i)=>!usedInvoices.has(i) && String(inv.docNumber||'') === m.invDoc);
+      if(li !== -1){
+        usedInvoices.add(li);
+        linkedByHand.push({ well: m.label, doc: perWell[li].docNumber, invDate: perWell[li].date||'', rig: perWell[li].rig||'' });
+        return;
+      }
+      // The link points at an invoice QuickBooks no longer returns - voided,
+      // renumbered, or outside the pull. Worth saying so rather than silently
+      // falling back to guessing, which would look like it had been fine.
+      brokenLinks.push({ well: m.label, doc: m.invDoc, rig: m.rig||'', date: m.date,
+                         ticketId: m.ticketId, padIdx: m.padIdx, wellIdx: m.wellIdx });
+    }
 
     // Rig and well both agree. Preferred, and precise.
     let idx = perWell.findIndex((inv,i)=>{
@@ -6441,16 +6481,48 @@ function buildBillingCheck(){
       .concat(discoveredRigs[key] || [])
       .filter(Boolean);
 
-    // Count matching is weaker evidence than a name match, so it gets a
-    // window. Without one, an open pool let a well marked last week pair
-    // with an unrelated invoice from March, purely because it was on the
-    // same rig and happened to be spare - which stopped a genuinely
-    // unbilled well from being flagged at all.
+    // Count matching is weaker evidence than a name match, so it only gets
+    // to consider invoices that could physically belong to this pad.
+    //
+    // This used to be anchored on the date the well was MARKED and allowed
+    // anything up to 90 days before it. That is not a constraint at all: a
+    // well marked today could pair with an invoice raised three months ago
+    // for an entirely different well on the same rig - which is exactly what
+    // happened on Blue Line 6, where two wells marked minutes earlier and
+    // never invoiced were reconciled against SZC invoices from weeks back.
+    // A rig with more invoices than tracked wells could never raise an
+    // unbilled-well alarm again, because a spare was always available.
+    //
+    // The pad's own dates are the real constraint. The rig was not on this
+    // pad before it arrived, so no invoice for a well on it can predate that.
+    // Three days of slack on the front for hand-entered dates; the tail is
+    // generous because invoicing legitimately trails the work.
     const wellDate = group[0].date || '';
+    const padStart = group[0].padStart || '';
+    const padEnd   = group[0].padEnd || '';
+    const shiftDays = (iso, n)=>{
+      const d = new Date(iso);
+      if(isNaN(d)) return '';
+      d.setDate(d.getDate() + n);
+      return d.toISOString().slice(0,10);
+    };
+    // With no pad dates recorded, fall back to the marking date but keep the
+    // window tight enough to still be a constraint.
+    // Pad dates are typed from memory and are often approximate, so the
+    // window is deliberately loose. It no longer has to be exact, because a
+    // count pairing is now only a SUGGESTION the user confirms - it decides
+    // what gets offered, not what gets believed.
+    const floorDate = padStart ? shiftDays(padStart, -21)
+                    : wellDate ? shiftDays(wellDate, -120) : '';
+    const ceilDate  = padEnd   ? shiftDays(padEnd, 150)
+                    : wellDate ? shiftDays(wellDate, 21) : '';
     const withinWindow = (invDate)=>{
-      if(!invDate || !wellDate) return true;
-      const days = (new Date(wellDate) - new Date(invDate)) / 86400000;
-      return days >= -14 && days <= 90;   // up to 90 days before, 14 after
+      // An undated invoice can still match by NAME; it just can't be handed
+      // to a well on nothing more than a count.
+      if(!invDate) return false;
+      if(floorDate && invDate < floorDate) return false;
+      if(ceilDate  && invDate > ceilDate)  return false;
+      return true;
     };
 
     const spare = [];
@@ -6466,11 +6538,43 @@ function buildBillingCheck(){
       if(onLineage) spare.push(i);
     });
 
+    // Closest invoice to the end of the work first, rather than whichever
+    // happened to sit earliest in the array. When several could fit, the
+    // one nearest the pad is the better guess.
+    const anchor = padEnd || padStart || wellDate || '';
+    if(anchor){
+      spare.sort((x,y)=>{
+        const dx = Math.abs(new Date(perWell[x].date) - new Date(anchor));
+        const dy = Math.abs(new Date(perWell[y].date) - new Date(anchor));
+        return dx - dy;
+      });
+    }
+    // More invoices in reach than wells to claim them means the pairing is a
+    // guess among several, not a deduction. Say so rather than presenting it
+    // as settled.
+    const ambiguous = spare.length > group.length;
+
     group.forEach(m=>{
+      // A well marked inside the grace window is left alone entirely - work
+      // recorded minutes ago has not had time to be invoiced, and guessing
+      // that it has is the one conclusion that loses money.
+      if(m.date > graceCutoff){ leftover.push(m); return; }
+      // Already told "no, that isn't it" - don't offer a guess again.
+      if(m.noInvoice){ leftover.push(m); return; }
       if(spare.length > 0){
         const i = spare.shift();
-        usedInvoices.add(i);
-        matchedByCount.push({ well: m.label, rig: perWell[i].rig, doc: perWell[i].docNumber, date: m.date });
+        // Reserved, NOT consumed. The invoice is held back so it isn't also
+        // reported as unmarked, but it does not count as matched either -
+        // nothing is settled until a person says so.
+        suggested.add(i);
+        needsConfirm.push({
+          well: m.label, rig: m.rig || '', customer: m.customer || '', pad: m.pad || '',
+          doc: perWell[i].docNumber, invDate: perWell[i].date || '',
+          invWell: perWell[i].wellName || '', invRig: perWell[i].rig || '',
+          date: m.date, padStart: padStart, padEnd: padEnd, ambiguous: ambiguous,
+          ticketId: m.ticketId, padIdx: m.padIdx, wellIdx: m.wellIdx,
+          inRange: m.inRange
+        });
       } else {
         leftover.push(m);
       }
@@ -6480,6 +6584,9 @@ function buildBillingCheck(){
   // Only now decide what's a problem and what's simply recent.
   leftover.forEach(m=>{
     if(!m.inRange) return;   // before the cutoff: settled, not our business
+    // Saying "not invoiced yet" is an answer, not a reason to wait out the
+    // grace window - the user has already checked.
+    if(m.noInvoice){ missing.push(m); return; }
     if(m.date > graceCutoff) tooRecent.push(m);
     else missing.push(m);
   });
@@ -6488,7 +6595,7 @@ function buildBillingCheck(){
   // lagging behind, which is the harmless direction.
   // Only invoices from the cutoff forward are worth reporting as unmarked -
   // anything earlier is settled work we've been told not to re-examine.
-  const spare = perWell.filter((inv,i)=>!usedInvoices.has(i) && (!inv.date || inv.date >= startDate));
+  const spare = perWell.filter((inv,i)=>!usedInvoices.has(i) && !suggested.has(i) && (!inv.date || inv.date >= startDate));
 
   // A well can legitimately carry TWO invoices - iron gets swapped mid-well,
   // so a second rental period on the same well is billed separately. The
@@ -6504,7 +6611,8 @@ function buildBillingCheck(){
     (seen ? extraInvoices : unmarked).push(inv);
   });
 
-  return { missing, tooRecent, unmarked, extraInvoices, rigChanged, matchedByCount, duplicateWells, perWellCount: perWell.length, markedCount: marked.filter(m=>m.inRange).length, grace: billingCheckGraceDays(), startDate: startDate, isScoped: !!appSettings.billingCheckStartDate };
+  return { missing, tooRecent, unmarked, extraInvoices, rigChanged, matchedByCount,
+           needsConfirm, linkedByHand, brokenLinks, duplicateWells, perWellCount: perWell.length, markedCount: marked.filter(m=>m.inRange).length, grace: billingCheckGraceDays(), startDate: startDate, isScoped: !!appSettings.billingCheckStartDate };
 }
 
 function renderDuplicateWellBand(c){
@@ -6557,6 +6665,83 @@ function renderBillingCheckFooter(c){
   </div>`;
 }
 
+/* Wells whose name does not appear on any invoice.
+
+   The tracker's label is typed by hand and the invoice's well name is typed
+   again somewhere else, so on some rigs they never agree and a name match is
+   simply never going to happen. The app used to paper over that by counting:
+   spare invoice on the right rig, near enough on dates, call it billed. That
+   is how two wells that had never been invoiced at all came to read as
+   settled - and on a rig carrying more invoices than tracked wells, a spare
+   was always available, so an unbilled well could never be flagged there.
+
+   Nothing is settled by inference now. If the name does not match, the well
+   is flagged. Where an invoice could plausibly be the one, it is offered as a
+   suggestion with its dates shown, and answering it writes the invoice number
+   onto the well. That link is permanent, so each mismatch is a question asked
+   once rather than a guess repeated forever.
+*/
+function renderNeedsConfirmBand(c){
+  const list = ((c && c.needsConfirm) || []).filter(r=>r.inRange);
+  if(!list.length) return '';
+  const n = list.length;
+  return `<div style="background:#FFF8E6; border:1.5px solid #E6D080; border-radius:8px; padding:14px 16px; margin-bottom:12px;">
+    <div style="font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; font-size:13px; color:#8A6D10; font-weight:600; margin-bottom:4px;">
+      ${n} well${n!==1?'s':''} marked billed with no invoice by that name
+    </div>
+    <div style="font-size:12px; color:#8A6D10; margin-bottom:10px;">
+      No invoice in QuickBooks names ${n!==1?'these wells':'this well'}. There is an invoice on the rig that could be the one, but nothing proves it. Open it, and if it is the right one, confirm it here &mdash; the invoice number gets saved onto the well and it is never asked again.
+    </div>
+    ${list.map(r=>{
+      const window = (r.padStart || r.padEnd)
+        ? `pad ${fmtDate(r.padStart)}${r.padEnd?' to '+fmtDate(r.padEnd):' onward'}`
+        : 'no pad dates on file';
+      return `<div style="padding:10px 0; border-top:1px solid #E6D080;">
+        <div style="font-size:13px; font-weight:600;">${escHtml(r.well || '(no well name)')}</div>
+        <div style="font-size:11px; color:#8A6D10;">${escHtml(r.rig||'no rig')} &middot; ${escHtml(r.customer||'')} &middot; ${escHtml(window)} &middot; marked ${escHtml(fmtDate(r.date))}</div>
+        <div style="font-size:12px; color:#6B5608; margin-top:6px;">
+          Possible match: <strong>${escHtml(r.doc||'invoice')}</strong>${r.invDate?' dated '+escHtml(fmtDate(r.invDate)):''}${r.invWell?`, billed as &ldquo;${escHtml(r.invWell)}&rdquo;`:''}${r.invRig?' on '+escHtml(r.invRig):''}
+          ${r.ambiguous?'<span style="color:#B5432A;"> &middot; other invoices could fit too &mdash; check the number</span>':''}
+        </div>
+        <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
+          <button data-link-well="${escAttr(r.ticketId)}" data-pad-index="${r.padIdx}" data-well-index="${r.wellIdx}" data-doc="${escAttr(r.doc||'')}"
+            style="background:#1E8A29; color:#fff; border:none; border-radius:4px; padding:6px 12px; font-size:12px; font-family:inherit; cursor:pointer;">Yes &mdash; that's the invoice</button>
+          <button data-noinv-well="${escAttr(r.ticketId)}" data-pad-index="${r.padIdx}" data-well-index="${r.wellIdx}"
+            style="background:none; color:#B5432A; border:1px solid #E0A9A0; border-radius:4px; padding:6px 12px; font-size:12px; font-family:inherit; cursor:pointer;">No &mdash; not invoiced yet</button>
+        </div>
+      </div>`;
+    }).join('')}
+  </div>`;
+}
+
+/* Wells tied to an invoice that QuickBooks no longer returns. */
+function renderBrokenLinkBand(c){
+  const list = (c && c.brokenLinks) || [];
+  if(!list.length) return '';
+  return `<div style="background:#FCEBEA; border:1.5px solid #E0A9A0; border-radius:8px; padding:12px 14px; margin-bottom:12px;">
+    <div style="font-size:12px; color:#8A3B2A;">
+      <strong>${list.length} confirmed invoice${list.length!==1?'s are':' is'} no longer in QuickBooks.</strong>
+      These wells were tied to an invoice number by hand, and that invoice isn't coming back in the pull &mdash; voided, renumbered, or dated outside the window being checked.
+    </div>
+    ${list.map(r=>`<div style="padding:6px 0; border-top:1px dashed #E0A9A0; font-size:12px;">
+      <span style="font-weight:600;">${escHtml(r.well||'(no name)')}</span>
+      <span style="color:#8A3B2A;"> &middot; linked to ${escHtml(r.doc)} &middot; ${escHtml(r.rig||'no rig')}</span>
+      <button data-unlink-well="${escAttr(r.ticketId)}" data-pad-index="${r.padIdx}" data-well-index="${r.wellIdx}"
+        style="background:none; border:1px solid #E0A9A0; color:#8A3B2A; border-radius:4px; padding:3px 9px; font-size:11px; font-family:inherit; cursor:pointer; margin-left:8px;">Clear the link</button>
+    </div>`).join('')}
+  </div>`;
+}
+
+/* Pairings a person confirmed. Quiet - it is settled work. */
+function renderLinkedBand(c){
+  const list = (c && c.linkedByHand) || [];
+  if(!list.length) return '';
+  return `<div style="background:#EEF4EE; border:1.5px solid #B7D9BB; border-radius:8px; padding:10px 14px; margin-bottom:12px; font-size:12px; color:#2E5B34;">
+    <strong>${list.length} well${list.length!==1?'s':''} confirmed against an invoice by hand.</strong>
+    ${escHtml(list.map(r=>(r.well||'(no name)') + ' → ' + (r.doc||'')).join(', '))}
+  </div>`;
+}
+
 function renderBillingCheck(){
   if(!syncUrl) return '';
   if(!qbRevenueData || !qbRevenueData.connected || qbRevenueData.error) return '';
@@ -6568,17 +6753,21 @@ function renderBillingCheck(){
 
   // Duplicated well names are a real finding, so they must not sit under a
   // banner reading "Everything lines up".
-  if(c.missing.length === 0 && c.unmarked.length === 0 && c.duplicateWells.length === 0){
+  const pendingConfirm = (c.needsConfirm||[]).filter(r=>r.inRange).length;
+  if(c.missing.length === 0 && c.unmarked.length === 0 && c.duplicateWells.length === 0 && pendingConfirm === 0 && (c.brokenLinks||[]).length === 0){
     return `${heading}
       <div style="background:#EEF4EE; border:1.5px solid #B7D9BB; border-radius:8px; padding:14px 16px; font-size:13px;">
         <strong style="color:#1E8A29;">Everything lines up.</strong>
         <div style="font-size:12px; color:#5B6660; margin-top:4px;">
-          ${c.markedCount} well${c.markedCount!==1?'s':''} marked billed in range, all matched to an invoice.
+          ${c.markedCount} well${c.markedCount!==1?'s':''} marked billed in range, every one tied to an invoice by name or confirmed by hand.
           ${c.tooRecent.length?`${c.tooRecent.length} marked in the last ${c.grace} days ${c.tooRecent.length!==1?'are':'is'} not checked yet.`:''}
         </div>
       </div>
       ${renderDuplicateWellBand(c)}
       ${renderExtraInvoiceBand(c)}
+      ${renderNeedsConfirmBand(c)}
+      ${renderBrokenLinkBand(c)}
+      ${renderLinkedBand(c)}
       ${c.rigChanged.length?`<div style="background:#EEF4EE; border:1.5px solid #B7D9BB; border-radius:8px; padding:12px 14px; margin-top:10px; font-size:12px; color:#2E5B34;">
         <strong>${c.rigChanged.length} well${c.rigChanged.length!==1?'s':''} matched under a different rig</strong> — ${c.rigChanged.map(r=>escHtml(r.well)+' (invoiced as '+escHtml(r.invoiceRig)+')').join(', ')}. Normal after a rig transfer.
       </div>`:''}
@@ -6598,7 +6787,7 @@ function renderBillingCheck(){
       </div>
       ${c.missing.map(m=>`<div style="padding:8px 0; border-top:1px solid #E0A9A0; font-size:13px;">
         <div style="font-weight:600;">${escHtml(m.label || '(no well name)')}</div>
-        <div style="font-size:11px; color:#8A3B2A;">${escHtml(m.rig||'no rig')} &middot; ${escHtml(m.pad||'no pad')} &middot; ${escHtml(m.customer||'')} &middot; marked ${fmtDate(m.date)}</div>
+        <div style="font-size:11px; color:#8A3B2A;">${escHtml(m.rig||'no rig')} &middot; ${escHtml(m.pad||'no pad')} &middot; ${escHtml(m.customer||'')} &middot; marked ${fmtDate(m.date)}${m.noInvoice?' &middot; <strong>you flagged this as not invoiced</strong>':''}</div>
       </div>`).join('')}
     </div>`;
   }
@@ -6620,18 +6809,9 @@ function renderBillingCheck(){
   out += renderDuplicateWellBand(c);
   out += renderExtraInvoiceBand(c);
 
-  if(c.matchedByCount.length > 0){
-    out += `<div style="background:#EEF4EE; border:1.5px solid #B7D9BB; border-radius:8px; padding:12px 14px; margin-bottom:12px;">
-      <div style="font-size:12px; color:#2E5B34;">
-        <strong>${c.matchedByCount.length} well${c.matchedByCount.length!==1?'s':''} reconciled by count.</strong>
-        The invoice exists for the right rig, but the well name on it doesn't match what was typed in the tracker. Counted as billed.
-      </div>
-      ${c.matchedByCount.map(r=>`<div style="padding:6px 0; border-top:1px dashed #B7D9BB; font-size:12px;">
-        <span style="font-weight:600;">${escHtml(r.well||'(no name)')}</span>
-        <span style="color:#5B6660;"> &middot; paired with ${escHtml(r.doc||'invoice')} on ${escHtml(r.rig||'')}</span>
-      </div>`).join('')}
-    </div>`;
-  }
+  out += renderNeedsConfirmBand(c);
+  out += renderBrokenLinkBand(c);
+  out += renderLinkedBand(c);
 
   if(c.rigChanged.length > 0){
     out += `<div style="background:#EEF4EE; border:1.5px solid #B7D9BB; border-radius:8px; padding:12px 14px; margin-bottom:12px;">
@@ -8514,6 +8694,60 @@ function attachHandlers(){
       if(Array.isArray(t.pads) && pi >= 0 && t.pads[pi]) return t.pads[pi];
       return getActivePad(t);
     };
+
+    // Billing Check: tie a well to a real invoice number, or say plainly that
+    // it hasn't been invoiced. Either answer is recorded on the well, so the
+    // same question is never asked twice.
+    const billedWellFromBtn = (b)=>{
+      const t = tickets.find(x=>x.id===b.dataset.linkWell || x.id===b.dataset.noinvWell || x.id===b.dataset.unlinkWell);
+      if(!t) return null;
+      const pi = parseInt(b.dataset.padIndex, 10);
+      const pad = (Array.isArray(t.pads) && pi >= 0) ? t.pads[pi] : null;
+      if(!pad || !Array.isArray(pad.billedWells)) return null;
+      const wi = parseInt(b.dataset.wellIndex, 10);
+      const w = pad.billedWells[wi];
+      if(!w) return null;
+      return { t, pad, w };
+    };
+
+    document.querySelectorAll('[data-link-well]').forEach(b=>{
+      b.onclick = async ()=>{
+        const f = billedWellFromBtn(b);
+        if(!f) return;
+        const doc = b.dataset.doc || '';
+        if(!doc) return;
+        if(!confirm(`Tie "${f.w.label||'this well'}" to invoice ${doc}?\n\nOnly do this if you've opened ${doc} and it really is this well. It will be treated as billed from now on and won't be asked about again.`)) return;
+        f.w.invDoc = doc;
+        delete f.w.noInvoice;
+        f.t.updatedAt = nowIso();
+        await saveTickets();
+        render();
+      };
+    });
+
+    document.querySelectorAll('[data-noinv-well]').forEach(b=>{
+      b.onclick = async ()=>{
+        const f = billedWellFromBtn(b);
+        if(!f) return;
+        f.w.noInvoice = true;
+        delete f.w.invDoc;
+        f.t.updatedAt = nowIso();
+        await saveTickets();
+        render();
+        alert(`"${f.w.label||'That well'}" is now flagged as not invoiced.\n\nIt will stay in the red list until an invoice naming it shows up in QuickBooks, or you confirm one by hand.`);
+      };
+    });
+
+    document.querySelectorAll('[data-unlink-well]').forEach(b=>{
+      b.onclick = async ()=>{
+        const f = billedWellFromBtn(b);
+        if(!f) return;
+        delete f.w.invDoc;
+        f.t.updatedAt = nowIso();
+        await saveTickets();
+        render();
+      };
+    });
 
     document.querySelectorAll('[data-unbill-well]').forEach(b=>{
       b.onclick = async ()=>{
