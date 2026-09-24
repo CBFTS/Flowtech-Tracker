@@ -924,7 +924,7 @@ function matchInvoiceRule(inv){
 }
 
 let syncStatus = 'idle'; // idle | saving | loading | ok | error
-const APP_BUILD = '162';  // shown in the sync panel - bump on every release
+const APP_BUILD = '163';  // shown in the sync panel - bump on every release
 let pushInProgress = false; // true while a push is in flight — blocks auto-pull to prevent race conditions
 // Bumped by every local save. pullFromCloud captures it before its fetch and
 // re-checks it after: pushInProgress only stops a pull STARTING mid-push, it
@@ -4390,6 +4390,29 @@ function renderActionAlerts(){
   const outTickets = tickets.filter(t=>!t.returnDate);
   const alerts = [];
 
+  /* Wells marked billed that no invoice accounts for.
+
+     This lives on the dashboard, not buried at the bottom of Reports, because
+     of what it actually catches: marking a well billed and then being pulled
+     away before the invoice gets raised. Someone who forgot to invoice is by
+     definition not going to remember to go and look for a report about it.
+     It has to be in front of them when they open the app.
+
+     Wrapped because it depends on the QuickBooks pull, and a dashboard that
+     throws because revenue data arrived half-formed is worse than one
+     missing a warning. */
+  let billingRisk = null;
+  try{
+    if(syncUrl && qbRevenueData && qbRevenueData.connected && !qbRevenueData.error){
+      const bc = buildBillingCheck();
+      const pending = (bc.needsConfirm || []).filter(r=>r.inRange);
+      const broken = bc.brokenLinks || [];
+      if(bc.missing.length || pending.length || broken.length){
+        billingRisk = { missing: bc.missing, pending: pending, broken: broken };
+      }
+    }
+  }catch(e){ billingRisk = null; }
+
   outTickets.forEach(t=>{
     if(!Array.isArray(t.pads) || t.pads.length === 0) return;
     const pad = getActivePad(t);
@@ -4423,12 +4446,42 @@ function renderActionAlerts(){
     }
   });
 
-  if(alerts.length === 0) return '';
+  if(alerts.length === 0 && !billingRisk) return '';
 
   const moveAlerts = alerts.filter(a=>a.type==='move');
   const billingAlerts = alerts.filter(a=>a.type==='billing');
 
   let html = '<div style="margin-bottom:16px;">';
+
+  // First, because it is the only one of these that is money already earned
+  // and possibly never charged for.
+  if(billingRisk){
+    const nMissing = billingRisk.missing.length;
+    const nPending = billingRisk.pending.length;
+    const nBroken  = billingRisk.broken.length;
+    const urgent = nMissing > 0 || nBroken > 0;
+    const bg = urgent ? '#FCEBEA' : '#FFF8E6';
+    const bd = urgent ? '#E8A5A0' : '#E6D080';
+    const fg = urgent ? '#B5432A' : '#8A6D10';
+    const parts = [];
+    if(nMissing) parts.push(`${nMissing} well${nMissing!==1?'s':''} with no invoice`);
+    if(nPending) parts.push(`${nPending} waiting on you to confirm`);
+    if(nBroken)  parts.push(`${nBroken} linked to an invoice that's gone`);
+    html += `<div style="background:${bg}; border:1.5px solid ${bd}; border-radius:8px; padding:14px 18px; margin-bottom:10px; cursor:pointer;" data-goto-billing="1">`;
+    html += `<div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">`;
+    html += `<span style="font-size:18px;">⚠</span>`;
+    html += `<span style="font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; font-size:13px; color:${fg}; font-weight:600;">Marked billed, not invoiced &middot; ${parts.join(' &middot; ')}</span>`;
+    html += `</div>`;
+    billingRisk.missing.slice(0,6).forEach(m=>{
+      html += `<div style="padding:6px 0; border-top:1px solid ${bd}; font-size:13px;">`;
+      html += `<span style="font-weight:600; color:#7A1F1F;">${escHtml(m.label||'(no well name)')}</span>`;
+      html += `<span style="font-size:12px; color:${fg};"> &middot; ${escHtml(m.rig||'no rig')} &middot; ${escHtml(m.customer||'')} &middot; marked ${escHtml(fmtDate(m.date))}</span>`;
+      html += `</div>`;
+    });
+    if(nMissing > 6) html += `<div style="font-size:11px; color:${fg}; padding-top:6px;">and ${nMissing-6} more.</div>`;
+    html += `<div style="font-size:11px; color:${fg}; padding-top:8px;">Open the Billing Check on Reports to work through ${nMissing+nPending+nBroken===1?'it':'them'}.</div>`;
+    html += `</div>`;
+  }
 
   if(moveAlerts.length > 0){
     html += `<div style="background:#FCEBEA; border:1.5px solid #E8A5A0; border-radius:8px; padding:14px 18px; margin-bottom:10px;">`;
@@ -6182,9 +6235,22 @@ function matchChargeRule(customer, rig){
   return withRig || forCustomer.find(r=>!String(r.rig||'').trim()) || null;
 }
 
+/* How long a freshly marked well is left alone before it can be flagged.
+
+   The normal sequence is invoice in QuickBooks first, mark it here after, so
+   a marked well with no invoice is already out of order and can be reported
+   quickly. The window only covers doing it the other way round - sitting down
+   with an operator, catching the tracker up, and invoicing afterwards.
+
+   Three days rather than a week: that catch-up is done between hitches and
+   it is easy to get pulled away before the invoicing happens. A well that
+   surfaces on Thursday is still in mind; the same well surfacing the
+   following week is not. Zero is allowed and means flag it immediately.
+*/
 function billingCheckGraceDays(){
   const v = Number(appSettings.billingCheckGraceDays);
-  return (v > 0) ? v : 7;
+  if(appSettings.billingCheckGraceDays === 0 || appSettings.billingCheckGraceDays === '0') return 0;
+  return (v > 0) ? v : 3;
 }
 
 /* Any invoice that names a well is a billing event for that well, whether it
@@ -6661,6 +6727,13 @@ function renderBillingCheckFooter(c){
         style="padding:4px 6px; border:1px solid var(--line); border-radius:4px; font-size:12px; font-family:inherit;">
       ${c.isScoped?`<button id="billing-check-reset" style="background:none; border:none; padding:0; color:#2E7D32; font-size:11px; text-decoration:underline; cursor:pointer; font-family:inherit;">use whole year</button>`:''}
       <span style="color:#8A8F94;">anything before this is treated as already settled</span>
+    </div>
+    <div style="display:flex; align-items:center; gap:8px; margin-top:6px; flex-wrap:wrap;">
+      <span>Flag a well after</span>
+      <input type="number" id="billing-check-grace" min="0" max="60" step="1" value="${escAttr(String(c.grace))}"
+        style="width:58px; padding:4px 6px; border:1px solid var(--line); border-radius:4px; font-size:12px; font-family:inherit;">
+      <span>day${c.grace!==1?'s':''} with no invoice</span>
+      <span style="color:#8A8F94;">set it to 0 to flag the moment a well is marked</span>
     </div>
   </div>`;
 }
@@ -7689,6 +7762,21 @@ function attachHandlers(){
     };
   });
 
+  const bcGrace = document.getElementById('billing-check-grace');
+  if(bcGrace){
+    bcGrace.onchange = async ()=>{
+      const raw = bcGrace.value;
+      const n = parseInt(raw, 10);
+      if(raw === '' || isNaN(n) || n < 0 || n > 60){
+        alert('Enter a whole number of days between 0 and 60. Nothing was changed.');
+        bcGrace.value = String(billingCheckGraceDays());
+        return;
+      }
+      appSettings.billingCheckGraceDays = n;
+      await saveAppSettings();
+      render();
+    };
+  }
   const bcStart = document.getElementById('billing-check-start');
   if(bcStart) bcStart.onchange = async ()=>{
     appSettings.billingCheckStartDate = bcStart.value || '';
@@ -8008,6 +8096,9 @@ function attachHandlers(){
   }
 
   if(currentTab === 'dashboard'){
+    document.querySelectorAll('[data-goto-billing]').forEach(row=>{
+      row.onclick = ()=>{ currentTab = 'reports'; render(); };
+    });
     document.querySelectorAll('[data-goto-rig]').forEach(row=>{
       row.onclick = ()=>{
         rigSearchTerm = row.dataset.gotoRig;
