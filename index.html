@@ -924,7 +924,7 @@ function matchInvoiceRule(inv){
 }
 
 let syncStatus = 'idle'; // idle | saving | loading | ok | error
-const APP_BUILD = '164';  // shown in the sync panel - bump on every release
+const APP_BUILD = '165';  // shown in the sync panel - bump on every release
 let pushInProgress = false; // true while a push is in flight — blocks auto-pull to prevent race conditions
 // Bumped by every local save. pullFromCloud captures it before its fetch and
 // re-checks it after: pushInProgress only stops a pull STARTING mid-push, it
@@ -1066,6 +1066,32 @@ function queuePendingSubmission(apiUrl, body){
 // Tries to send every queued submission. Successes are removed from the
 // queue; anything that still fails (still offline) stays queued for next
 // time. Safe to call repeatedly - does nothing if the queue is empty.
+/* Did the server actually SAVE it, or did the request merely complete?
+
+   Apps Script answers 200 with an error body when the token is wrong and 500
+   when the script throws, and both of those resolve the fetch promise. Every
+   driver-facing submission treated a resolved promise as success: the page
+   showed "Signature Submitted - thank you, ticket #… has been confirmed", the
+   signature only ever existed in that page's canvas, and it was gone. The
+   catch that would have queued it for retry never ran, because nothing threw.
+
+   Throwing on a bad answer puts those paths back on the retry queue where
+   they belong.                                                           */
+async function postAndConfirm(url, body){
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify(body)
+  });
+  if(!res.ok) throw new Error('server returned ' + res.status);
+  // A body is not guaranteed - an older backend returns none, and that is
+  // not a failure. An explicit error in one is.
+  let parsed = null;
+  try{ parsed = await res.json(); }catch(e){ parsed = null; }
+  if(parsed && parsed.error) throw new Error(String(parsed.error));
+  return parsed;
+}
+
 async function flushPendingSubmissions(){
   const list = getPendingSubmissions();
   if(list.length === 0) return { attempted: 0, succeeded: 0 };
@@ -1073,13 +1099,13 @@ async function flushPendingSubmissions(){
   let succeeded = 0;
   for(const item of list){
     try{
-      await fetch(item.apiUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify(item.body)
-      });
+      await postAndConfirm(item.apiUrl, item.body);
       succeeded++;
     }catch(e){
+      // Anything that did not land stays queued. This used to count every
+      // answer as a success and drop the item, so one retry against a 500
+      // permanently discarded a signature the page had promised would "send
+      // automatically as soon as you're back online".
       stillPending.push(item);
     }
   }
@@ -1229,7 +1255,14 @@ function countableItemNames(){
 }
 
 function startCountSession(){
-  countSession = { startedAt: new Date().toISOString(), items: {} };
+  // What is out on tickets is captured NOW, at the moment the count starts,
+  // and used when it is applied. Owned is computed as ready + shop + out, and
+  // `out` used to be read fresh at apply time - so iron that was standing in
+  // the yard when it was tallied at 08:00 and left on a ticket at 10:00 was
+  // counted in BOTH terms, and owned came out permanently too high. The
+  // session is explicitly designed to be paused and resumed, so hours between
+  // walking the yard and finishing is the normal case, not an edge one.
+  countSession = { startedAt: new Date().toISOString(), outAtStart: outQtyByName(), items: {} };
   saveCountSession();
   countMode = 'counting';
   countSearchTerm = '';
@@ -1564,32 +1597,51 @@ async function reconcileYardFromTickets_(){
     const wantBack = (t && t.returnDate) ? q : {};      // came home => went into the shop queue
 
     // Ready: subtract what has gone out, give back anything no longer out.
+    /* The ledger records WHAT THE TICKET SAYS, not what the buckets could
+       cover.
+
+       It used to record only the quantity that actually moved. Ready cannot
+       go below zero, so a delivery the yard record could not cover recorded
+       nothing - and the debit stayed pending, re-attempted on every single
+       reconcile, for as long as the ledger lived. The first time Ready had
+       any stock, that stale debit took it.
+
+       Which made the Ready button appear broken out of the box. Ready is 0
+       for everything until the first yard count, so ANY ticket written before
+       then left a permanent debit. The iron goes out, comes home, shows
+       correctly as In Shop, you tap Ready and enter 5 - and the reconcile
+       that runs on the very same save applies the old debit and puts Ready
+       straight back to 0. The row then disappears entirely, because the yard
+       breakdown only draws when ready or shop is above zero.
+
+       Recording the full intent fixes it and also terminates properly: the
+       next reconcile computes a delta of zero and does nothing, so there is
+       no repeating push either. Where the buckets genuinely could not cover
+       the movement the numbers now disagree with each other in the open, and
+       Full Inventory's own "more marked ready than are home" line says so -
+       which is a visible wrong number instead of an invisible one. */
     const outNames = new Set(Object.keys(wantOut).concat(Object.keys(rec.out)));
     outNames.forEach(name=>{
-      const delta = (wantOut[name]||0) - (rec.out[name]||0);
+      const want = (wantOut[name]||0);
+      const delta = want - (rec.out[name]||0);
       if(delta === 0) return;
       // Ready falls when iron leaves, so the sign is inverted here.
-      const moved = applyDelta(name, 'ready', -delta);
-      rec.out[name] = (rec.out[name]||0) - moved;
+      applyDelta(name, 'ready', -delta);
+      rec.out[name] = want;
       if(rec.out[name] <= 0) delete rec.out[name];
-      // Only a real movement counts as a change. Ready can't go below zero,
-      // so when the yard is short, moved is 0 and NOTHING above changed -
-      // but this used to report "changed" anyway. That answer is what makes
-      // saveAppSettings push, and the push ends by reconciling again, so the
-      // two called each other forever, one POST per lap, on any item whose
-      // Ready count couldn't cover the ticket.
-      if(moved !== 0) changed = true;
+      changed = true;
     });
 
     // Shop queue: add on return, and remove again if the return is undone.
     const backNames = new Set(Object.keys(wantBack).concat(Object.keys(rec.back)));
     backNames.forEach(name=>{
-      const delta = (wantBack[name]||0) - (rec.back[name]||0);
+      const want = (wantBack[name]||0);
+      const delta = want - (rec.back[name]||0);
       if(delta === 0) return;
-      const moved = applyDelta(name, 'shop', delta);
-      rec.back[name] = (rec.back[name]||0) + moved;
+      applyDelta(name, 'shop', delta);
+      rec.back[name] = want;
       if(rec.back[name] <= 0) delete rec.back[name];
-      if(moved !== 0) changed = true;   // same reason as above
+      changed = true;
     });
 
     // Ledger entry for a ticket that no longer exists and has nothing left
@@ -1834,6 +1886,19 @@ function seedMadeToOrderOnce(){
    on a schedule that matches when you're holding a phone. So the dates are
    editable after the fact instead.
 */
+/* Three different answers, not two.
+
+   Every rejection here says "Nothing was changed", and every one of them
+   returned undefined - which the Edit Pad caller reads as "the user didn't
+   want to touch the date, carry on". So typing a new pad name, a new well
+   count and an unreadable date produced the alert AND saved the name and the
+   count. The well count drives the x-of-y counter and the "all wells billed,
+   rig move needed" alert, so the message was not just wrong, it was wrong
+   about the number that fires an alarm.
+
+   undefined = cancelled, leave this field alone and carry on.
+   null      = rejected, the whole edit must abort so the alert tells the truth.
+   a string  = the new value.                                              */
 function promptPadDate(label, current, opts){
   const o = opts || {};
   const raw = prompt(`${label}\n\nYYYY-MM-DD${o.allowBlank ? ' — leave blank if the pad is still running.' : ''}`,
@@ -1843,22 +1908,22 @@ function promptPadDate(label, current, opts){
   if(!v){
     if(o.allowBlank) return '';
     alert('A date is required. Nothing was changed.');
-    return undefined;
+    return null;
   }
   if(!/^\d{4}-\d{2}-\d{2}$/.test(v)){
     alert(`"${v}" isn't a date in YYYY-MM-DD form. Nothing was changed.`);
-    return undefined;
+    return null;
   }
   const d = new Date(v + 'T00:00:00');
   // Date() happily accepts 2026-02-31 and rolls it into March, so the round
   // trip is what actually proves the day exists.
   if(isNaN(d.getTime()) || d.toISOString().slice(0,10) !== v){
     alert(`There is no such date as ${v}. Nothing was changed.`);
-    return undefined;
+    return null;
   }
   if(v > todayStr()){
     alert(`${fmtDate(v)} is in the future. Nothing was changed.`);
-    return undefined;
+    return null;
   }
   return v;
 }
@@ -1888,10 +1953,28 @@ async function renameEquipment(oldName, newName){
   if(inv.items[oldName]){
     const from = inv.items[oldName];
     const to = inv.items[target] || { ready:0, shop:0 };
-    inv.items[target] = {
-      ready: (Number(to.ready)||0) + (Number(from.ready)||0),
-      shop:  (Number(to.shop)||0)  + (Number(from.shop)||0)
+    // Carry the rest of the entry across, not just the two quantities.
+    // Rebuilding it as a bare {ready, shop} threw away countedAt and the shop
+    // batch ages - so fixing a typo in a name reset "at the inspector 36 days,
+    // worth a call" to 0 days, meaning the 14-day threshold would never fire
+    // for that batch again, and flipped the item to "never counted" so it
+    // landed in the red missed-again box on the next count review. The name
+    // is a key in more places than the seven the cascade already knew about.
+    const mergedEntry = Object.assign({}, from, to);
+    mergedEntry.ready = (Number(to.ready)||0) + (Number(from.ready)||0);
+    mergedEntry.shop  = (Number(to.shop)||0)  + (Number(from.shop)||0);
+    // Where both sides have a history, keep the OLDER facts - an item that
+    // has been at the inspector since August is still that old after a
+    // rename, and the count that matters is the one longest ago.
+    const olderOf = (a, b)=>{
+      if(!a) return b; if(!b) return a;
+      return String(a) < String(b) ? a : b;
     };
+    if(from.countedAt || to.countedAt) mergedEntry.countedAt = olderOf(from.countedAt, to.countedAt);
+    const fb = Array.isArray(from.batches) ? from.batches : [];
+    const tb = Array.isArray(to.batches) ? to.batches : [];
+    if(fb.length || tb.length) mergedEntry.batches = fb.concat(tb);
+    inv.items[target] = mergedEntry;
     if(target !== oldName) delete inv.items[oldName];
   }
 
@@ -2038,6 +2121,16 @@ function peakConcurrentByItem(){
   tickets.forEach(t=>{
     const start = t.deliveryDate;
     if(!start) return;
+    // An OPEN ticket has not come back. Giving it a synthetic end date of
+    // today, combined with the same-day tie-break below that processes
+    // returns before deliveries, meant a ticket delivered TODAY was cancelled
+    // by its own end event before its delivery was ever counted - so it
+    // contributed nothing to the peak. Anything delivered today came out as
+    // "peak 0" and was dropped from the Fill From Tickets review entirely,
+    // or produced a row reading "6 out now, peak 2 at once" that set owned to
+    // 2 and left On Hand at minus four. Open tickets get no end event at all,
+    // which is the truth: that iron has not come home.
+    const openTicket = !t.returnDate;
     const end = t.returnDate || today;
     (t.equipment||[]).forEach(e=>{
       const name = e.name;
@@ -2045,7 +2138,7 @@ function peakConcurrentByItem(){
       if(!name || qty <= 0) return;
       if(!events[name]) events[name] = [];
       events[name].push({ date:start, delta:qty });
-      events[name].push({ date:end, delta:-qty });
+      if(!openTicket) events[name].push({ date:end, delta:-qty });
     });
   });
 
@@ -2225,7 +2318,11 @@ function renderCountReview(){
 }
 
 async function applyCountSession(){
-  const out = outQtyByName();
+  // The snapshot taken when the count began. A session resumed from before
+  // this existed falls back to the old behaviour rather than failing.
+  const out = (countSession && countSession.outAtStart && typeof countSession.outAtStart === 'object')
+    ? countSession.outAtStart
+    : outQtyByName();
   const names = countableItemNames();
   const snapshot = {};
   let applied = 0;
@@ -5148,12 +5245,25 @@ function renderByRig(){
     const itemCount = rigTickets.reduce((s,t)=>s+t.equipment.length,0);
     const customer = rigTickets[0]?.customer || '—';
 
-    // Find the primary ticket for pad tracking (most recent delivery)
-    const primaryTicket = rigTickets.slice().sort((a,b)=>(b.deliveryDate||'').localeCompare(a.deliveryDate||''))[0];
-    const activePad = primaryTicket ? getActivePad(primaryTicket) : null;
+    /* A pad panel for EVERY open ticket on this rig, not just the newest.
 
-    // Pad status summary for the rig header area
+       It used to pick one "primary" ticket - whichever had the latest
+       delivery date - and that was the only pad shown and the only one the
+       Well Billed button could write to. A rig running two open tickets at
+       once therefore had a pad the dashboard nagged about and the rig tracker
+       would not show, and pressing Well Billed recorded the well against the
+       OTHER ticket's pad. The nagged pad stayed at its old count forever, the
+       other pad's count went up by a well that was never drilled on it, and
+       the well was filed under the wrong pad name - which then feeds the
+       Billing Check's per-pad date window and the Reports pad column. */
+    const padTickets = rigTickets.slice().sort((a,b)=>(b.deliveryDate||'').localeCompare(a.deliveryDate||''));
+    let padHtml = padTickets.map((primaryTicket, ptIdx)=>{
+    const activePad = getActivePad(primaryTicket);
+    const multi = padTickets.length > 1;
     let padHtml = '';
+    if(multi){
+      padHtml += `<div style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:var(--ink-soft); margin-top:10px; letter-spacing:0.5px;">TICKET ${escHtml(primaryTicket.ticketNumber || primaryTicket.id)}${primaryTicket.deliveryDate?' &middot; out '+escHtml(fmtDate(primaryTicket.deliveryDate)):''}</div>`;
+    }
     if(activePad){
       const billed = Array.isArray(activePad.billedWells) ? activePad.billedWells.length : 0;
       const total = activePad.totalWells || 0;
@@ -5185,23 +5295,25 @@ function renderByRig(){
 
       padHtml += padHistoryHtml(primaryTicket);
       padHtml += `</div>`;
-    } else if(primaryTicket && Array.isArray(primaryTicket.pads) && primaryTicket.pads.some(p=>p.status==='complete')) {
+    } else if(Array.isArray(primaryTicket.pads) && primaryTicket.pads.some(p=>p.status==='complete')) {
       // Every pad finished but the iron is still out - the rig is between
       // pads. This used to fall through to "No pad tracking on this rig
       // yet", which is plainly untrue when the history is sitting right
       // there, and it put that history (and the only way to correct a pad's
       // dates) out of reach at exactly the moment it's being looked at.
-      padHtml = `<div style="background:#FCFAF3; border:1.5px solid var(--line); border-radius:6px; padding:12px; margin:8px 0;">
+      padHtml += `<div style="background:#FCFAF3; border:1.5px solid var(--line); border-radius:6px; padding:12px; margin:8px 0;">
         <div style="font-size:13px; color:var(--ink-soft); margin-bottom:8px;">No pad running right now &mdash; every pad on this ticket is complete.</div>
         <button class="ghost-btn" data-add-pad="${primaryTicket.id}" style="font-size:12px; padding:7px 14px;">+ Add Pad</button>`;
       padHtml += padHistoryHtml(primaryTicket);
       padHtml += `</div>`;
-    } else if(primaryTicket) {
-      padHtml = `<div style="background:#FCFAF3; border:1.5px solid var(--line); border-radius:6px; padding:12px; margin:8px 0;">
-        <div style="font-size:13px; color:var(--ink-soft); margin-bottom:8px;">No pad tracking on this rig yet.</div>
+    } else {
+      padHtml += `<div style="background:#FCFAF3; border:1.5px solid var(--line); border-radius:6px; padding:12px; margin:8px 0;">
+        <div style="font-size:13px; color:var(--ink-soft); margin-bottom:8px;">No pad tracking on this ticket yet.</div>
         <button class="ghost-btn" data-add-pad="${primaryTicket.id}" style="font-size:12px; padding:7px 14px;">+ Add Pad</button>
       </div>`;
     }
+    return padHtml;
+    }).join('');
 
     const ticketBlocks = rigTickets.map(t=>{
       const days = daysBetween(t.deliveryDate, todayStr());
@@ -7143,13 +7255,27 @@ function renderReports(){
     if(!Array.isArray(t.pads)) return;
     t.pads.forEach(pad=>{
       const billed = Array.isArray(pad.billedWells) ? pad.billedWells : [];
+      // A finished pad whose end date was cleared used to fall into the
+      // still-running branch and count its days from the start date to TODAY,
+      // growing by one every morning and dragging Avg Days on Pad with it -
+      // 42 days became 160 and kept climbing. A pad marked complete with no
+      // end date is missing data, not a pad that has been running for months.
+      const padIsDone = pad.status === 'complete' || !!pad.completedDate;
       const padDays = (pad.completedDate && pad.startDate ? daysBetween(pad.startDate, pad.completedDate)
-                     : pad.startDate ? daysBetween(pad.startDate, todayStr())
+                     : (!padIsDone && pad.startDate) ? daysBetween(pad.startDate, todayStr())
                      : 0) || 0;
-      
+
+      // The rig stamped on a well when it was billed, not the ticket's rig
+      // today. Transferring iron to a replacement rig is done by renaming the
+      // rig on the same ticket, so reading t.rig here retroactively moved
+      // every well and every pad of the OLD rig onto the new one - the old
+      // rig vanished from Rig Efficiency and Pad History entirely, and the
+      // new one's Days/Well was computed over another rig's work.
+      const padRig = (billed.find(w=>w && w.rig) || {}).rig || t.rig || 'Unknown';
+
       allPads.push({
         customer: t.customer || 'Unknown',
-        rig: t.rig || 'Unknown',
+        rig: padRig,
         name: pad.name || '—',
         totalWells: pad.totalWells || 0,
         billedCount: billed.length,
@@ -7164,7 +7290,7 @@ function renderReports(){
           date: w.date || '',
           label: w.label || '',
           customer: t.customer || 'Unknown',
-          rig: t.rig || 'Unknown',
+          rig: w.rig || t.rig || 'Unknown',
           pad: pad.name || '—'
         });
       });
@@ -8577,11 +8703,23 @@ function attachHandlers(){
         // name later resurrected them against a blank owned count - where
         // the discrepancy check is skipped, so nothing would flag it.
         if(inv.items[name]) delete inv.items[name];
-        Object.keys(inv.applied||{}).forEach(id=>{
-          const rec = inv.applied[id];
-          if(rec.out) delete rec.out[name];
-          if(rec.back) delete rec.back[name];
-        });
+        // The ledger entries are deliberately LEFT ALONE.
+        //
+        // The ledger records what has already been applied for each ticket.
+        // Stripping this item's lines out of it told the next reconcile that
+        // none of this item's history had been applied yet - so it re-ran the
+        // `back` leg of every returned ticket ever written and piled the
+        // entire rental history into In Shop. Six owned, three past cycles,
+        // and the item came back reading 16 in shop against an owned count of
+        // "not set", where the discrepancy check is skipped so nothing flagged
+        // it. Zeroing the lines instead of deleting them does exactly the same
+        // damage, for the same reason: the tickets still exist and still say
+        // the iron came home, so the delta reappears either way.
+        //
+        // Left intact, the ledger and the tickets agree, every delta is zero,
+        // and deleting the yard entry above is enough to make the item gone.
+        // A new ticket written under the same name later starts a fresh entry
+        // from zero, which is correct.
         // and the made-to-order flag, or re-adding the name later brings
         // back a setting the user never chose for it
         setMadeToOrder(name, false);
@@ -9121,12 +9259,19 @@ function attachHandlers(){
         const isDone = pad.status === 'complete';
 
         const nextStart = promptPadDate(`When did the rig arrive on ${name}?`, startDate);
+        if(nextStart === null) return;                    // rejected - abort, as the alert said
         if(nextStart !== undefined) startDate = nextStart;
 
         if(isDone){
           const nextEnd = promptPadDate(`When did the rig leave ${name}?`, completedDate, { allowBlank:true });
+          if(nextEnd === null) return;                    // rejected - abort
           if(nextEnd !== undefined) completedDate = nextEnd;
         }
+
+        // Clearing the end date on a finished pad leaves it neither running
+        // nor dated, which is what made its day count climb forever. If the
+        // end date has gone, the pad is running again.
+        if(isDone && !completedDate) pad.status = 'active';
 
         if(startDate && completedDate && completedDate < startDate){
           alert(`${name} would end (${fmtDate(completedDate)}) before it started (${fmtDate(startDate)}). Nothing was changed.`);
@@ -9952,11 +10097,12 @@ async function runSignatureCaptureMode(ticketId, apiUrl){
       // Only send this one ticket's signature data, to a small dedicated
       // row - never touches or resends the full ticket list, so there's
       // no risk of clobbering other changes or hitting any size limit.
-      await fetch(apiUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify(requestBody)
-      });
+      //
+      // postAndConfirm throws unless the server actually accepted it. A bare
+      // fetch resolved on a 500 or on a 200 carrying {error:'unauthorized'},
+      // so the driver saw "Signature Submitted" for a signature that had just
+      // been thrown away - and it only ever existed on that page.
+      await postAndConfirm(apiUrl, requestBody);
       app.innerHTML = `
         <div style="max-width:480px; margin:60px auto; text-align:center; font-family:'Inter',sans-serif; padding:24px;">
           <div style="background:#14181A; padding:14px 20px; border-radius:8px 8px 0 0; border-bottom:4px solid #33D63A;">
@@ -10162,11 +10308,10 @@ async function runReturnCaptureMode(ticketId, apiUrl){
     });
     const requestBody = { returnUpdate: { ticketId, conditions, signatureReceivedBack: sigData, returnPhoto: returnPhotoData, source: 'driver' } };
     try{
-      await fetch(apiUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify(requestBody)
-      });
+      // Same as the signing page: only an answer the server actually accepted
+      // counts as submitted. Otherwise the condition record of what came back
+      // damaged is confirmed to the driver and lost.
+      await postAndConfirm(apiUrl, requestBody);
       app.innerHTML = `
         <div style="max-width:480px; margin:60px auto; text-align:center; font-family:'Inter',sans-serif; padding:24px;">
           <div style="background:#14181A; padding:14px 20px; border-radius:8px 8px 0 0; border-bottom:4px solid #33D63A;">
