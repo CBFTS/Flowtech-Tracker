@@ -924,7 +924,7 @@ function matchInvoiceRule(inv){
 }
 
 let syncStatus = 'idle'; // idle | saving | loading | ok | error
-const APP_BUILD = '163';  // shown in the sync panel - bump on every release
+const APP_BUILD = '164';  // shown in the sync panel - bump on every release
 let pushInProgress = false; // true while a push is in flight — blocks auto-pull to prevent race conditions
 // Bumped by every local save. pullFromCloud captures it before its fetch and
 // re-checks it after: pushInProgress only stops a pull STARTING mid-push, it
@@ -3690,7 +3690,11 @@ async function pullFromCloud(silent, force){
     await pushToCloud();
     return;
   }
-  if(force) setUnsyncedLocalWork(false);
+  // The guard used to be cleared HERE, before the network call. A forced
+  // pull that then failed - signal dropped, token wrong - left the flag off
+  // for a pull that never happened, so the next successful pull could
+  // overwrite local work with nothing standing in its way. It is cleared
+  // below instead, once the sheet's data has actually been written down.
   if(!silent) syncStatus = 'loading';
   render();
   try{
@@ -3741,8 +3745,23 @@ async function pullFromCloud(silent, force){
         return localMedia[t.id] ? {...merged, ...localMedia[t.id]} : merged;
       });
     }
-    if(Array.isArray(data.catalog) && data.catalog.length) equipmentCatalog = data.catalog;
-    if(data.equipmentOwned && typeof data.equipmentOwned === 'object'){
+    // A store the other device deliberately EMPTIED used to be skipped by the
+    // .length guard while its stamp was adopted regardless - so this device
+    // kept the old list under a fresh stamp, pushed it back unrefusable, and
+    // the deletion was undone on both devices in silence. Anything skipped
+    // here is recorded and its stamp is NOT adopted, so the local copy stays
+    // stale-looking and loses cleanly on the next exchange.
+    const skippedStores = [];
+    if(Array.isArray(data.catalog)){
+      if(data.catalog.length) equipmentCatalog = data.catalog; else skippedStores.push('catalog');
+    }
+    // The array stores above refuse an empty payload; these two did not, so a
+    // freshly set-up device pushing its empty objects could wipe the yard
+    // count and the archived rig list for good. An empty one is skipped and
+    // its stamp is not adopted, exactly like the arrays.
+    if(data.equipmentOwned && typeof data.equipmentOwned === 'object' && !Object.keys(data.equipmentOwned).length){
+      skippedStores.push('equipmentOwned');
+    } else if(data.equipmentOwned && typeof data.equipmentOwned === 'object'){
       // Coerced on the way in. A hand-edited Sheet cell like "12 ea" becomes
       // NaN, which isn't null so it passes every "is it set" check, then
       // poisons the totals - one bad cell blanked the entire Inventory
@@ -3758,11 +3777,21 @@ async function pullFromCloud(silent, force){
       });
       equipmentOwned = clean;
     }
-    if(Array.isArray(data.colorCatalog) && data.colorCatalog.length) colorCatalog = data.colorCatalog;
-    if(Array.isArray(data.rigCatalog) && data.rigCatalog.length) rigCatalog = data.rigCatalog;
-    if(Array.isArray(data.archivedRigs)) archivedRigs = data.archivedRigs;
-    if(Array.isArray(data.customerCatalog) && data.customerCatalog.length) customerCatalog = data.customerCatalog;
-    if(Array.isArray(data.templateCatalog) && data.templateCatalog.length) templateCatalog = data.templateCatalog;
+    if(Array.isArray(data.colorCatalog)){
+      if(data.colorCatalog.length) colorCatalog = data.colorCatalog; else skippedStores.push('colorCatalog');
+    }
+    if(Array.isArray(data.rigCatalog)){
+      if(data.rigCatalog.length) rigCatalog = data.rigCatalog; else skippedStores.push('rigCatalog');
+    }
+    if(Array.isArray(data.archivedRigs)){
+      if(data.archivedRigs.length) archivedRigs = data.archivedRigs; else skippedStores.push('archivedRigs');
+    }
+    if(Array.isArray(data.customerCatalog)){
+      if(data.customerCatalog.length) customerCatalog = data.customerCatalog; else skippedStores.push('customerCatalog');
+    }
+    if(Array.isArray(data.templateCatalog)){
+      if(data.templateCatalog.length) templateCatalog = data.templateCatalog; else skippedStores.push('templateCatalog');
+    }
     if(data.appSettings && typeof data.appSettings === 'object'){
       // Only tear down the cached revenue breakdown if the rules behind it
       // actually changed. Nulling it on every pull looked harmless but
@@ -3800,7 +3829,16 @@ async function pullFromCloud(silent, force){
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(appSettings));
     // Adopted AFTER everything above has been written, so a failure part way
     // through doesn't leave this device claiming stamps for data it hasn't got.
-    adoptStoreStamps(data.stamps);
+    if(data.stamps && skippedStores.length){
+      const keep = {};
+      Object.keys(data.stamps).forEach(k=>{ if(skippedStores.indexOf(k) === -1) keep[k] = data.stamps[k]; });
+      adoptStoreStamps(keep);
+    } else {
+      adoptStoreStamps(data.stamps);
+    }
+    // Same reasoning: a forced pull discards local work deliberately, but only
+    // once the replacement data is actually on this device.
+    if(force) setUnsyncedLocalWork(false);
     syncStatus = 'ok';
     await reconcileYardFromTickets();
   }catch(e){
@@ -3846,18 +3884,47 @@ async function pushToCloud(){
     // stops the next pull from overwriting the local copy.
     let refused = [];
     let discarded = [];
+    // Read the body in its own step. The token check used to live inside this
+    // try, and its `throw` was caught by the very catch that exists to forgive
+    // an older backend returning no JSON - so a push the server flatly refused
+    // fell through to the success branch below, turned the light green, and
+    // cleared the one flag stopping the next pull overwriting the work it had
+    // just failed to save. A refusal has to leave this function, not be
+    // swallowed by the tolerance for old backends.
+    let body = null;
     try{
-      const body = await res.json();
-      if(body && body.error === 'unauthorized'){
-        noteSyncFailure('push', 'server-refused-token', { status: res.status });
-        showSyncTokenWarning('refused');
-        throw new Error('unauthorized');
-      }
-      if(body && Array.isArray(body.rejected)) refused = body.rejected;
-      if(body && Array.isArray(body.staleTickets)) discarded = body.staleTickets;
-      if(body) adoptStoreStamps(body.stamps);
-      if(body) noteServerProtocol(body.protocol);
-    }catch(e){ /* older backend returns no body worth reading */ }
+      body = await res.json();
+    }catch(e){ body = null; /* older backend returns no body worth reading */ }
+
+    if(body && body.error === 'unauthorized'){
+      noteSyncFailure('push', 'server-refused-token', { status: res.status });
+      showSyncTokenWarning('refused');
+      syncStatus = 'error';
+      // Nothing was saved, so the local copy is still the only copy. The flag
+      // stays SET, which is what actually makes the banner's promise true.
+      setUnsyncedLocalWork(true);
+      throw new Error('unauthorized');
+    }
+
+    if(body && Array.isArray(body.rejected)) refused = body.rejected;
+    if(body && Array.isArray(body.staleTickets)) discarded = body.staleTickets;
+    if(body) noteServerProtocol(body.protocol);
+
+    // ═══ FIX: adopt stamps only for stores the server actually ACCEPTED ═══
+    // adoptStoreStamps is written for the pull path, where this device really
+    // does hold the sheet's copy of everything. On a push that premise is
+    // false for any refused store: the local value is still the stale one, so
+    // taking the sheet's stamp for it makes the next push look current and
+    // the stale value wins - the guard defeats itself one auto-sync tick after
+    // firing. Refused stores keep their old stamp so they keep losing until
+    // the user resolves it.
+    if(body && body.stamps){
+      const acceptable = {};
+      Object.keys(body.stamps).forEach(k=>{
+        if(refused.indexOf(k) === -1) acceptable[k] = body.stamps[k];
+      });
+      adoptStoreStamps(acceptable);
+    }
 
     // Tickets the server threw away because it held a newer copy. This used
     // to happen in silence, and the next pull then replaced the local copy -
@@ -4443,13 +4510,52 @@ function renderActionAlerts(){
         message: `Last billed ${agoLabel(daysSince)}`,
         ticketId: t.id
       });
+    } else if(billed === 0 && padStartDays !== null && padStartDays > 21){
+      // Nothing has EVER been billed on this pad. The staleness rule above
+      // needs a last-billed date to measure from, so the worst case - months
+      // of work with not one well invoiced - produced no alert at all, and
+      // sorted to the bottom of Billing Status as if it were the freshest
+      // thing on the list. padStartDays was computed for this check and then
+      // never used.
+      alerts.push({
+        type: 'billing',
+        rig: t.rig || 'Unassigned',
+        customer: t.customer || '—',
+        pad: pad.name,
+        billed, total,
+        message: `on this pad ${agoLabel(padStartDays)} — nothing billed yet`,
+        ticketId: t.id
+      });
     }
+
+    // ═══ FIX: a pad that CLOSED with wells unbilled is watched by nothing ═══
+    // Rig Move completes a pad, and from that moment no screen shows it, no
+    // alert mentions it, and there was no way to mark a well billed on it
+    // ever again. Whatever was left unbilled simply stopped existing.
+    (Array.isArray(t.pads) ? t.pads : []).forEach((p2, p2i)=>{
+      if(!p2 || p2 === pad || p2.status === 'active') return;
+      const b2 = Array.isArray(p2.billedWells) ? p2.billedWells.length : 0;
+      const tot2 = p2.totalWells || 0;
+      if(tot2 > 0 && b2 < tot2){
+        alerts.push({
+          type: 'closed',
+          rig: t.rig || 'Unassigned',
+          customer: t.customer || '—',
+          pad: p2.name,
+          billed: b2, total: tot2,
+          message: `${tot2 - b2} well${tot2-b2!==1?'s':''} never billed`,
+          ticketId: t.id,
+          padIndex: p2i
+        });
+      }
+    });
   });
 
   if(alerts.length === 0 && !billingRisk) return '';
 
   const moveAlerts = alerts.filter(a=>a.type==='move');
   const billingAlerts = alerts.filter(a=>a.type==='billing');
+  const closedAlerts = alerts.filter(a=>a.type==='closed');
 
   let html = '<div style="margin-bottom:16px;">';
 
@@ -4480,6 +4586,25 @@ function renderActionAlerts(){
     });
     if(nMissing > 6) html += `<div style="font-size:11px; color:${fg}; padding-top:6px;">and ${nMissing-6} more.</div>`;
     html += `<div style="font-size:11px; color:${fg}; padding-top:8px;">Open the Billing Check on Reports to work through ${nMissing+nPending+nBroken===1?'it':'them'}.</div>`;
+    html += `</div>`;
+  }
+
+  if(closedAlerts.length > 0){
+    html += `<div style="background:#FCEBEA; border:2px solid #B5432A; border-radius:8px; padding:14px 18px; margin-bottom:10px;">`;
+    html += `<div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">`;
+    html += `<span style="font-size:18px;">⚠</span>`;
+    html += `<span style="font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; font-size:13px; color:#B5432A; font-weight:600;">Finished work, never billed · ${closedAlerts.length} pad${closedAlerts.length!==1?'s':''}</span>`;
+    html += `</div>`;
+    closedAlerts.forEach(a=>{
+      html += `<div style="display:flex; justify-content:space-between; align-items:center; gap:10px; padding:8px 0; border-top:1px solid #E0A9A0;">`;
+      html += `<div>`;
+      html += `<div style="font-weight:600; font-size:14px; color:#7A1F1F;">${escHtml(a.rig)} · ${escHtml(a.pad)}</div>`;
+      html += `<div style="font-size:12px; color:#B5432A;">${escHtml(a.customer)} · ${a.billed}/${a.total} billed · ${escHtml(a.message)}</div>`;
+      html += `</div>`;
+      html += `<button class="ghost-btn" data-bill-closed-pad="${escAttr(a.ticketId)}" data-pad-index="${a.padIndex}" style="font-size:11px; padding:6px 12px; border-color:#B5432A; color:#B5432A; white-space:nowrap;">Mark a well billed</button>`;
+      html += `</div>`;
+    });
+    html += `<div style="font-size:11px; color:#8A3B2A; padding-top:8px;">This pad is finished, so nothing else in the app watches it. If the wells were invoiced, record them here.</div>`;
     html += `</div>`;
   }
 
@@ -6422,27 +6547,51 @@ function buildBillingCheck(){
     }
     return true;
   };
-  const wellsAgree = (rawA, rawB)=>{
+  /* How strongly two spellings look like the same well. 0 = not a match.
+
+     This used to answer a plain yes/no and the first well in the list to get
+     a yes took the invoice for good. Two things went wrong with that. The
+     substring rule alone made "Bull Moose 1" a match for "BULL MOOSE 10", so
+     a well that had never been invoiced could eat the invoice belonging to a
+     different well on the same lease - and the robbed well, being newly
+     marked, then sat silently in the grace window while the screen read
+     "Everything lines up." And because it was first-come, reversing the order
+     of two wells in the tracker changed the verdict on identical data.
+
+     So: numbers have to agree before any loose comparison is allowed. On an
+     oil well the number IS the identity - the words are the lease. And a
+     score lets the caller assign the best pairing overall rather than
+     whichever it happened to reach first. */
+  const wellMatchScore = (rawA, rawB)=>{
     const a = normalizeTight(rawA), b = normalizeTight(rawB);
-    if(!a || !b) return false;
-    if(a === b) return true;
-    // A short label is not evidence. "3" would otherwise match "neal5103h",
-    // and match whichever invoice happened to come first.
+    if(!a || !b) return 0;
+    if(a === b) return 3;                       // identical once punctuation is gone
+    // A short label is not evidence. "3" would otherwise match "neal5103h".
     const shorter = a.length <= b.length ? a : b;
-    if(shorter.length < 4) return false;
-    if(a.indexOf(b) !== -1 || b.indexOf(a) !== -1) return true;
-    // Last resort: the same numbers, plus a name word that all but agrees.
-    // A well name is typed here and typed again on the invoice, so the words
-    // drift and reorder - "Suntura Unit ( Lower Clear Fork) 520" against
-    // "Suntura (Lower Clear Fork) Unit 520". The numbers are what actually
-    // identify the well; the words only have to rule out a different lease.
+    if(shorter.length < 4) return 0;
+
     const na = wellNums(rawA), nb = wellNums(rawB);
-    if(!na.length || na.length !== nb.length) return false;
-    if(na.slice().sort().join('|') !== nb.slice().sort().join('|')) return false;
+    const numsAgree = !!na.length && na.length === nb.length
+                   && na.slice().sort().join('|') === nb.slice().sort().join('|');
+
+    if(a.indexOf(b) !== -1 || b.indexOf(a) !== -1){
+      // One name sits inside the other. Fine when the numbers are the same
+      // ("Baird, W.E. 1937" inside "BAIRD WE 1937H"). Not fine when they
+      // differ, because then the containment IS the difference between two
+      // wells - which is exactly the Bull Moose 1 / Bull Moose 10 case.
+      return numsAgree ? 2 : 0;
+    }
+    if(!numsAgree) return 0;
+    // Same numbers plus a name word that all but agrees. A well name is typed
+    // here and typed again on the invoice, so the words drift and reorder -
+    // "Suntura Unit ( Lower Clear Fork) 520" against "Suntura (Lower Clear
+    // Fork) Unit 520". The numbers identify the well; the words only have to
+    // rule out a different lease.
     const wa = wellWords(rawA), wb = wellWords(rawB);
-    if(!wa.length || !wb.length) return false;
-    return wa.some(x=>wb.some(y=>nearWord(x, y)));
+    if(!wa.length || !wb.length) return 0;
+    return wa.some(x=>wb.some(y=>nearWord(x, y))) ? 1 : 0;
   };
+  const wellsAgree = (rawA, rawB)=> wellMatchScore(rawA, rawB) > 0;
   // Takes the ORIGINAL spellings, not normalized ones. sameRigName splits a
   // rig into a contractor word and a number, and normalizeTight has already
   // thrown away the space that separates them: "Ensign T124" becomes
@@ -6469,62 +6618,89 @@ function buildBillingCheck(){
 
   const linkedByHand = [];   // confirmed against a named invoice by the user
   const brokenLinks = [];    // confirmed once, but that invoice is gone now
+  const handled = new Set(); // wells settled by pass zero
 
-  marked.forEach(m=>{
-    const mRig = normalizeTight(m.rig);
+  /* PASS ZERO - a pairing a person confirmed by hand.
 
-    // Pass zero: a pairing the user confirmed by hand. This is the only kind
-    // of evidence stronger than a name match, because a person looked at the
-    // invoice and said yes. It is also what makes the whole check work on
-    // rigs where the typed label never matches the invoice - confirm it once
-    // and it is settled for good, instead of being re-guessed every load.
-    if(m.invDoc){
-      const li = perWell.findIndex((inv,i)=>!usedInvoices.has(i) && String(inv.docNumber||'') === m.invDoc);
-      if(li !== -1){
-        usedInvoices.add(li);
-        linkedByHand.push({ well: m.label, doc: perWell[li].docNumber, invDate: perWell[li].date||'', rig: perWell[li].rig||'' });
-        return;
-      }
-      // The link points at an invoice QuickBooks no longer returns - voided,
-      // renumbered, or outside the pull. Worth saying so rather than silently
-      // falling back to guessing, which would look like it had been fine.
-      brokenLinks.push({ well: m.label, doc: m.invDoc, rig: m.rig||'', date: m.date,
-                         ticketId: m.ticketId, padIdx: m.padIdx, wellIdx: m.wellIdx });
-    }
+     This has to be its OWN complete loop over every marked well, finished
+     before any name matching starts. Written as the first branch inside the
+     name-matching loop it was not a pass at all: a well processed earlier
+     could take, on a fuzzy name match, the exact invoice a later well was
+     hand-linked to. The confirmed well then reported as "linked to an invoice
+     that is no longer in QuickBooks" and dropped into the red list - and the
+     remedy offered on screen, "Clear the link", made it permanent, so the one
+     piece of human-verified evidence in the system could never take effect.
 
-    // Rig and well both agree. Preferred, and precise.
-    let idx = perWell.findIndex((inv,i)=>{
-      if(usedInvoices.has(i)) return false;
-      if(!wellsAgree(m.label, inv.wellName)) return false;
-      return rigsAgree(m.rig, inv.rig);
-    });
-
-    // The well name alone. Specific enough to stand by itself, and the rig
-    // legitimately differs after iron transfers to a replacement rig.
-    let viaWellOnly = false;
-    if(idx === -1){
-      idx = perWell.findIndex((inv,i)=>{
-        if(usedInvoices.has(i)) return false;
-        return wellsAgree(m.label, inv.wellName);
-      });
-      if(idx !== -1) viaWellOnly = true;
-    }
-
-    if(idx !== -1){
-      usedInvoices.add(idx);
-      const padKey = m.ticketId + '|' + m.padId;
-      if(perWell[idx].rig){
-        if(!discoveredRigs[padKey]) discoveredRigs[padKey] = [];
-        if(discoveredRigs[padKey].indexOf(perWell[idx].rig) === -1) discoveredRigs[padKey].push(perWell[idx].rig);
-      }
-      if(viaWellOnly){
-        const inv = perWell[idx];
-        if(inv.rig && m.rig && !rigsAgree(m.rig, inv.rig)){
-          rigChanged.push({ well: m.label, trackerRig: m.rig, invoiceRig: inv.rig, doc: inv.docNumber, date: m.date });
-        }
-      }
+     A person looking at an invoice and saying yes outranks every other kind
+     of evidence here, so it is claimed first and nothing else can take it. */
+  marked.forEach((m, mi)=>{
+    if(!m.invDoc) return;
+    const li = perWell.findIndex((inv,i)=>!usedInvoices.has(i) && String(inv.docNumber||'') === m.invDoc);
+    if(li !== -1){
+      usedInvoices.add(li);
+      handled.add(mi);
+      linkedByHand.push({ well: m.label, doc: perWell[li].docNumber, invDate: perWell[li].date||'', rig: perWell[li].rig||'' });
       return;
     }
+    // The link points at an invoice QuickBooks no longer returns - voided,
+    // renumbered, or outside the pull. Worth saying so rather than silently
+    // falling back to guessing, which would look like it had been fine.
+    brokenLinks.push({ well: m.label, doc: m.invDoc, rig: m.rig||'', date: m.date,
+                       ticketId: m.ticketId, padIdx: m.padIdx, wellIdx: m.wellIdx });
+    handled.add(mi);
+  });
+
+  /* PASS ONE - match on names, best pairing first.
+
+     The old version walked the wells in array order and gave each one the
+     first invoice that looked like a yes. That made the answer depend on the
+     order the wells happen to sit in, and let a weak match consume an invoice
+     a strong match needed. Instead: score every possible pairing, then hand
+     them out strongest first. An invoice two different wells want equally
+     well is not evidence about either, so it is left for the confirm list
+     rather than being given to whichever came first. */
+  const pairs = [];
+  marked.forEach((m, mi)=>{
+    if(handled.has(mi)) return;
+    perWell.forEach((inv, ii)=>{
+      if(usedInvoices.has(ii)) return;
+      const sc = wellMatchScore(m.label, inv.wellName);
+      if(!sc) return;
+      const rigOk = rigsAgree(m.rig, inv.rig);
+      // The rig is a tie-break, not a requirement: iron transferred to a
+      // replacement rig is legitimately invoiced under the old name.
+      pairs.push({ mi, ii, score: sc * 2 + (rigOk ? 1 : 0), rigOk });
+    });
+  });
+  pairs.sort((x, y)=> y.score - x.score);
+
+  const claimedWell = new Set();
+  pairs.forEach(p=>{
+    if(claimedWell.has(p.mi) || usedInvoices.has(p.ii)) return;
+    // Another well wants this same invoice just as strongly. Neither claim is
+    // worth more than the other, so let the count/confirm path handle it in
+    // the open instead of silently picking one.
+    const contested = pairs.some(q=>
+      q !== p && q.ii === p.ii && q.score === p.score && q.mi !== p.mi && !claimedWell.has(q.mi));
+    if(contested) return;
+
+    const m = marked[p.mi], inv = perWell[p.ii];
+    usedInvoices.add(p.ii);
+    claimedWell.add(p.mi);
+    handled.add(p.mi);
+
+    const padKey = m.ticketId + '|' + m.padId;
+    if(inv.rig){
+      if(!discoveredRigs[padKey]) discoveredRigs[padKey] = [];
+      if(discoveredRigs[padKey].indexOf(inv.rig) === -1) discoveredRigs[padKey].push(inv.rig);
+    }
+    if(!p.rigOk && inv.rig && m.rig){
+      rigChanged.push({ well: m.label, trackerRig: m.rig, invoiceRig: inv.rig, doc: inv.docNumber, date: m.date });
+    }
+  });
+
+  marked.forEach((m, mi)=>{
+    if(handled.has(mi)) return;
     unmatched.push(m);
   });
 
@@ -6578,10 +6754,15 @@ function buildBillingCheck(){
     // window is deliberately loose. It no longer has to be exact, because a
     // count pairing is now only a SUGGESTION the user confirms - it decides
     // what gets offered, not what gets believed.
-    const floorDate = padStart ? shiftDays(padStart, -21)
-                    : wellDate ? shiftDays(wellDate, -120) : '';
-    const ceilDate  = padEnd   ? shiftDays(padEnd, 150)
-                    : wellDate ? shiftDays(wellDate, 21) : '';
+    // shiftDays returns '' on a date it cannot parse, and an empty bound is
+    // treated as NO bound below - so a pad carrying something like "TBD" took
+    // the "we have pad dates" branch and then accepted every invoice ever
+    // raised on the rig. Fall back to the well date whenever the pad date
+    // does not actually yield a bound.
+    const floorDate = (padStart && shiftDays(padStart, -21))
+                    || (wellDate ? shiftDays(wellDate, -120) : '');
+    const ceilDate  = (padEnd && shiftDays(padEnd, 150))
+                    || (wellDate ? shiftDays(wellDate, 21) : '');
     const withinWindow = (invDate)=>{
       // An undated invoice can still match by NAME; it just can't be handed
       // to a well on nothing more than a count.
@@ -6594,6 +6775,11 @@ function buildBillingCheck(){
     const spare = [];
     perWell.forEach((inv,i)=>{
       if(usedInvoices.has(i)) return;
+      // Already offered to a well on another pad. Without this, ONE invoice
+      // was suggested to any number of wells, each shown as unambiguous, and
+      // every one of them was demoted out of the red list on the strength of
+      // the same piece of paper.
+      if(suggested.has(i)) return;
       const iRig = normalizeTight(inv.rig);
       if(!iRig) return;
       if(!withinWindow(inv.date)) return;
@@ -6621,6 +6807,13 @@ function buildBillingCheck(){
     const ambiguous = spare.length > group.length;
 
     group.forEach(m=>{
+      // Wells from before the checking-from date are settled business and are
+      // not reported anywhere. Letting one take a suggestion still put its
+      // invoice into the `suggested` set, which removed that invoice from the
+      // unmarked list - while every screen filters the confirm list on
+      // inRange, so it rendered nowhere at all. Narrowing the window was what
+      // made an in-range invoice vanish.
+      if(!m.inRange){ leftover.push(m); return; }
       // A well marked inside the grace window is left alone entirely - work
       // recorded minutes ago has not had time to be invoiced, and guessing
       // that it has is the one conclusion that loses money.
@@ -8752,6 +8945,40 @@ function attachHandlers(){
   }
 
   // ── PAD TRACKING ACTION HANDLERS (shared across tickets + rig tracker) ──
+  /* Mark a well billed on a pad that has already CLOSED.
+
+     Rig Move completes a pad, and from that moment the Well Billed button was
+     gone - it renders only for the active pad, and only when that pad is not
+     complete. So a rig move made with 2 of 5 wells billed put three wells
+     permanently out of reach: nothing could record them, no screen showed
+     them, and the staleness clock had stopped. The confirm on Rig Move said
+     unbilled wells "may get missed", which understated it - there was no
+     recovery path at all. This is that path. */
+  document.querySelectorAll('[data-bill-closed-pad]').forEach(b=>{
+    b.onclick = async ()=>{
+      const t = tickets.find(x=>x.id===b.dataset.billClosedPad);
+      if(!t || !Array.isArray(t.pads)) return;
+      const pi = parseInt(b.dataset.padIndex, 10);
+      const pad = t.pads[pi];
+      if(!pad) return;
+      const billed = Array.isArray(pad.billedWells) ? pad.billedWells.length : 0;
+      const total = pad.totalWells || 0;
+      const label = promptRequired(
+        `Well name or number on ${pad.name || 'this pad'} (${billed}/${total} billed):`,
+        'A well name or number is required.');
+      if(label === null) return;
+      if(!Array.isArray(pad.billedWells)) pad.billedWells = [];
+      // The rig stamped is the one recorded on the pad's other wells where
+      // there is one, not the ticket's rig today - this pad finished, and the
+      // ticket may have moved to a replacement rig since.
+      const priorRig = (pad.billedWells.find(w=>w && w.rig) || {}).rig;
+      pad.billedWells.push({ date: todayStr(), label: label, rig: priorRig || t.rig || '' });
+      t.updatedAt = nowIso();
+      await saveTickets();
+      render();
+    };
+  });
+
   document.querySelectorAll('[data-well-billed]').forEach(b=>{
       b.onclick = async ()=>{
         const t = tickets.find(x=>x.id===b.dataset.wellBilled);
@@ -9361,9 +9588,15 @@ async function onSaveTicket(){
   // Save catalogs to local storage directly (pushToCloud already bundles
   // rig/customer data into the same request that saveTickets() below
   // triggers, so there's no need for three separate overlapping pushes).
-  try{ localStorage.setItem(RIG_CATALOG_KEY, JSON.stringify(rigCatalog)); }catch(e){ showStorageWarning('rig list', e); }
-  try{ localStorage.setItem(CUSTOMER_CATALOG_KEY, JSON.stringify(customerCatalog)); }catch(e){ showStorageWarning('customer list', e); }
-  try{ localStorage.setItem(CATALOG_KEY, JSON.stringify(equipmentCatalog)); }catch(e){ showStorageWarning('equipment list', e); }
+  //
+  // These MUST be stamped. Writing them without a stamp meant the push
+  // carried the new rig or customer under an old stamp, the server refused
+  // the store as stale, and the next pull erased the addition - so a ticket
+  // could be saved against a rig that then vanished from the rig list. Every
+  // other write to these stores stamps; this path was the one that didn't.
+  try{ localStorage.setItem(RIG_CATALOG_KEY, JSON.stringify(rigCatalog)); stampStore('rigCatalog'); }catch(e){ showStorageWarning('rig list', e); }
+  try{ localStorage.setItem(CUSTOMER_CATALOG_KEY, JSON.stringify(customerCatalog)); stampStore('customerCatalog'); }catch(e){ showStorageWarning('customer list', e); }
+  try{ localStorage.setItem(CATALOG_KEY, JSON.stringify(equipmentCatalog)); stampStore('catalog'); }catch(e){ showStorageWarning('equipment list', e); }
 
   // Kick off saving (local write happens synchronously inside this, before
   // any network call) but don't wait on the cloud push before moving on -
