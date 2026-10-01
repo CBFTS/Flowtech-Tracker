@@ -924,7 +924,7 @@ function matchInvoiceRule(inv){
 }
 
 let syncStatus = 'idle'; // idle | saving | loading | ok | error
-const APP_BUILD = '165';  // shown in the sync panel - bump on every release
+const APP_BUILD = '166';  // shown in the sync panel - bump on every release
 let pushInProgress = false; // true while a push is in flight — blocks auto-pull to prevent race conditions
 // Bumped by every local save. pullFromCloud captures it before its fetch and
 // re-checks it after: pushInProgress only stops a pull STARTING mid-push, it
@@ -976,6 +976,49 @@ function savePendingDeletes(){
     if(pendingDeletes.length) localStorage.setItem(PENDING_DELETES_KEY, JSON.stringify(pendingDeletes));
     else localStorage.removeItem(PENDING_DELETES_KEY);
   }catch(e){ /* best effort - the in-memory copy still works this session */ }
+}
+
+/* Wells the user has deliberately taken off a pad - the × on a chip, or the
+   old spelling when a well is renamed - that the cloud has not yet been told
+   about. Persisted for the same reason pendingDeletes is: a dead battery
+   between the tap and the push must not turn a removal into a resurrection.
+
+   The server unions billed wells from both copies of a ticket so a conflict
+   never loses one. Without this list it could not tell "this device never
+   heard of that well" from "this device took it out on purpose" - and put
+   every removal straight back, within one sync tick, on a single device.
+   Keys are built exactly as the server builds them. */
+let pendingWellRemovals = [];
+const PENDING_WELL_REMOVALS_KEY = 'flowtech_equipment_tracker_pendingwellremovals';
+
+function wellKeyForSync(w){
+  if(!w) return '';
+  const label = String(w.label || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  return label + '|' + String(w.date || '');
+}
+function padKeyForSync(p){
+  if(!p) return '';
+  return String(p.id || p.name || '');
+}
+function loadPendingWellRemovals(){
+  try{
+    const raw = localStorage.getItem(PENDING_WELL_REMOVALS_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    pendingWellRemovals = Array.isArray(arr) ? arr.filter(x=>x && x.ticketId && x.padKey && x.wellKey) : [];
+  }catch(e){ pendingWellRemovals = []; }
+}
+function savePendingWellRemovals(){
+  try{
+    if(pendingWellRemovals.length) localStorage.setItem(PENDING_WELL_REMOVALS_KEY, JSON.stringify(pendingWellRemovals));
+    else localStorage.removeItem(PENDING_WELL_REMOVALS_KEY);
+  }catch(e){ /* best effort */ }
+}
+function noteWellRemoved(ticketId, pad, w){
+  const entry = { ticketId: ticketId, padKey: padKeyForSync(pad), wellKey: wellKeyForSync(w) };
+  if(!entry.padKey || !entry.wellKey) return;
+  const dup = pendingWellRemovals.some(x=>x.ticketId===entry.ticketId && x.padKey===entry.padKey && x.wellKey===entry.wellKey);
+  if(!dup) pendingWellRemovals.push(entry);
+  savePendingWellRemovals();
 }
 
 // ── PAD / WELL BILLING HELPERS ──────────────────────────────────────
@@ -1092,25 +1135,42 @@ async function postAndConfirm(url, body){
   return parsed;
 }
 
+let flushInFlight = false;
 async function flushPendingSubmissions(){
-  const list = getPendingSubmissions();
-  if(list.length === 0) return { attempted: 0, succeeded: 0 };
-  const stillPending = [];
-  let succeeded = 0;
-  for(const item of list){
-    try{
-      await postAndConfirm(item.apiUrl, item.body);
-      succeeded++;
-    }catch(e){
-      // Anything that did not land stays queued. This used to count every
-      // answer as a success and drop the item, so one retry against a 500
-      // permanently discarded a signature the page had promised would "send
-      // automatically as soon as you're back online".
-      stillPending.push(item);
+  // Fired by a 15-second timer, the 'online' event AND page load, with no
+  // guard between them. On a weak signal one flush's POST could hang for
+  // tens of seconds; a second flush started, both reached the server (two
+  // emails, two PDFs), and whichever finished LAST overwrote the queue with
+  // its own stale view - a signature queued by another tab in between was
+  // gone for good. One flush at a time, and the queue is re-read and merged
+  // before it is written back, never replaced wholesale.
+  if(flushInFlight) return { attempted: 0, succeeded: 0, busy: true };
+  flushInFlight = true;
+  try{
+    const list = getPendingSubmissions();
+    if(list.length === 0) return { attempted: 0, succeeded: 0 };
+    const sentKeys = new Set();
+    let succeeded = 0;
+    for(const item of list){
+      try{
+        await postAndConfirm(item.apiUrl, item.body);
+        succeeded++;
+        sentKeys.add(JSON.stringify(item));
+      }catch(e){
+        // Anything that did not land stays queued. This used to count every
+        // answer as a success and drop the item, so one retry against a 500
+        // permanently discarded a signature the page had promised would
+        // "send automatically as soon as you're back online".
+      }
     }
+    // Re-read: another tab may have queued something while we were posting.
+    const now = getPendingSubmissions();
+    const remaining = now.filter(item=>!sentKeys.has(JSON.stringify(item)));
+    savePendingSubmissions(remaining);
+    return { attempted: list.length, succeeded };
+  } finally {
+    flushInFlight = false;
   }
-  savePendingSubmissions(stillPending);
-  return { attempted: list.length, succeeded };
 }
 
 // Starts listening for connectivity coming back, and retries in the
@@ -1620,15 +1680,37 @@ async function reconcileYardFromTickets_(){
        the movement the numbers now disagree with each other in the open, and
        Full Inventory's own "more marked ready than are home" line says so -
        which is a visible wrong number instead of an invisible one. */
+    /* Two numbers per item per ticket: what the ticket SAYS (rec.out), and
+       what the bucket actually PAID toward it (rec.outPaid). Recording only
+       the intent, as the last build did, stopped the stale-debit loop but
+       opened the opposite hole: a ticket written when Ready was 0 recorded
+       out=5 while Ready paid nothing, and deleting that ticket later gave
+       back 5 - Ready read 5 for iron nobody had ever counted. A reversal can
+       only hand back what was actually taken. */
+    if(!rec.outPaid  || typeof rec.outPaid  !== 'object') rec.outPaid  = {};
+    if(!rec.backPaid || typeof rec.backPaid !== 'object') rec.backPaid = {};
+
     const outNames = new Set(Object.keys(wantOut).concat(Object.keys(rec.out)));
     outNames.forEach(name=>{
       const want = (wantOut[name]||0);
-      const delta = want - (rec.out[name]||0);
-      if(delta === 0) return;
-      // Ready falls when iron leaves, so the sign is inverted here.
-      applyDelta(name, 'ready', -delta);
+      const prev = (rec.out[name]||0);
+      if(want === prev) return;
+      const prevPaid = (rec.outPaid[name]||0);
+      let paid = prevPaid;
+      if(want > prev){
+        // More iron has left. Ready falls by what it can actually cover.
+        const taken = -applyDelta(name, 'ready', -(want - prev));
+        paid = prevPaid + taken;
+      } else {
+        // Less iron is out (edit, delete, undo). Give back ONLY what was
+        // genuinely taken off Ready for this ticket - never more.
+        const giveBack = Math.min(prev - want, prevPaid);
+        if(giveBack > 0) applyDelta(name, 'ready', giveBack);
+        paid = prevPaid - giveBack;
+      }
       rec.out[name] = want;
-      if(rec.out[name] <= 0) delete rec.out[name];
+      rec.outPaid[name] = paid;
+      if(rec.out[name] <= 0){ delete rec.out[name]; delete rec.outPaid[name]; }
       changed = true;
     });
 
@@ -1636,11 +1718,23 @@ async function reconcileYardFromTickets_(){
     const backNames = new Set(Object.keys(wantBack).concat(Object.keys(rec.back)));
     backNames.forEach(name=>{
       const want = (wantBack[name]||0);
-      const delta = want - (rec.back[name]||0);
-      if(delta === 0) return;
-      applyDelta(name, 'shop', delta);
+      const prev = (rec.back[name]||0);
+      if(want === prev) return;
+      const prevPaid = (rec.backPaid[name]||0);
+      let paid = prevPaid;
+      if(want > prev){
+        const added = applyDelta(name, 'shop', want - prev);
+        paid = prevPaid + added;
+      } else {
+        // Undoing a return pulls out of the shop queue only what this ticket
+        // put in - and no more than is still there to pull.
+        const pullOut = Math.min(prev - want, prevPaid);
+        const pulled = pullOut > 0 ? -applyDelta(name, 'shop', -pullOut) : 0;
+        paid = prevPaid - pulled;
+      }
       rec.back[name] = want;
-      if(rec.back[name] <= 0) delete rec.back[name];
+      rec.backPaid[name] = paid;
+      if(rec.back[name] <= 0){ delete rec.back[name]; delete rec.backPaid[name]; }
       changed = true;
     });
 
@@ -2363,15 +2457,37 @@ async function applyCountSession(){
   // return already reflected in the physical count would be added again.
   // Items that weren't counted keep their existing ledger entries untouched.
   const countedNames = new Set(Object.keys(snapshot));
+  // The count describes the yard as it was when the walk STARTED. A ticket
+  // written after that moment took iron that was standing there being
+  // counted, so its movement is NOT yet reflected in the tally and must stay
+  // un-applied in the ledger - the next reconcile will debit it. Baselining
+  // it here as "already applied" left Ready overstated by exactly the iron
+  // that left mid-count. The saved snapshot of what was out at the start is
+  // the same line drawn from the other side.
+  const startedAt = (countSession && countSession.startedAt) ? String(countSession.startedAt) : '';
+  const startedDay = startedAt ? startedAt.slice(0,10) : '';
+  const afterCountStarted = (t)=>{
+    if(!startedAt) return false;
+    // Delivered after the day the count began is unambiguous. Same day is
+    // judged by the ticket's own edit time against the session start.
+    if(t.deliveryDate && t.deliveryDate > startedDay) return true;
+    if(t.deliveryDate === startedDay && t.updatedAt && String(t.updatedAt) > startedAt) return true;
+    return false;
+  };
   tickets.forEach(t=>{
     const q = ticketQuantities_(t);
-    if(!inv.applied[t.id]) inv.applied[t.id] = { out:{}, back:{} };
+    if(!inv.applied[t.id]) inv.applied[t.id] = { out:{}, back:{}, outPaid:{}, backPaid:{} };
     const rec = inv.applied[t.id];
+    if(!rec.outPaid) rec.outPaid = {};
+    if(!rec.backPaid) rec.backPaid = {};
+    if(afterCountStarted(t)) return;        // leave for the reconcile to apply
     Object.keys(q).forEach(name=>{
       if(!countedNames.has(name)) return;
       rec.out[name] = q[name];
-      if(t.returnDate) rec.back[name] = q[name];
-      else delete rec.back[name];
+      // The count IS the physical truth, so what it saw counts as fully paid.
+      rec.outPaid[name] = q[name];
+      if(t.returnDate){ rec.back[name] = q[name]; rec.backPaid[name] = q[name]; }
+      else { delete rec.back[name]; delete rec.backPaid[name]; }
     });
   });
 
@@ -3640,12 +3756,14 @@ async function saveCustomerCatalog(){
 }
 
 // Adds a value to a catalog array (deduped, case-insensitive) if not already present.
+// Returns true only when it actually added something, so the caller can
+// stamp the store only on a real change.
 function addToCatalogIfNew(catalogArr, value){
   const v = (value||'').trim();
-  if(!v) return catalogArr;
+  if(!v) return false;
   const exists = catalogArr.some(x=>x.toLowerCase()===v.toLowerCase());
-  if(!exists) catalogArr.push(v);
-  return catalogArr;
+  if(!exists){ catalogArr.push(v); return true; }
+  return false;
 }
 
 async function loadTemplates(){
@@ -3849,14 +3967,41 @@ async function pullFromCloud(silent, force){
     // here is recorded and its stamp is NOT adopted, so the local copy stays
     // stale-looking and loses cleanly on the next exchange.
     const skippedStores = [];
-    if(Array.isArray(data.catalog)){
-      if(data.catalog.length) equipmentCatalog = data.catalog; else skippedStores.push('catalog');
-    }
+
+    /* Is an EMPTY store from the sheet a deliberate emptying, or a blank
+       sheet that must not wipe this device?
+
+       Refusing every empty store, as the last build did, created a lockout:
+       unarchive the last rig on device A, and device B skips the empty list,
+       keeps its old stamp, gets every push refused as stale, and stops
+       pulling altogether - with an orange banner it cannot clear. The sheet
+       carries a stamp per store, and that stamp is the answer: an empty store
+       whose stamp is NEWER than ours was emptied on purpose by a device that
+       had the current data, and must be taken. An empty store with no stamp,
+       or an older one, is the blank-sheet case and is still refused. The
+       server now rejects unstamped writes, so a brand-new device can no
+       longer plant a stamped empty list by accident. */
+    const localStamps = getStoreStamps();
+    const incomingStamps = (data.stamps && typeof data.stamps === 'object') ? data.stamps : {};
+    const emptyIsDeliberate = (key)=>{
+      const theirs = incomingStamps[key];
+      if(typeof theirs !== 'string' || !theirs) return false;
+      const ours = localStamps[key];
+      return !ours || theirs > ours;
+    };
+    const takeArray = (key, value, apply)=>{
+      if(!Array.isArray(value)) return;
+      if(value.length || emptyIsDeliberate(key)) apply(value);
+      else skippedStores.push(key);
+    };
+
+    takeArray('catalog', data.catalog, v=>{ equipmentCatalog = v; });
     // The array stores above refuse an empty payload; these two did not, so a
     // freshly set-up device pushing its empty objects could wipe the yard
     // count and the archived rig list for good. An empty one is skipped and
     // its stamp is not adopted, exactly like the arrays.
-    if(data.equipmentOwned && typeof data.equipmentOwned === 'object' && !Object.keys(data.equipmentOwned).length){
+    if(data.equipmentOwned && typeof data.equipmentOwned === 'object'
+       && !Object.keys(data.equipmentOwned).length && !emptyIsDeliberate('equipmentOwned')){
       skippedStores.push('equipmentOwned');
     } else if(data.equipmentOwned && typeof data.equipmentOwned === 'object'){
       // Coerced on the way in. A hand-edited Sheet cell like "12 ea" becomes
@@ -3874,21 +4019,11 @@ async function pullFromCloud(silent, force){
       });
       equipmentOwned = clean;
     }
-    if(Array.isArray(data.colorCatalog)){
-      if(data.colorCatalog.length) colorCatalog = data.colorCatalog; else skippedStores.push('colorCatalog');
-    }
-    if(Array.isArray(data.rigCatalog)){
-      if(data.rigCatalog.length) rigCatalog = data.rigCatalog; else skippedStores.push('rigCatalog');
-    }
-    if(Array.isArray(data.archivedRigs)){
-      if(data.archivedRigs.length) archivedRigs = data.archivedRigs; else skippedStores.push('archivedRigs');
-    }
-    if(Array.isArray(data.customerCatalog)){
-      if(data.customerCatalog.length) customerCatalog = data.customerCatalog; else skippedStores.push('customerCatalog');
-    }
-    if(Array.isArray(data.templateCatalog)){
-      if(data.templateCatalog.length) templateCatalog = data.templateCatalog; else skippedStores.push('templateCatalog');
-    }
+    takeArray('colorCatalog', data.colorCatalog, v=>{ colorCatalog = v; });
+    takeArray('rigCatalog', data.rigCatalog, v=>{ rigCatalog = v; });
+    takeArray('archivedRigs', data.archivedRigs, v=>{ archivedRigs = v; });
+    takeArray('customerCatalog', data.customerCatalog, v=>{ customerCatalog = v; });
+    takeArray('templateCatalog', data.templateCatalog, v=>{ templateCatalog = v; });
     if(data.appSettings && typeof data.appSettings === 'object'){
       // Only tear down the cached revenue breakdown if the rules behind it
       // actually changed. Nulling it on every pull looked harmless but
@@ -3964,10 +4099,11 @@ async function pushToCloud(){
     // on success - a delete that happens while the request is in flight stays
     // queued for the next push instead of being silently dropped.
     const deletesToSend = pendingDeletes.slice();
+    const removalsToSend = pendingWellRemovals.slice();
     const res = await fetch(syncUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({ token: syncToken, tickets: ticketsForCloud, deletes: deletesToSend, catalog: equipmentCatalog, equipmentOwned: equipmentOwned, colorCatalog: colorCatalog, rigCatalog: rigCatalog, archivedRigs: archivedRigs, customerCatalog: customerCatalog, templateCatalog: templateCatalog, appSettings: appSettings, stamps: getStoreStamps() })
+      body: JSON.stringify({ token: syncToken, tickets: ticketsForCloud, deletes: deletesToSend, removedWells: removalsToSend, catalog: equipmentCatalog, equipmentOwned: equipmentOwned, colorCatalog: colorCatalog, rigCatalog: rigCatalog, archivedRigs: archivedRigs, customerCatalog: customerCatalog, templateCatalog: templateCatalog, appSettings: appSettings, stamps: getStoreStamps() })
     });
     // The response has to be checked. Previously this awaited the fetch and
     // then declared success regardless, so a server-side error showed a
@@ -4031,6 +4167,10 @@ async function pushToCloud(){
     if(deletesToSend.length){
       pendingDeletes = pendingDeletes.filter(id=>!deletesToSend.includes(id));
       savePendingDeletes();
+    }
+    if(removalsToSend.length){
+      pendingWellRemovals = pendingWellRemovals.filter(x=>!removalsToSend.includes(x));
+      savePendingWellRemovals();
     }
 
     if(refused.length){
@@ -4554,6 +4694,43 @@ function renderActionAlerts(){
   const outTickets = tickets.filter(t=>!t.returnDate);
   const alerts = [];
 
+  /* Pads that CLOSED with wells unbilled - on ANY ticket, returned or not.
+
+     Rig Move completes a pad, Mark Returned ends a ticket, and from that
+     moment no screen showed the pad, no alert mentioned it, and there was
+     no way to mark a well billed on it ever again. Whatever was left
+     unbilled simply stopped existing. The previous build put this loop
+     inside the open-tickets loop, below an early return on "no active pad"
+     - so a returned ticket, or one sitting between pads, was still skipped,
+     while the weekly email had started reporting exactly those. The email
+     and the dashboard now agree, and the button to record the well is here.
+
+     A returned ticket's pad is treated as closed whatever its status says:
+     Mark Returned does not change pad status, so an "active" pad on a
+     returned ticket is finished work by definition. */
+  tickets.forEach(t=>{
+    if(!Array.isArray(t.pads)) return;
+    const ticketClosed = !!t.returnDate;
+    t.pads.forEach((p2, p2i)=>{
+      if(!p2) return;
+      if(!ticketClosed && p2.status === 'active') return;   // live pad, handled below
+      const b2 = Array.isArray(p2.billedWells) ? p2.billedWells.length : 0;
+      const tot2 = p2.totalWells || 0;
+      if(tot2 > 0 && b2 < tot2){
+        alerts.push({
+          type: 'closed',
+          rig: t.rig || 'Unassigned',
+          customer: t.customer || '—',
+          pad: p2.name,
+          billed: b2, total: tot2,
+          message: `${tot2 - b2} well${tot2-b2!==1?'s':''} never billed${ticketClosed?' · iron returned':''}`,
+          ticketId: t.id,
+          padIndex: p2i
+        });
+      }
+    });
+  });
+
   /* Wells marked billed that no invoice accounts for.
 
      This lives on the dashboard, not buried at the bottom of Reports, because
@@ -4625,27 +4802,6 @@ function renderActionAlerts(){
       });
     }
 
-    // ═══ FIX: a pad that CLOSED with wells unbilled is watched by nothing ═══
-    // Rig Move completes a pad, and from that moment no screen shows it, no
-    // alert mentions it, and there was no way to mark a well billed on it
-    // ever again. Whatever was left unbilled simply stopped existing.
-    (Array.isArray(t.pads) ? t.pads : []).forEach((p2, p2i)=>{
-      if(!p2 || p2 === pad || p2.status === 'active') return;
-      const b2 = Array.isArray(p2.billedWells) ? p2.billedWells.length : 0;
-      const tot2 = p2.totalWells || 0;
-      if(tot2 > 0 && b2 < tot2){
-        alerts.push({
-          type: 'closed',
-          rig: t.rig || 'Unassigned',
-          customer: t.customer || '—',
-          pad: p2.name,
-          billed: b2, total: tot2,
-          message: `${tot2 - b2} well${tot2-b2!==1?'s':''} never billed`,
-          ticketId: t.id,
-          padIndex: p2i
-        });
-      }
-    });
   });
 
   if(alerts.length === 0 && !billingRisk) return '';
@@ -4843,9 +4999,14 @@ function renderNewTicket(){
 
   let equipRows = draftEquip.map((e,i)=>{
     const isKnown = equipmentCatalog.includes(e.name);
-    const isCustomSelected = e.name && !isKnown;
+    // Choosing "+ Add new..." set the name to '' and re-rendered; with an
+    // empty name this test was false, so no text box appeared and the
+    // dropdown snapped back to "Select equipment...". The only way to add an
+    // item from the ticket form was therefore no way at all. A per-row flag
+    // keeps the box open until the user types or picks something else.
+    const isCustomSelected = !!e.customName || (e.name && !isKnown);
     const isColorKnown = colorCatalog.includes(e.bandColor);
-    const isCustomColor = e.bandColor && !isColorKnown;
+    const isCustomColor = !!e.customColor || (e.bandColor && !isColorKnown);
     return `
     <tr data-eqid="${e.id}">
       <td>
@@ -6781,20 +6942,25 @@ function buildBillingCheck(){
       const rigOk = rigsAgree(m.rig, inv.rig);
       // The rig is a tie-break, not a requirement: iron transferred to a
       // replacement rig is legitimately invoiced under the old name.
-      pairs.push({ mi, ii, score: sc * 2 + (rigOk ? 1 : 0), rigOk });
+      // How far the invoice sits from the day the well was marked. The
+      // tie-break between two wells that match an invoice equally well.
+      const gap = (m.date && inv.date) ? Math.abs(new Date(m.date) - new Date(inv.date)) : Number.MAX_SAFE_INTEGER;
+      pairs.push({ mi, ii, score: sc * 2 + (rigOk ? 1 : 0), rigOk, gap });
     });
   });
-  pairs.sort((x, y)=> y.score - x.score);
+  // Strongest first; among equals, the invoice nearest the marking date.
+  pairs.sort((x, y)=> (y.score - x.score) || (x.gap - y.gap));
 
   const claimedWell = new Set();
   pairs.forEach(p=>{
     if(claimedWell.has(p.mi) || usedInvoices.has(p.ii)) return;
-    // Another well wants this same invoice just as strongly. Neither claim is
-    // worth more than the other, so let the count/confirm path handle it in
-    // the open instead of silently picking one.
-    const contested = pairs.some(q=>
-      q !== p && q.ii === p.ii && q.score === p.score && q.mi !== p.mi && !claimedWell.has(q.mi));
-    if(contested) return;
+    // Two wells with the SAME name on one pad - a re-bill after an iron swap
+    // - both match the same two invoices equally. The last build refused to
+    // pick and left both for the count pass, which then put one well in the
+    // red "no invoice" list while its invoice sat in the green "second
+    // invoice, nothing missing" band: a contradiction on one screen. Ties
+    // are now broken by date, and a residual exact tie takes the pairing in
+    // order - it is the same well name either way.
 
     const m = marked[p.mi], inv = perWell[p.ii];
     usedInvoices.add(p.ii);
@@ -6978,7 +7144,12 @@ function buildBillingCheck(){
   const unmarked = [];        // no marked well by this name - worth chasing
   const extraInvoices = [];   // well already matched - a swap or a re-bill
   spare.forEach(inv=>{
-    const seen = marked.some(m=>m.label && wellsAgree(m.label, inv.wellName));
+    // Only a well that was actually matched can make a spare invoice a
+    // "second invoice". Testing every marked well, matched or not, let an
+    // invoice for a well NOT in the tracker read as "nothing missing" because
+    // its name happened to agree with some unmatched chip.
+    const seen = marked.some((m, mi)=>handled.has(mi) && !brokenLinks.some(b=>b.well===m.label && b.date===m.date)
+                                       && m.label && wellsAgree(m.label, inv.wellName));
     (seen ? extraInvoices : unmarked).push(inv);
   });
 
@@ -7347,8 +7518,12 @@ function renderReports(){
       addPadTo(customerStats[cust]);
       if(!t.returnDate) customerStats[cust].activeRigs.add(t.rig);
 
-      // Rig stats
-      const rig = t.rig || 'Unknown';
+      // Rig stats - keyed by the rig the pad was actually worked on, which is
+      // the one stamped on its billed wells, not the ticket's rig today. The
+      // Pad History table was fixed to read it this way last build; this
+      // table was not, so a rig swap still moved every old pad onto the new
+      // rig here and the old rig vanished from Rig Efficiency entirely.
+      const rig = padRig || t.rig || 'Unknown';
       if(!rigStats[rig]) rigStats[rig] = Object.assign(freshBucket(), { customer: cust });
       addPadTo(rigStats[rig]);
       rigStats[rig].customer = cust;
@@ -7982,8 +8157,26 @@ function attachHandlers(){
 
   document.querySelectorAll('nav button[data-tab]').forEach(btn=>{
     btn.onclick = ()=>{
+      const leavingEdit = (currentTab === 'new' && editingId && btn.dataset.tab !== 'new');
+      const wasEditing = editingId;
       currentTab = btn.dataset.tab;
-      if(currentTab === 'new' && !editingId){ resetDraftEquip(); resetDraftTicket(); }
+      // Walking away from an edit without Cancel or Save used to leave
+      // editingId set, so the next tap on "New Ticket" reopened that edit
+      // with its fields pre-filled - and a user who overtyped the ticket
+      // number, customer and rig to write a NEW ticket silently overwrote the
+      // old one instead. The heading said EDIT TICKET; nothing else did.
+      if(leavingEdit){
+        editingId = null;
+      }
+      if(currentTab === 'new'){
+        if(wasEditing && !leavingEdit){
+          // Already on the form mid-edit and tapped the nav button again -
+          // leave the edit alone.
+        } else {
+          editingId = null;
+          resetDraftEquip(); resetDraftTicket();
+        }
+      }
       focusedTicketId = null;
       globalSearchTerm = '';
       render();
@@ -8339,10 +8532,27 @@ function attachHandlers(){
           alert('This file doesn\'t look like a valid Equipment Tracker backup.');
           return;
         }
+        // Every ticket is checked BEFORE anything is touched. The old check
+        // accepted any JSON with a tickets array; one ticket missing its
+        // equipment list was written to storage, the first render threw on
+        // it, and the app came up blank on every reload until localStorage
+        // was cleared by hand - and with sync on, the bad row had already
+        // been pushed to the sheet for every device to pick up.
+        const bad = [];
+        parsed.tickets.forEach((t, i)=>{
+          if(!t || typeof t !== 'object'){ bad.push(`#${i+1}: not a ticket`); return; }
+          if(typeof t.id !== 'string' || !t.id){ bad.push(`#${i+1}: no id`); return; }
+          if(!Array.isArray(t.equipment)){ bad.push(`${t.ticketNumber||t.id}: no equipment list`); return; }
+          if(t.pads !== undefined && !Array.isArray(t.pads)){ bad.push(`${t.ticketNumber||t.id}: pads is not a list`); return; }
+        });
+        if(bad.length){
+          alert(`This backup can't be imported - ${bad.length} ticket${bad.length!==1?'s are':' is'} malformed:\n\n${bad.slice(0,8).join('\n')}${bad.length>8?`\n…and ${bad.length-8} more`:''}\n\nNothing was changed.`);
+          return;
+        }
         const count = parsed.tickets.length;
         const willReplace = tickets.length > 0;
         const msg = willReplace
-          ? `This will REPLACE your current ${tickets.length} ticket(s) with the ${count} ticket(s) from this backup file. This cannot be undone. Continue?`
+          ? `This will REPLACE your current ${tickets.length} ticket(s) with the ${count} ticket(s) from this backup file, and push them to the cloud as the newest copy. This cannot be undone.\n\nNote: a ticket deleted since this backup was taken will NOT come back - the cloud remembers deletions.\n\nContinue?`
           : `Import ${count} ticket(s) from this backup file?`;
         if(!confirm(msg)) return;
 
@@ -8351,7 +8561,17 @@ function attachHandlers(){
         // (pre-import) cloud data and stomp the import a moment later.
         if(autoSyncTimer){ clearInterval(autoSyncTimer); autoSyncTimer = null; }
 
-        tickets = parsed.tickets;
+        // An import is a deliberate rollback, and it has to WIN. Imported
+        // tickets used to keep the updatedAt from the backup file - older
+        // than the sheet's copy by definition - so the push that followed
+        // discarded every one of them as stale and the next pull put the
+        // current data straight back: "Import complete", nothing restored.
+        // Stamping them now makes the backup the newest copy everywhere.
+        // Tickets deleted since the backup are NOT resurrected - that needs
+        // their tombstones cleared on the sheet, which is a hand edit, and
+        // the confirm says so.
+        const importStamp = nowIso();
+        tickets = parsed.tickets.map(t=>Object.assign({}, t, { updatedAt: importStamp }));
         if(Array.isArray(parsed.catalog) && parsed.catalog.length){
           equipmentCatalog = parsed.catalog;
         }
@@ -8522,6 +8742,7 @@ function attachHandlers(){
       sel.onchange = ()=>{
         const row = draftEquip.find(e=>e.id===sel.dataset.eqid);
         if(!row) return;
+        row.customName = (sel.value === '__custom__');
         row.name = (sel.value === '__custom__') ? '' : sel.value;
         render();
         if(sel.value === '__custom__'){
@@ -8550,6 +8771,7 @@ function attachHandlers(){
       sel.onchange = ()=>{
         const row = draftEquip.find(e=>e.id===sel.dataset.eqid);
         if(!row) return;
+        row.customColor = (sel.value === '__customcolor__');
         row.bandColor = (sel.value === '__customcolor__') ? '' : sel.value;
         render();
         if(sel.value === '__customcolor__'){
@@ -9047,7 +9269,11 @@ function attachHandlers(){
           notes: t.notes||'',
           photo: t.photo||'',
           signatureDelivered: t.signatureDelivered||'',
-          signatureReceived: t.signatureReceived||''
+          signatureReceived: t.signatureReceived||'',
+          // What the signatures were when the form opened. Only a change
+          // from THIS is a reason to write the Signatures sheet on save.
+          sigDeliveredAtOpen: t.signatureDelivered||'',
+          sigReceivedAtOpen: t.signatureReceived||''
         };
         currentTab = 'new';
         render();
@@ -9056,12 +9282,29 @@ function attachHandlers(){
     document.querySelectorAll('[data-return]').forEach(b=>{
       b.onclick = async ()=>{
         const t = tickets.find(x=>x.id===b.dataset.return);
-        if(t){
-          t.returnDate = todayStr(); t.updatedAt = nowIso();
-          await saveTickets();
-          await reconcileYardFromTickets(); // straight into the shop queue
-          render();
+        if(!t) return;
+        // Rig Move warns about unbilled wells; this did not. Pad at 1 of 4,
+        // tap Mark Returned, and the other three dropped off every screen
+        // with no way left to record them and no alert. Same warning here,
+        // and the pad is closed so the dashboard's closed-pad alert and its
+        // "Mark a well billed" button apply to it from now on.
+        const live = Array.isArray(t.pads) ? t.pads.filter(p=>p && p.status === 'active') : [];
+        const short = live.filter(p=>{
+          const b2 = Array.isArray(p.billedWells) ? p.billedWells.length : 0;
+          return (p.totalWells||0) > 0 && b2 < (p.totalWells||0);
+        });
+        if(short.length){
+          const lines = short.map(p=>`• ${p.name||'(pad)'} — ${(Array.isArray(p.billedWells)?p.billedWells.length:0)} of ${p.totalWells} billed`).join('\n');
+          if(!confirm(`This ticket still has unbilled wells:\n\n${lines}\n\nMark it returned anyway? The pad will show on the dashboard until those wells are recorded.`)) return;
         }
+        live.forEach(p=>{
+          p.status = 'complete';
+          if(!p.completedDate) p.completedDate = todayStr();
+        });
+        t.returnDate = todayStr(); t.updatedAt = nowIso();
+        await saveTickets();
+        await reconcileYardFromTickets(); // straight into the shop queue
+        render();
       };
     });
     document.querySelectorAll('[data-delete]').forEach(b=>{
@@ -9216,6 +9459,9 @@ function attachHandlers(){
         if(!w) return;
         const desc = w.label ? `"${w.label}"` : `the entry dated ${fmtDate(w.date)}`;
         if(!confirm(`Remove ${desc} from ${pad.name}?\n\nThis lowers the billed count for this pad.`)) return;
+        // Tell the cloud this was on purpose BEFORE it is gone from memory,
+        // or the server's conflict union will put it straight back.
+        noteWellRemoved(t.id, pad, w);
         pad.billedWells.splice(i, 1);
         t.updatedAt = nowIso();
         await saveTickets();
@@ -9268,10 +9514,24 @@ function attachHandlers(){
           if(nextEnd !== undefined) completedDate = nextEnd;
         }
 
-        // Clearing the end date on a finished pad leaves it neither running
-        // nor dated, which is what made its day count climb forever. If the
-        // end date has gone, the pad is running again.
-        if(isDone && !completedDate) pad.status = 'active';
+        // Clearing the end date on a finished pad: the pad is running again -
+        // but only ONE pad on a ticket can be. If a later pad is already
+        // active, blanking this one's end date would flip it to a second
+        // active pad hiding behind the current one, where getActivePad never
+        // returns it, Pad History never lists it and the closed-pad alert
+        // skips it - unreachable until the next rig move. Refuse that case
+        // with a reason, and decide the status AFTER every abort below so a
+        // cancelled edit leaves nothing changed in memory.
+        let reopen = false;
+        if(isDone && !completedDate){
+          const otherActive = Array.isArray(t.pads) && t.pads.some(p=>p && p !== pad && p.status === 'active');
+          if(otherActive){
+            const live = t.pads.find(p=>p && p !== pad && p.status === 'active');
+            alert(`${name} can't be reopened while ${live.name || 'another pad'} is the running pad on this ticket. Give it an end date, or finish ${live.name || 'the other pad'} first. Nothing was changed.`);
+            return;
+          }
+          reopen = true;
+        }
 
         if(startDate && completedDate && completedDate < startDate){
           alert(`${name} would end (${fmtDate(completedDate)}) before it started (${fmtDate(startDate)}). Nothing was changed.`);
@@ -9292,8 +9552,9 @@ function attachHandlers(){
         }
 
         const unchanged = name === (pad.name||'') && count === (pad.totalWells||0)
-          && startDate === (pad.startDate||'') && completedDate === (pad.completedDate||'');
+          && startDate === (pad.startDate||'') && completedDate === (pad.completedDate||'') && !reopen;
         if(unchanged) return;
+        if(reopen) pad.status = 'active';
         pad.startDate = startDate;
         if(isDone) pad.completedDate = completedDate;
         pad.name = name;
@@ -9318,6 +9579,11 @@ function attachHandlers(){
         const trimmed = next.trim();
         if(!trimmed){ alert('A well name or number is required.'); return; }
         if(trimmed === (w.label||'')) return;   // no change, no save, no sync churn
+        // A rename is a removal of the old spelling plus an addition of the
+        // new one as far as the cloud's union is concerned. Record the old
+        // key, or the server resurrects the misspelling beside the fix and
+        // the pad reads "3 of 2 billed".
+        noteWellRemoved(t.id, pad, w);
         w.label = trimmed;
         // The billed DATE is deliberately untouched. It is what the Billing
         // Check dates its grace window from, and a typo fix is not a re-bill.
@@ -9648,8 +9914,23 @@ async function onSaveTicket(){
     .filter(w=>w.date || w.amount)
     .map(w=>({ id: w.id, date: w.date || deliveryDate, label: (w.label||'').trim(), amount: Number(w.amount)||0 }));
 
+  // bandSetAt rides along. Rebuilding each line as {name, serial, bandColor,
+  // qty} threw it away, so a band swapped today and then any edit to the
+  // ticket resolved the new colour against the January delivery date - and
+  // brand-new iron showed as expired. If the colour was CHANGED on the form
+  // the stamp is reset to today, because that is a swap.
+  const priorLines = (editingId ? (tickets.find(x=>x.id===editingId)||{}).equipment : null) || [];
   const equipment = draftEquip
-    .map(e=>({name:e.name.trim(), serial:(e.serial||'').trim(), bandColor:(e.bandColor||'').trim(), qty:Number(e.qty)||0}))
+    .map(e=>{
+      const line = {name:e.name.trim(), serial:(e.serial||'').trim(), bandColor:(e.bandColor||'').trim(), qty:Number(e.qty)||0};
+      const prior = priorLines.find(p=>p && p.name===line.name && (p.serial||'')===line.serial);
+      if(prior && prior.bandSetAt){
+        line.bandSetAt = (prior.bandColor||'') === line.bandColor ? prior.bandSetAt : todayStr();
+      } else if(prior && (prior.bandColor||'') !== line.bandColor && line.bandColor){
+        line.bandSetAt = todayStr();
+      }
+      return line;
+    })
     .filter(e=>e.name);
 
   if(!ticketNumber){ alert('Please enter a ticket number.'); return; }
@@ -9721,14 +10002,15 @@ async function onSaveTicket(){
     tickets.push({id:savedTicketId, ticketNumber, customer, rig, deliveryDate, returnDate, notes, photo, signatureDelivered, signatureReceived, wellCharges, equipment, pads: initialPads, updatedAt: nowIso()});
   }
 
-  addToCatalogIfNew(rigCatalog, rig);
-  addToCatalogIfNew(customerCatalog, customer);
+  const rigAdded = addToCatalogIfNew(rigCatalog, rig);
+  const customerAdded = addToCatalogIfNew(customerCatalog, customer);
   // Equipment entered as "+ Add new equipment..." has to join the catalog
   // too. Without this, once the ticket was returned the item appeared in no
   // catalog and had no owned count, so it dropped out of Full Inventory
   // entirely - carrying its In Shop quantity into a queue nothing could see
   // and no count would ever visit.
-  equipment.forEach(e=>addToCatalogIfNew(equipmentCatalog, e.name));
+  let equipmentAdded = false;
+  equipment.forEach(e=>{ if(addToCatalogIfNew(equipmentCatalog, e.name)) equipmentAdded = true; });
 
   // Save catalogs to local storage directly (pushToCloud already bundles
   // rig/customer data into the same request that saveTickets() below
@@ -9739,9 +10021,14 @@ async function onSaveTicket(){
   // the store as stale, and the next pull erased the addition - so a ticket
   // could be saved against a rig that then vanished from the rig list. Every
   // other write to these stores stamps; this path was the one that didn't.
-  try{ localStorage.setItem(RIG_CATALOG_KEY, JSON.stringify(rigCatalog)); stampStore('rigCatalog'); }catch(e){ showStorageWarning('rig list', e); }
-  try{ localStorage.setItem(CUSTOMER_CATALOG_KEY, JSON.stringify(customerCatalog)); stampStore('customerCatalog'); }catch(e){ showStorageWarning('customer list', e); }
-  try{ localStorage.setItem(CATALOG_KEY, JSON.stringify(equipmentCatalog)); stampStore('catalog'); }catch(e){ showStorageWarning('equipment list', e); }
+  // Stamped ONLY when something was actually added. Stamping on every save
+  // made this device the newest writer of all three catalogs every time a
+  // ticket was touched, which let a phone that had missed a pull overwrite
+  // a rename made on the laptop - the exact stale write the stamp exists to
+  // refuse. An unchanged catalog keeps its old stamp and loses honestly.
+  try{ localStorage.setItem(RIG_CATALOG_KEY, JSON.stringify(rigCatalog)); if(rigAdded) stampStore('rigCatalog'); }catch(e){ showStorageWarning('rig list', e); }
+  try{ localStorage.setItem(CUSTOMER_CATALOG_KEY, JSON.stringify(customerCatalog)); if(customerAdded) stampStore('customerCatalog'); }catch(e){ showStorageWarning('customer list', e); }
+  try{ localStorage.setItem(CATALOG_KEY, JSON.stringify(equipmentCatalog)); if(equipmentAdded) stampStore('catalog'); }catch(e){ showStorageWarning('equipment list', e); }
 
   // Kick off saving (local write happens synchronously inside this, before
   // any network call) but don't wait on the cloud push before moving on -
@@ -9751,7 +10038,17 @@ async function onSaveTicket(){
   // Also keep the separate Signatures sheet (used by delivery-signing
   // links) in sync, so clearing/changing a signature here actually sticks
   // instead of a stale driver-submitted one reappearing on the next pull.
-  pushSignatureUpdate(savedTicketId, signatureDelivered, signatureReceived);
+  //
+  // But ONLY when the signature was actually changed on this form. It used
+  // to write both columns on every save, from whatever the form held - and
+  // the form held what the ticket had when Edit was opened. Auto-pull is
+  // suspended while the form is open, so a driver who signed at the rig in
+  // that window had his signature overwritten with blanks the moment the
+  // owner saved an unrelated note. The Drive PDF survived; the app and the
+  // sheet showed the ticket as unsigned, and nothing said so.
+  const sigChanged = (signatureDelivered !== (draftTicket.sigDeliveredAtOpen || ''))
+                  || (signatureReceived  !== (draftTicket.sigReceivedAtOpen  || ''));
+  if(sigChanged) pushSignatureUpdate(savedTicketId, signatureDelivered, signatureReceived);
 
   // Back up any photos or signatures captured in the main app to Google
   // Drive. Runs fully async in the background - the user is already back
@@ -9880,6 +10177,7 @@ async function init(){
   loadSyncToken();
   loadLastSyncFailure();
   loadPendingDeletes();
+  loadPendingWellRemovals();
   seedMadeToOrderOnce();
   await reconcileYardFromTickets();
   render();
