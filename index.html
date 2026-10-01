@@ -924,7 +924,7 @@ function matchInvoiceRule(inv){
 }
 
 let syncStatus = 'idle'; // idle | saving | loading | ok | error
-const APP_BUILD = '166';  // shown in the sync panel - bump on every release
+const APP_BUILD = '167';  // shown in the sync panel - bump on every release
 let pushInProgress = false; // true while a push is in flight — blocks auto-pull to prevent race conditions
 // Bumped by every local save. pullFromCloud captures it before its fetch and
 // re-checks it after: pushInProgress only stops a pull STARTING mid-push, it
@@ -1041,6 +1041,140 @@ function promptWellCount(){
   }
   return null;
 }
+
+/* ── INVOICE PICKER ─────────────────────────────────────────────────
+   Asked the moment a well is marked billed, and again from the chip.
+
+   Up to build 166 a billed well carried no invoice state at all. The
+   Billing Check then had to GUESS which QuickBooks invoice was which by
+   comparing hand-typed names, and every mismatch - "1-1H" against "Neal
+   5103H", "Bull Moose 1" against "BULL MOOSE 10" - became a bug to patch.
+   Three builds went into tightening the guessing.
+
+   The fix is not better guessing; it is not guessing. A well is now in one
+   of three states the moment it is marked: tied to a named invoice, "not
+   invoiced yet", or (legacy, pre-167) unknown. The first is settled. The
+   second is an explicit to-do that the check keeps watching: when an
+   invoice turns up that names the well, or sits on the rig in the pad's
+   window, it is OFFERED with one tap - never assumed. Only legacy wells
+   still go through the old name match.
+
+   Resolves to { kind:'invoice', doc } | { kind:'none' } | null (cancel). */
+function docsLinkedAcrossTracker(exceptWell){
+  const used = new Set();
+  (tickets||[]).forEach(t=>{
+    (Array.isArray(t.pads)?t.pads:[]).forEach(p=>{
+      (Array.isArray(p.billedWells)?p.billedWells:[]).forEach(w=>{
+        if(w && w !== exceptWell && w.invDoc) used.add(String(w.invDoc));
+      });
+    });
+  });
+  return used;
+}
+function rankInvoicesForWell(t, pad, label, exceptWell){
+  const invoices = (qbRevenueData && Array.isArray(qbRevenueData.invoices)) ? qbRevenueData.invoices : [];
+  const used = docsLinkedAcrossTracker(exceptWell);
+  const lineage = [t.rig].concat((Array.isArray(t.previousRigs)?t.previousRigs:[]).map(p=>p&&p.rig)).filter(Boolean);
+  const padStart = pad && pad.startDate ? String(pad.startDate).slice(0,10) : '';
+  const rows = [];
+  invoices.forEach(inv=>{
+    if(!isPerWellInvoice(inv)) return;
+    const doc = String(inv.docNumber||'');
+    if(!doc || used.has(doc)) return;
+    const name = wellMatchScore(label, inv.wellName);
+    const onRig = !!inv.rig && lineage.some(r=>rigsAgree(r, inv.rig));
+    const sameCust = !!(t.customer && inv.customer) && normalizeTight(inv.customer).indexOf(normalizeTight(t.customer)) !== -1;
+    // Nothing raised before the rig reached this pad can be for a well on it.
+    const beforePad = !!(padStart && inv.date && inv.date < padStart);
+    rows.push({ inv, doc, name, onRig, sameCust, beforePad,
+                likely: name > 0 || (onRig && !beforePad) });
+  });
+  rows.sort((x,y)=> (y.name - x.name) || (Number(y.onRig) - Number(x.onRig)) || (Number(y.sameCust) - Number(x.sameCust))
+                 || String(y.inv.date||'').localeCompare(String(x.inv.date||'')));
+  return rows;
+}
+function pickInvoiceForWell(t, pad, label, opts){
+  opts = opts || {};
+  return new Promise(async (resolve)=>{
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed; inset:0; background:rgba(20,24,26,0.7); display:flex; align-items:center; justify-content:center; z-index:9999; padding:16px;';
+    const btn = (txt, style)=>`<button style="${style}; border-radius:6px; padding:9px 14px; font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; font-size:12px; cursor:pointer;">${txt}</button>`;
+    const shell = (body)=>`
+      <div style="background:#F6F1E6; border-radius:10px; padding:20px; max-width:480px; width:100%; max-height:90vh; overflow:auto; font-family:'Inter',sans-serif;">
+        <h3 style="font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; margin:0 0 4px 0; font-size:16px;">Which invoice is this well?</h3>
+        <div style="font-size:13px; color:#5B6660; margin-bottom:12px;"><strong>${escHtml(label)}</strong> on ${escHtml(pad && pad.name || 'this pad')} &middot; ${escHtml(t.rig||'no rig')}${t.customer?' &middot; '+escHtml(t.customer):''}</div>
+        ${body}
+      </div>`;
+    const finish = (v)=>{ overlay.remove(); resolve(v); };
+    document.body.appendChild(overlay);
+
+    // Invoices are only pulled when Reports is opened; marking a well on the
+    // Tickets tab is usually the first thing that needs them.
+    if(syncUrl && !qbRevenueData){
+      overlay.innerHTML = shell(`<div style="font-size:13px; color:#5B6660; padding:12px 0;">Checking QuickBooks for invoices&hellip;</div>`);
+      try{
+        await fetchQuickBooksRevenue();
+        // Reports may already have a pull in flight; fetchQuickBooksRevenue
+        // returns at once in that case, so wait for it rather than telling
+        // the user QuickBooks is down.
+        for(let i = 0; i < 40 && qbRevenueLoading; i++) await new Promise(r=>setTimeout(r, 250));
+      }catch(e){}
+    }
+    const qbOk = !!(qbRevenueData && qbRevenueData.connected && !qbRevenueData.error);
+    const rows = qbOk ? rankInvoicesForWell(t, pad, label, opts.exceptWell) : [];
+    const likely = rows.filter(r=>r.likely);
+    const rest = rows.filter(r=>!r.likely);
+    const rowHtml = (r)=>`
+      <button data-pick-doc="${escAttr(r.doc)}" style="display:block; width:100%; text-align:left; background:#fff; border:1.5px solid ${r.name>0?'#1E8A29':'#D3DED4'}; border-radius:6px; padding:9px 11px; margin-bottom:6px; font-family:inherit; cursor:pointer;">
+        <div style="font-size:13px; font-weight:600;">Invoice ${escHtml(r.doc)} <span style="font-weight:400; color:#5B6660;">&middot; ${escHtml(fmtDate(r.inv.date))}${isFinite(Number(r.inv.amount))?' &middot; $'+Number(r.inv.amount).toLocaleString(undefined,{maximumFractionDigits:0}):''}</span></div>
+        <div style="font-size:11px; color:#5B6660; margin-top:2px;">${r.inv.wellName?'billed as &ldquo;'+escHtml(r.inv.wellName)+'&rdquo;':'no well on invoice'}${r.inv.rig?' &middot; '+escHtml(r.inv.rig):''}${r.inv.customer?' &middot; '+escHtml(r.inv.customer):''}${r.name>0?' <span style="color:#1E8A29;">&middot; name matches</span>':''}${r.beforePad?' <span style="color:#B5432A;">&middot; dated before this pad started</span>':''}</div>
+      </button>`;
+    let listHtml;
+    if(!syncUrl){
+      listHtml = `<div style="font-size:12px; color:#5B6660; margin-bottom:12px;">No cloud sync set up, so invoices can't be looked up here. You can still say whether it's been invoiced.</div>`;
+    } else if(!qbOk){
+      listHtml = `<div style="font-size:12px; color:#B5432A; margin-bottom:12px;">QuickBooks couldn't be reached, so no invoices to pick from right now. Choose &ldquo;Not invoiced yet&rdquo; and link it later from the well's chip.</div>`;
+    } else if(!rows.length){
+      listHtml = `<div style="font-size:12px; color:#5B6660; margin-bottom:12px;">Every per-well invoice in QuickBooks is already tied to a well. If this one was just invoiced, give the pull a minute and link it from the chip.</div>`;
+    } else {
+      listHtml = (likely.length
+          ? `<div style="font-size:11px; text-transform:uppercase; letter-spacing:0.5px; color:#5B6660; margin-bottom:6px;">On ${escHtml(t.rig||'this rig')} or naming this well</div>${likely.slice(0,8).map(rowHtml).join('')}`
+          : `<div style="font-size:12px; color:#5B6660; margin-bottom:8px;">Nothing in QuickBooks names this well or sits on ${escHtml(t.rig||'this rig')}.</div>`)
+        + (rest.length || likely.length > 8
+          ? `<details style="margin-bottom:8px;"><summary style="cursor:pointer; font-size:11px; color:#5B6660; text-transform:uppercase; letter-spacing:0.5px;">Show all ${rows.length} unlinked invoices</summary><div style="margin-top:8px;">${likely.slice(8).concat(rest).map(rowHtml).join('')}</div></details>`
+          : '');
+    }
+    overlay.innerHTML = shell(`
+      ${listHtml}
+      <div style="display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; margin-top:6px;">
+        ${opts.allowClear ? `<button id="inv-pick-clear" style="background:none; border:1.5px solid #E0A9A0; color:#8A3B2A; border-radius:6px; padding:9px 14px; font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; font-size:12px; cursor:pointer; margin-right:auto;">Clear link</button>` : ''}
+        <button id="inv-pick-cancel" style="background:none; border:1.5px solid #5C6670; color:#5C6670; border-radius:6px; padding:9px 14px; font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; font-size:12px; cursor:pointer;">Cancel</button>
+        <button id="inv-pick-none" style="background:#B5432A; color:#fff; border:none; border-radius:6px; padding:9px 14px; font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; font-size:12px; cursor:pointer;">Not invoiced yet</button>
+      </div>
+      <div style="font-size:11px; color:#5B6660; margin-top:10px;">&ldquo;Not invoiced yet&rdquo; keeps this well on the Billing Check until an invoice is tied to it &mdash; when one shows up in QuickBooks that names it, you'll be offered the link.</div>`);
+    overlay.querySelectorAll('[data-pick-doc]').forEach(b=>{
+      b.onclick = ()=>{
+        const doc = b.dataset.pickDoc;
+        if(!confirm(`Tie "${label}" to invoice ${doc}?\n\nIt will count as billed and invoiced from now on.`)) return;
+        finish({ kind:'invoice', doc: doc });
+      };
+    });
+    overlay.querySelector('#inv-pick-none').onclick = ()=> finish({ kind:'none' });
+    overlay.querySelector('#inv-pick-cancel').onclick = ()=> finish(null);
+    const clr = overlay.querySelector('#inv-pick-clear');
+    if(clr) clr.onclick = ()=> finish({ kind:'clear' });
+    overlay.onclick = (e)=>{ if(e.target === overlay) finish(null); };
+  });
+}
+// Apply a picker answer to a billed-well record. Returns false on cancel.
+function applyInvoicePick(w, pick){
+  if(!pick) return false;
+  if(pick.kind === 'invoice'){ w.invDoc = pick.doc; delete w.noInvoice; }
+  else if(pick.kind === 'none'){ w.noInvoice = true; delete w.invDoc; }
+  else if(pick.kind === 'clear'){ delete w.invDoc; delete w.noInvoice; }
+  return true;
+}
+
 // Each ticket can carry a history of pads the iron has visited. The
 // active pad is where the equipment is right now; completed pads are
 // history. Each pad tracks total wells vs how many have been billed.
@@ -1618,6 +1752,58 @@ async function reconcileYardFromTickets(){
   }
 }
 
+/* READY IS ARITHMETIC, NOT A LEDGER.
+
+   Ready used to be a stored number maintained by replaying every ticket's
+   delivery against it. That ledger was patched three times in two weeks -
+   stale debits that re-fired forever, a Ready button that undid itself,
+   phantom stock paid out on a delete - and each fix added another field.
+   The root problem was never any one of those: it was that Ready is not an
+   event. It is what is left.
+
+       ready = owned - out on tickets - in the shop queue
+
+   Owned comes from a count or Fill From Tickets. Out is read straight off
+   the open tickets. The shop queue IS event-driven (returns go in, the
+   Ready button takes out) and that part of the ledger stays. Ready is
+   recomputed from those three whenever anything changes, and nothing can
+   drift because nothing is stored.
+
+   When owned is smaller than out + shop, the numbers contradict each other
+   and Ready is floored at zero with the shortfall recorded on the item, so
+   the screen can say "N more out or in shop than owned" instead of showing
+   a negative. The only cure for that is a count, and the screen says so. */
+function deriveReadyForAll(){
+  const inv = ensureInventoryCount();
+  const out = outQtyByName();
+  const names = new Set(Object.keys(inv.items||{}));
+  Object.keys(equipmentOwned||{}).forEach(n=>names.add(n));
+  Object.keys(out).forEach(n=>names.add(n));
+  let changed = false;
+  names.forEach(name=>{
+    const ownedRaw = equipmentOwned ? equipmentOwned[name] : null;
+    const hasOwned = ownedRaw !== null && ownedRaw !== undefined && ownedRaw !== '' && isFinite(Number(ownedRaw));
+    const it = inv.items[name];
+    const shop = it ? (Number(it.shop)||0) : 0;
+    const o = out[name] || 0;
+    let ready = 0, short = 0;
+    if(hasOwned){
+      const owned = Number(ownedRaw);
+      ready = Math.max(0, owned - o - shop);
+      short = Math.max(0, o + shop - owned);
+    }
+    if(it){
+      if((Number(it.ready)||0) !== ready){ it.ready = ready; changed = true; }
+      if((Number(it.short)||0) !== short){ if(short) it.short = short; else delete it.short; changed = true; }
+    } else if(ready > 0 || short > 0){
+      inv.items[name] = { ready: ready, shop: 0 };
+      if(short) inv.items[name].short = short;
+      changed = true;
+    }
+  });
+  return changed;
+}
+
 async function reconcileYardFromTickets_(){
   if(!tickets) return false;
   const inv = ensureInventoryCount();
@@ -1678,41 +1864,13 @@ async function reconcileYardFromTickets_(){
        next reconcile computes a delta of zero and does nothing, so there is
        no repeating push either. Where the buckets genuinely could not cover
        the movement the numbers now disagree with each other in the open, and
-       Full Inventory's own "more marked ready than are home" line says so -
+       Full Inventory's own "more out or in shop than owned" line says so -
        which is a visible wrong number instead of an invisible one. */
-    /* Two numbers per item per ticket: what the ticket SAYS (rec.out), and
-       what the bucket actually PAID toward it (rec.outPaid). Recording only
-       the intent, as the last build did, stopped the stale-debit loop but
-       opened the opposite hole: a ticket written when Ready was 0 recorded
-       out=5 while Ready paid nothing, and deleting that ticket later gave
-       back 5 - Ready read 5 for iron nobody had ever counted. A reversal can
-       only hand back what was actually taken. */
-    if(!rec.outPaid  || typeof rec.outPaid  !== 'object') rec.outPaid  = {};
+    // The out leg of this ledger is gone. Ready is no longer maintained by
+    // replaying deliveries - see deriveReadyForAll() above. Only the shop
+    // queue is event-driven now. Old rec.out / rec.outPaid entries are left
+    // in place and ignored.
     if(!rec.backPaid || typeof rec.backPaid !== 'object') rec.backPaid = {};
-
-    const outNames = new Set(Object.keys(wantOut).concat(Object.keys(rec.out)));
-    outNames.forEach(name=>{
-      const want = (wantOut[name]||0);
-      const prev = (rec.out[name]||0);
-      if(want === prev) return;
-      const prevPaid = (rec.outPaid[name]||0);
-      let paid = prevPaid;
-      if(want > prev){
-        // More iron has left. Ready falls by what it can actually cover.
-        const taken = -applyDelta(name, 'ready', -(want - prev));
-        paid = prevPaid + taken;
-      } else {
-        // Less iron is out (edit, delete, undo). Give back ONLY what was
-        // genuinely taken off Ready for this ticket - never more.
-        const giveBack = Math.min(prev - want, prevPaid);
-        if(giveBack > 0) applyDelta(name, 'ready', giveBack);
-        paid = prevPaid - giveBack;
-      }
-      rec.out[name] = want;
-      rec.outPaid[name] = paid;
-      if(rec.out[name] <= 0){ delete rec.out[name]; delete rec.outPaid[name]; }
-      changed = true;
-    });
 
     // Shop queue: add on return, and remove again if the return is undone.
     const backNames = new Set(Object.keys(wantBack).concat(Object.keys(rec.back)));
@@ -1747,6 +1905,7 @@ async function reconcileYardFromTickets_(){
   });
 
   syncAllShopBatches();
+  if(deriveReadyForAll()) changed = true;
   if(changed) await saveAppSettings();
   return changed;
 }
@@ -1874,7 +2033,8 @@ async function markReadyFromShop(name){
   if(inv.shopHistory.length > 400) inv.shopHistory = inv.shopHistory.slice(-400);
 
   it.shop -= move;
-  it.ready += move;
+  // Ready is derived - the shop queue going down IS Ready going up.
+  deriveReadyForAll();
   await saveAppSettings();
   render();
 }
@@ -2483,13 +2643,15 @@ async function applyCountSession(){
     if(afterCountStarted(t)) return;        // leave for the reconcile to apply
     Object.keys(q).forEach(name=>{
       if(!countedNames.has(name)) return;
-      rec.out[name] = q[name];
-      // The count IS the physical truth, so what it saw counts as fully paid.
-      rec.outPaid[name] = q[name];
+      // Only the shop side is a ledger now. The count IS the physical truth,
+      // so a returned ticket's iron counts as fully in the queue it saw.
       if(t.returnDate){ rec.back[name] = q[name]; rec.backPaid[name] = q[name]; }
       else { delete rec.back[name]; delete rec.backPaid[name]; }
     });
   });
+  // owned was set to ready + shop + out above, so deriving gives back the
+  // counted Ready exactly - this just makes the stored field agree.
+  deriveReadyForAll();
 
   // Write everything FIRST, and only then drop the raw count. It used to be
   // cleared here, before three sequential saves and network pushes - so a
@@ -2752,7 +2914,7 @@ function printInventorySheet(){
 
   const statusFor = (r)=>{
     if(r.owned === null) return '<span class="warn">no count on file</span>';
-    if(r.overplaced) return `<span class="bad">${r.overplaced} more marked ready than are home</span>`;
+    if(r.overplaced) return `<span class="bad">${r.overplaced} more out or in shop than owned &mdash; count needed</span>`;
     // A single-unit item that's out has nothing left by definition. Saying
     // "none available" there implies a fleet that ran dry, when really it's
     // a one-off doing exactly what it was bought to do - the zero under At
@@ -4081,6 +4243,28 @@ async function pullFromCloud(silent, force){
 }
 
 // Push current data up to the shared Google Sheet backend.
+/* ── TICKETS CELL HEADROOM ──────────────────────────────────────────
+   Every ticket is stored as one JSON string in a single Google Sheets cell,
+   and a cell holds 50,000 characters. Nothing on the server warns as that
+   fills; the first sign would be a push that fails outright, with the whole
+   app refusing to save. This measures the same JSON the push sends, so the
+   dashboard can say "getting full" while there is still time to archive. */
+const TICKETS_CELL_LIMIT = 50000;
+function ticketsCellEstimate(){
+  try{
+    return JSON.stringify((tickets||[]).map(t=>{
+      const {photo, signatureDelivered, signatureReceived, ...rest} = t;
+      return rest;
+    })).length;
+  }catch(e){ return 0; }
+}
+function ticketsCellWarning(){
+  const n = ticketsCellEstimate();
+  if(n < TICKETS_CELL_LIMIT * 0.7) return null;
+  const pct = Math.round(n / TICKETS_CELL_LIMIT * 100);
+  return { chars: n, pct: pct, critical: n >= TICKETS_CELL_LIMIT * 0.9 };
+}
+
 async function pushToCloud(){
   if(!syncUrl) return;
   pushInProgress = true;
@@ -4391,6 +4575,10 @@ function resetDraftTicket(){
 }
 
 function render(){
+  // Ready is arithmetic over owned, out and the shop queue. Recomputed here
+  // so every screen reads a current number whatever changed last - cheap,
+  // idempotent, and persisted by whichever save comes next.
+  try{ deriveReadyForAll(); }catch(e){ /* never let a derive break a render */ }
   // Count mode takes over the whole screen. No tab bar, no header chrome -
   // it's used one-handed in a yard, and every pixel of tap target counts.
   if(countMode){
@@ -4804,13 +4992,26 @@ function renderActionAlerts(){
 
   });
 
-  if(alerts.length === 0 && !billingRisk) return '';
+  const cellWarn = syncUrl ? ticketsCellWarning() : null;
+  if(alerts.length === 0 && !billingRisk && !cellWarn) return '';
 
   const moveAlerts = alerts.filter(a=>a.type==='move');
   const billingAlerts = alerts.filter(a=>a.type==='billing');
   const closedAlerts = alerts.filter(a=>a.type==='closed');
 
   let html = '<div style="margin-bottom:16px;">';
+
+  if(cellWarn){
+    const fg = cellWarn.critical ? '#B5432A' : '#8A6D10';
+    const bg = cellWarn.critical ? '#FCEBEA' : '#FFF8E6';
+    const bd = cellWarn.critical ? '#E8A5A0' : '#E6D080';
+    html += `<div style="background:${bg}; border:1.5px solid ${bd}; border-radius:8px; padding:12px 18px; margin-bottom:10px;">
+      <div style="font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; font-size:13px; color:${fg}; font-weight:600;">Cloud storage ${cellWarn.pct}% full</div>
+      <div style="font-size:12px; color:${fg}; margin-top:4px;">${cellWarn.critical
+        ? 'The ticket store is almost at the Google Sheets cell limit. When it fills, syncing stops working altogether. Export a backup now, then delete returned tickets from last year to make room.'
+        : 'The ticket store is getting close to the Google Sheets cell limit (' + cellWarn.chars.toLocaleString() + ' of ' + TICKETS_CELL_LIMIT.toLocaleString() + ' characters). Deleting old returned tickets after a backup keeps it clear.'}</div>
+    </div>`;
+  }
 
   // First, because it is the only one of these that is money already earned
   // and possibly never charged for.
@@ -5810,7 +6011,7 @@ function renderFullInventory(){
           ${r.out>0?` &middot; <span style="color:#3A6EA5; font-weight:600;">${r.out} out</span>`:''}
           &middot; <span style="color:${r.shop>0?'#B8691C':'var(--ink-soft)'};">${r.shop} in shop</span>
           ${unaccounted ? ` &middot; <span style="color:#B8691C;">${unaccounted} unaccounted</span>` : ''}
-          ${overplaced ? ` &middot; <span style="color:#B5432A;">${overplaced} more marked ready than are home</span>` : ''}
+          ${overplaced ? ` &middot; <span style="color:#B5432A;">${overplaced} more out or in shop than owned &mdash; count needed</span>` : ''}
           ${(function(){
             if(!(r.shop > 0)) return '';
             const w = shopWaits(r.name);
@@ -6716,6 +6917,88 @@ function duplicateWellNames(invoices){
   return out;
 }
 
+/* ── WELL / INVOICE NAME SCORING (shared by the check and the picker) ── */
+const WELL_FILLER = ['unit','well','lease','pad','the','and','fee','state','tract','sec','section','com'];
+const wellNums  = (s)=> (String(s||'').match(/\d+/g) || []);
+const wellWords = (s)=> (String(s||'').toLowerCase().match(/[a-z]+/g) || [])
+                          .filter(w=>w.length >= 3 && WELL_FILLER.indexOf(w) === -1);
+// One character out - "Neil" against "Neal". Anything looser starts
+// pairing wells that only rhyme.
+const nearWord = (a, b)=>{
+  if(a === b) return true;
+  if(a.length < 4 || b.length < 4) return false;
+  if(Math.abs(a.length - b.length) > 1) return false;
+  let i = 0, j = 0, edits = 0;
+  while(i < a.length && j < b.length){
+    if(a[i] === b[j]){ i++; j++; continue; }
+    if(++edits > 1) return false;
+    if(a.length > b.length) i++;
+    else if(b.length > a.length) j++;
+    else { i++; j++; }
+  }
+  return true;
+};
+/* How strongly two spellings look like the same well. 0 = not a match.
+
+   This used to answer a plain yes/no and the first well in the list to get
+   a yes took the invoice for good. Two things went wrong with that. The
+   substring rule alone made "Bull Moose 1" a match for "BULL MOOSE 10", so
+   a well that had never been invoiced could eat the invoice belonging to a
+   different well on the same lease - and the robbed well, being newly
+   marked, then sat silently in the grace window while the screen read
+   "Everything lines up." And because it was first-come, reversing the order
+   of two wells in the tracker changed the verdict on identical data.
+
+   So: numbers have to agree before any loose comparison is allowed. On an
+   oil well the number IS the identity - the words are the lease. And a
+   score lets the caller assign the best pairing overall rather than
+   whichever it happened to reach first. */
+function wellMatchScore(rawA, rawB){
+  const a = normalizeTight(rawA), b = normalizeTight(rawB);
+  if(!a || !b) return 0;
+  if(a === b) return 3;                       // identical once punctuation is gone
+  // A short label is not evidence. "3" would otherwise match "neal5103h".
+  const shorter = a.length <= b.length ? a : b;
+  if(shorter.length < 4) return 0;
+
+  const na = wellNums(rawA), nb = wellNums(rawB);
+  const numsAgree = !!na.length && na.length === nb.length
+                 && na.slice().sort().join('|') === nb.slice().sort().join('|');
+
+  if(a.indexOf(b) !== -1 || b.indexOf(a) !== -1){
+    // One name sits inside the other. Fine when the numbers are the same
+    // ("Baird, W.E. 1937" inside "BAIRD WE 1937H"). Not fine when they
+    // differ, because then the containment IS the difference between two
+    // wells - which is exactly the Bull Moose 1 / Bull Moose 10 case.
+    return numsAgree ? 2 : 0;
+  }
+  if(!numsAgree) return 0;
+  // Same numbers plus a name word that all but agrees. A well name is typed
+  // here and typed again on the invoice, so the words drift and reorder -
+  // "Suntura Unit ( Lower Clear Fork) 520" against "Suntura (Lower Clear
+  // Fork) Unit 520". The numbers identify the well; the words only have to
+  // rule out a different lease.
+  const wa = wellWords(rawA), wb = wellWords(rawB);
+  if(!wa.length || !wb.length) return 0;
+  return wa.some(x=>wb.some(y=>nearWord(x, y))) ? 1 : 0;
+}
+function wellsAgree(rawA, rawB){ return wellMatchScore(rawA, rawB) > 0; }
+// Takes the ORIGINAL spellings, not normalized ones. sameRigName splits a
+// rig into a contractor word and a number, and normalizeTight has already
+// thrown away the space that separates them: "Ensign T124" becomes
+// "ensignt124", whose word token is "ensignt" and no longer equals the
+// "ensign" from "Ensign 124". Feeding it pre-normalized text quietly
+// disabled the whole token comparison, so a rig invoiced under a slightly
+// different spelling kept getting reported as a different rig - and
+// renaming the rig in the tracker could not fix it, because the two names
+// still failed to compare.
+function rigsAgree(rawA, rawB){
+  const a = normalizeTight(rawA), b = normalizeTight(rawB);
+  if(!a || !b) return true; // one side silent - the well name carries it
+  if(a === b || a.indexOf(b) !== -1 || b.indexOf(a) !== -1) return true;
+  return sameRigName(rawA, rawB);
+}
+
 function buildBillingCheck(){
   const startDate = billingCheckStartDate();
   const invoices = (qbRevenueData && Array.isArray(qbRevenueData.invoices)) ? qbRevenueData.invoices : [];
@@ -6758,6 +7041,9 @@ function buildBillingCheck(){
           // Set by answering "not invoiced" on a suggestion. Stops the same
           // guess being offered over and over once it has been rejected.
           noInvoice: !!w.noInvoice,
+          // Invoices a person already said are NOT this well. Never offered
+          // again; anything else still can be.
+          rejected: Array.isArray(w.rejected) ? w.rejected.map(String) : [],
           // Only wells from the cutoff forward are reported as missing;
           // earlier ones may still match, so an invoice isn't left orphaned.
           inRange: w.date >= startDate,
@@ -6800,86 +7086,8 @@ function buildBillingCheck(){
 
   // Words that appear in half the well names in the basin. They carry no
   // identity, so they can't be the evidence two names are the same well.
-  const WELL_FILLER = ['unit','well','lease','pad','the','and','fee','state','tract','sec','section','com'];
-  const wellNums  = (s)=> (String(s||'').match(/\d+/g) || []);
-  const wellWords = (s)=> (String(s||'').toLowerCase().match(/[a-z]+/g) || [])
-                            .filter(w=>w.length >= 3 && WELL_FILLER.indexOf(w) === -1);
-  // One character out - "Neil" against "Neal". Anything looser starts
-  // pairing wells that only rhyme.
-  const nearWord = (a, b)=>{
-    if(a === b) return true;
-    if(a.length < 4 || b.length < 4) return false;
-    if(Math.abs(a.length - b.length) > 1) return false;
-    let i = 0, j = 0, edits = 0;
-    while(i < a.length && j < b.length){
-      if(a[i] === b[j]){ i++; j++; continue; }
-      if(++edits > 1) return false;
-      if(a.length > b.length) i++;
-      else if(b.length > a.length) j++;
-      else { i++; j++; }
-    }
-    return true;
-  };
-  /* How strongly two spellings look like the same well. 0 = not a match.
-
-     This used to answer a plain yes/no and the first well in the list to get
-     a yes took the invoice for good. Two things went wrong with that. The
-     substring rule alone made "Bull Moose 1" a match for "BULL MOOSE 10", so
-     a well that had never been invoiced could eat the invoice belonging to a
-     different well on the same lease - and the robbed well, being newly
-     marked, then sat silently in the grace window while the screen read
-     "Everything lines up." And because it was first-come, reversing the order
-     of two wells in the tracker changed the verdict on identical data.
-
-     So: numbers have to agree before any loose comparison is allowed. On an
-     oil well the number IS the identity - the words are the lease. And a
-     score lets the caller assign the best pairing overall rather than
-     whichever it happened to reach first. */
-  const wellMatchScore = (rawA, rawB)=>{
-    const a = normalizeTight(rawA), b = normalizeTight(rawB);
-    if(!a || !b) return 0;
-    if(a === b) return 3;                       // identical once punctuation is gone
-    // A short label is not evidence. "3" would otherwise match "neal5103h".
-    const shorter = a.length <= b.length ? a : b;
-    if(shorter.length < 4) return 0;
-
-    const na = wellNums(rawA), nb = wellNums(rawB);
-    const numsAgree = !!na.length && na.length === nb.length
-                   && na.slice().sort().join('|') === nb.slice().sort().join('|');
-
-    if(a.indexOf(b) !== -1 || b.indexOf(a) !== -1){
-      // One name sits inside the other. Fine when the numbers are the same
-      // ("Baird, W.E. 1937" inside "BAIRD WE 1937H"). Not fine when they
-      // differ, because then the containment IS the difference between two
-      // wells - which is exactly the Bull Moose 1 / Bull Moose 10 case.
-      return numsAgree ? 2 : 0;
-    }
-    if(!numsAgree) return 0;
-    // Same numbers plus a name word that all but agrees. A well name is typed
-    // here and typed again on the invoice, so the words drift and reorder -
-    // "Suntura Unit ( Lower Clear Fork) 520" against "Suntura (Lower Clear
-    // Fork) Unit 520". The numbers identify the well; the words only have to
-    // rule out a different lease.
-    const wa = wellWords(rawA), wb = wellWords(rawB);
-    if(!wa.length || !wb.length) return 0;
-    return wa.some(x=>wb.some(y=>nearWord(x, y))) ? 1 : 0;
-  };
-  const wellsAgree = (rawA, rawB)=> wellMatchScore(rawA, rawB) > 0;
-  // Takes the ORIGINAL spellings, not normalized ones. sameRigName splits a
-  // rig into a contractor word and a number, and normalizeTight has already
-  // thrown away the space that separates them: "Ensign T124" becomes
-  // "ensignt124", whose word token is "ensignt" and no longer equals the
-  // "ensign" from "Ensign 124". Feeding it pre-normalized text quietly
-  // disabled the whole token comparison, so a rig invoiced under a slightly
-  // different spelling kept getting reported as a different rig - and
-  // renaming the rig in the tracker could not fix it, because the two names
-  // still failed to compare.
-  const rigsAgree = (rawA, rawB)=>{
-    const a = normalizeTight(rawA), b = normalizeTight(rawB);
-    if(!a || !b) return true; // one side silent - the well name carries it
-    if(a === b || a.indexOf(b) !== -1 || b.indexOf(a) !== -1) return true;
-    return sameRigName(rawA, rawB);
-  };
+  // wellMatchScore / rigsAgree live above buildBillingCheck now - the
+  // invoice picker on Well Billed scores candidates with the same rules.
 
   // Pass one: match on names. Anything that fails is set aside rather than
   // judged yet - the grace window is applied at the end, so a well marked
@@ -6935,6 +7143,11 @@ function buildBillingCheck(){
   const pairs = [];
   marked.forEach((m, mi)=>{
     if(handled.has(mi)) return;
+    // A well that was explicitly marked "not invoiced yet" is never settled
+    // by a name match on its own - it gets OFFERED the match below instead.
+    // Only wells from before build 167, which carry no answer, are still
+    // auto-matched here.
+    if(m.noInvoice) return;
     perWell.forEach((inv, ii)=>{
       if(usedInvoices.has(ii)) return;
       const sc = wellMatchScore(m.label, inv.wellName);
@@ -6975,6 +7188,34 @@ function buildBillingCheck(){
     if(!p.rigOk && inv.rig && m.rig){
       rigChanged.push({ well: m.label, trackerRig: m.rig, invoiceRig: inv.rig, doc: inv.docNumber, date: m.date });
     }
+  });
+
+  /* PASS ONE-B - an invoice has turned up that NAMES a "not invoiced yet"
+     well. That is exactly what the user was waiting for when they chose
+     that answer, so it is offered straight away, grace window or not -
+     but offered, not assumed. One tap confirms it. */
+  marked.forEach((m, mi)=>{
+    if(handled.has(mi) || !m.noInvoice || !m.inRange || !m.label) return;
+    let best = -1, bestScore = 0, bestGap = Infinity;
+    perWell.forEach((inv, ii)=>{
+      if(usedInvoices.has(ii) || suggested.has(ii)) return;
+      if(m.rejected.indexOf(String(inv.docNumber||'')) !== -1) return;
+      const sc = wellMatchScore(m.label, inv.wellName);
+      if(!sc) return;
+      const score = sc * 2 + (rigsAgree(m.rig, inv.rig) ? 1 : 0);
+      const gap = (m.date && inv.date) ? Math.abs(new Date(m.date) - new Date(inv.date)) : Infinity;
+      if(score > bestScore || (score === bestScore && gap < bestGap)){ best = ii; bestScore = score; bestGap = gap; }
+    });
+    if(best === -1) return;
+    const inv = perWell[best];
+    suggested.add(best);
+    handled.add(mi);
+    needsConfirm.push({
+      well: m.label, rig: m.rig || '', customer: m.customer || '', pad: m.pad || '',
+      doc: inv.docNumber, invDate: inv.date || '', invWell: inv.wellName || '', invRig: inv.rig || '',
+      date: m.date, padStart: m.padStart, padEnd: m.padEnd, ambiguous: false, byName: true,
+      ticketId: m.ticketId, padIdx: m.padIdx, wellIdx: m.wellIdx, inRange: m.inRange
+    });
   });
 
   marked.forEach((m, mi)=>{
@@ -7096,10 +7337,13 @@ function buildBillingCheck(){
       // recorded minutes ago has not had time to be invoiced, and guessing
       // that it has is the one conclusion that loses money.
       if(m.date > graceCutoff){ leftover.push(m); return; }
-      // Already told "no, that isn't it" - don't offer a guess again.
-      if(m.noInvoice){ leftover.push(m); return; }
-      if(spare.length > 0){
-        const i = spare.shift();
+      // "Not invoiced yet" no longer stops the count pass - it only rules
+      // out the specific invoices already turned down for this well. The
+      // user invoices after marking, often under a different spelling, and
+      // this is how that invoice reaches the well without a hand search.
+      const si = spare.findIndex(i=>m.rejected.indexOf(String(perWell[i].docNumber||'')) === -1);
+      if(si !== -1){
+        const i = spare.splice(si, 1)[0];
         // Reserved, NOT consumed. The invoice is held back so it isn't also
         // reported as unmarked, but it does not count as matched either -
         // nothing is settled until a person says so.
@@ -7121,9 +7365,9 @@ function buildBillingCheck(){
   // Only now decide what's a problem and what's simply recent.
   leftover.forEach(m=>{
     if(!m.inRange) return;   // before the cutoff: settled, not our business
-    // Saying "not invoiced yet" is an answer, not a reason to wait out the
-    // grace window - the user has already checked.
-    if(m.noInvoice){ missing.push(m); return; }
+    // "Not invoiced yet" chosen at marking time means exactly that - the
+    // invoice is still to be raised, so the grace window applies as usual.
+    // Past it, the well is red until an invoice is tied to it.
     if(m.date > graceCutoff) tooRecent.push(m);
     else missing.push(m);
   });
@@ -7236,10 +7480,10 @@ function renderNeedsConfirmBand(c){
   const n = list.length;
   return `<div style="background:#FFF8E6; border:1.5px solid #E6D080; border-radius:8px; padding:14px 16px; margin-bottom:12px;">
     <div style="font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; font-size:13px; color:#8A6D10; font-weight:600; margin-bottom:4px;">
-      ${n} well${n!==1?'s':''} marked billed with no invoice by that name
+      ${n} well${n!==1?'s':''} waiting on an invoice to be tied
     </div>
     <div style="font-size:12px; color:#8A6D10; margin-bottom:10px;">
-      No invoice in QuickBooks names ${n!==1?'these wells':'this well'}. There is an invoice on the rig that could be the one, but nothing proves it. Open it, and if it is the right one, confirm it here &mdash; the invoice number gets saved onto the well and it is never asked again.
+      ${n!==1?'These wells are':'This well is'} marked billed but not yet tied to an invoice. An invoice that names the well, or one on the rig in the pad's window, is offered here &mdash; nothing is assumed. Open it, and if it's the right one, confirm it; the number is saved onto the well and it's never asked again.
     </div>
     ${list.map(r=>{
       const window = (r.padStart || r.padEnd)
@@ -7249,13 +7493,13 @@ function renderNeedsConfirmBand(c){
         <div style="font-size:13px; font-weight:600;">${escHtml(r.well || '(no well name)')}</div>
         <div style="font-size:11px; color:#8A6D10;">${escHtml(r.rig||'no rig')} &middot; ${escHtml(r.customer||'')} &middot; ${escHtml(window)} &middot; marked ${escHtml(fmtDate(r.date))}</div>
         <div style="font-size:12px; color:#6B5608; margin-top:6px;">
-          Possible match: <strong>${escHtml(r.doc||'invoice')}</strong>${r.invDate?' dated '+escHtml(fmtDate(r.invDate)):''}${r.invWell?`, billed as &ldquo;${escHtml(r.invWell)}&rdquo;`:''}${r.invRig?' on '+escHtml(r.invRig):''}
+          ${r.byName ? 'An invoice naming this well has shown up:' : 'Possible match:'} <strong>${escHtml(r.doc||'invoice')}</strong>${r.invDate?' dated '+escHtml(fmtDate(r.invDate)):''}${r.invWell?`, billed as &ldquo;${escHtml(r.invWell)}&rdquo;`:''}${r.invRig?' on '+escHtml(r.invRig):''}
           ${r.ambiguous?'<span style="color:#B5432A;"> &middot; other invoices could fit too &mdash; check the number</span>':''}
         </div>
         <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
           <button data-link-well="${escAttr(r.ticketId)}" data-pad-index="${r.padIdx}" data-well-index="${r.wellIdx}" data-doc="${escAttr(r.doc||'')}"
             style="background:#1E8A29; color:#fff; border:none; border-radius:4px; padding:6px 12px; font-size:12px; font-family:inherit; cursor:pointer;">Yes &mdash; that's the invoice</button>
-          <button data-noinv-well="${escAttr(r.ticketId)}" data-pad-index="${r.padIdx}" data-well-index="${r.wellIdx}"
+          <button data-noinv-well="${escAttr(r.ticketId)}" data-pad-index="${r.padIdx}" data-well-index="${r.wellIdx}" data-doc="${escAttr(r.doc||'')}"
             style="background:none; color:#B5432A; border:1px solid #E0A9A0; border-radius:4px; padding:6px 12px; font-size:12px; font-family:inherit; cursor:pointer;">No &mdash; not invoiced yet</button>
         </div>
       </div>`;
@@ -7336,7 +7580,9 @@ function renderBillingCheck(){
       </div>
       ${c.missing.map(m=>`<div style="padding:8px 0; border-top:1px solid #E0A9A0; font-size:13px;">
         <div style="font-weight:600;">${escHtml(m.label || '(no well name)')}</div>
-        <div style="font-size:11px; color:#8A3B2A;">${escHtml(m.rig||'no rig')} &middot; ${escHtml(m.pad||'no pad')} &middot; ${escHtml(m.customer||'')} &middot; marked ${fmtDate(m.date)}${m.noInvoice?' &middot; <strong>you flagged this as not invoiced</strong>':''}</div>
+        <div style="font-size:11px; color:#8A3B2A;">${escHtml(m.rig||'no rig')} &middot; ${escHtml(m.pad||'no pad')} &middot; ${escHtml(m.customer||'')} &middot; marked ${fmtDate(m.date)}${m.noInvoice?' &middot; <strong>marked not invoiced yet</strong>':''}</div>
+        <button data-pick-inv-well="${escAttr(m.ticketId)}" data-pad-index="${m.padIdx}" data-well-index="${m.wellIdx}"
+          style="margin-top:6px; background:none; border:1px solid #E0A9A0; color:#8A3B2A; border-radius:4px; padding:4px 10px; font-size:11px; font-family:inherit; cursor:pointer;">Link an invoice&hellip;</button>
       </div>`).join('')}
     </div>`;
   }
@@ -7946,6 +8192,14 @@ function renderBilledWellChips(ticketId, padIndex, wells, opts){
     h += `<button data-rename-well="${escAttr(ticketId)}" data-pad-index="${padIndex}" data-well-index="${wi}"
             title="Rename this well"
             style="background:none; border:none; padding:0; margin:0; cursor:pointer; color:inherit; font-size:${fs}; font-family:inherit; text-align:left; text-decoration:underline dotted rgba(0,0,0,0.28); text-underline-offset:3px;">${fmtDate(w.date)}${w.label?' — '+escHtml(w.label):''}</button>`;
+    // Invoice state, tappable. Green = tied to a named invoice; red = said
+    // "not invoiced yet"; grey = marked before build 167, never asked.
+    const st = w.invDoc ? { txt: '#'+escHtml(w.invDoc), col: '#1E8A29', tip: 'Tied to invoice '+escAttr(w.invDoc)+' — tap to change' }
+             : w.noInvoice ? { txt: 'no inv', col: '#B5432A', tip: 'Not invoiced yet — tap to link an invoice' }
+             : { txt: 'inv?', col: 'var(--ink-soft)', tip: 'Invoice not recorded — tap to link one' };
+    h += `<button data-pick-inv-well="${escAttr(ticketId)}" data-pad-index="${padIndex}" data-well-index="${wi}"
+            title="${st.tip}"
+            style="background:none; border:1px solid ${st.col}; color:${st.col}; border-radius:3px; padding:0 4px; margin:0 0 0 4px; cursor:pointer; font-size:10px; line-height:16px; font-family:'IBM Plex Mono',monospace;">${st.txt}</button>`;
     h += `<button data-unbill-well="${escAttr(ticketId)}" data-pad-index="${padIndex}" data-well-index="${wi}"
             title="Remove this billed well"
             style="background:none; border:none; padding:0 2px; margin:0; cursor:pointer; color:var(--ink-soft); font-size:13px; line-height:1; font-family:inherit;">&times;</button>`;
@@ -9353,7 +9607,9 @@ function attachHandlers(){
       // there is one, not the ticket's rig today - this pad finished, and the
       // ticket may have moved to a replacement rig since.
       const priorRig = (pad.billedWells.find(w=>w && w.rig) || {}).rig;
-      pad.billedWells.push({ date: todayStr(), label: label, rig: priorRig || t.rig || '' });
+      const w = { date: todayStr(), label: label, rig: priorRig || t.rig || '' };
+      if(!applyInvoicePick(w, await pickInvoiceForWell(t, pad, label))) return;
+      pad.billedWells.push(w);
       t.updatedAt = nowIso();
       await saveTickets();
       render();
@@ -9378,7 +9634,29 @@ function attachHandlers(){
         // - which is done by renaming the rig on the same ticket, since the
         // equipment never comes back - rewrites the history of every well
         // already billed under the old rig and flags them all as unbilled.
-        pad.billedWells.push({ date: todayStr(), label: label, rig: t.rig || '' });
+        const w = { date: todayStr(), label: label, rig: t.rig || '' };
+        // Which invoice? Asked now, while the well is in front of the user,
+        // instead of guessed later by the check. Cancel here cancels the
+        // whole marking - there is no half-recorded state.
+        if(!applyInvoicePick(w, await pickInvoiceForWell(t, pad, label))) return;
+        pad.billedWells.push(w);
+        t.updatedAt = nowIso();
+        await saveTickets();
+        render();
+      };
+    });
+
+    // Invoice state on an existing chip: link, relink, or clear.
+    document.querySelectorAll('[data-pick-inv-well]').forEach(b=>{
+      b.onclick = async ()=>{
+        const t = tickets.find(x=>x.id===b.dataset.pickInvWell);
+        if(!t) return;
+        const pad = padFromChip(t, b.dataset);
+        if(!pad || !Array.isArray(pad.billedWells)) return;
+        const w = pad.billedWells[parseInt(b.dataset.wellIndex, 10)];
+        if(!w) return;
+        const pick = await pickInvoiceForWell(t, pad, w.label || '(no name)', { exceptWell: w, allowClear: !!(w.invDoc || w.noInvoice) });
+        if(!applyInvoicePick(w, pick)) return;
         t.updatedAt = nowIso();
         await saveTickets();
         render();
@@ -9430,6 +9708,13 @@ function attachHandlers(){
         if(!f) return;
         f.w.noInvoice = true;
         delete f.w.invDoc;
+        // Remember the specific invoice turned down, so the check can keep
+        // offering OTHER invoices as they appear without repeating this one.
+        const rej = b.dataset.doc || '';
+        if(rej){
+          if(!Array.isArray(f.w.rejected)) f.w.rejected = [];
+          if(f.w.rejected.indexOf(rej) === -1) f.w.rejected.push(rej);
+        }
         f.t.updatedAt = nowIso();
         await saveTickets();
         render();
@@ -9745,11 +10030,11 @@ function attachHandlers(){
         if(!confirm(msg)) return;
       }
 
-      // Fresh iron leaves the yard; expired iron joins the shop queue.
-      const sent = Math.min(qty, readyNow);
-      it.ready = readyNow - sent;
+      // Fresh iron leaves the yard; expired iron joins the shop queue. Ready
+      // is derived, so adding to the shop queue is what brings it down.
       it.shop  = (Number(it.shop) || 0) + qty;
       syncShopBatches(line.name);   // stamp its arrival at the inspector
+      deriveReadyForAll();
 
       if(qty === onRig){
         line.bandColor = band.name;
