@@ -935,6 +935,11 @@ let localChangeSeq = 0;
 function noteLocalChange(){ localChangeSeq++; }
 let showSyncPanel = false;
 let autoSyncTimer = null;
+// True while the invoice picker is open. The 30-second auto-pull replaces the
+// whole tickets array with fresh objects from the cloud; a pull landing while
+// the picker waited on the user left the Well Billed handler writing into the
+// OLD ticket object, so the click looked like it took and then reverted.
+let invoicePickerOpen = false;
 
 const app = document.getElementById('app');
 
@@ -1060,12 +1065,27 @@ function promptWellCount(){
    still go through the old name match.
 
    Resolves to { kind:'invoice', doc } | { kind:'none' } | null (cancel). */
+// A billed well is identified by what it records, not by object identity -
+// a sync replaces the objects while a dialog is open.
+function sameWell(a, b){
+  if(!a || !b) return false;
+  if(a === b) return true;
+  return (a.label||'') === (b.label||'') && (a.date||'') === (b.date||'') && (a.rig||'') === (b.rig||'');
+}
+// After any await, find the ticket and pad again in the CURRENT tickets array.
+function refindPad(ticketId, pad){
+  const t = (tickets||[]).find(x=>x.id===ticketId);
+  if(!t || !Array.isArray(t.pads)) return null;
+  const key = pad && (pad.id || pad.name);
+  const p = t.pads.find(x=>x && (x.id || x.name) === key);
+  return p ? { t, pad: p } : null;
+}
 function docsLinkedAcrossTracker(exceptWell){
   const used = new Set();
   (tickets||[]).forEach(t=>{
     (Array.isArray(t.pads)?t.pads:[]).forEach(p=>{
       (Array.isArray(p.billedWells)?p.billedWells:[]).forEach(w=>{
-        if(w && w !== exceptWell && w.invDoc) used.add(String(w.invDoc));
+        if(w && !sameWell(w, exceptWell) && w.invDoc) used.add(String(w.invDoc));
       });
     });
   });
@@ -1080,7 +1100,7 @@ function invoiceOwner(doc, exceptWell){
   (tickets||[]).forEach(t=>{
     (Array.isArray(t.pads)?t.pads:[]).forEach((p, pi)=>{
       (Array.isArray(p.billedWells)?p.billedWells:[]).forEach((w, wi)=>{
-        if(!hit && w && w !== exceptWell && w.invDoc && normDoc(w.invDoc) === d) hit = { t, pad: p, w, pi, wi };
+        if(!hit && w && !sameWell(w, exceptWell) && w.invDoc && normDoc(w.invDoc) === d) hit = { t, pad: p, w, pi, wi };
       });
     });
   });
@@ -1120,7 +1140,8 @@ function pickInvoiceForWell(t, pad, label, opts){
         <div style="font-size:13px; color:#5B6660; margin-bottom:12px;"><strong>${escHtml(label)}</strong> on ${escHtml(pad && pad.name || 'this pad')} &middot; ${escHtml(t.rig||'no rig')}${t.customer?' &middot; '+escHtml(t.customer):''}</div>
         ${body}
       </div>`;
-    const finish = (v)=>{ overlay.remove(); resolve(v); };
+    invoicePickerOpen = true;
+    const finish = (v)=>{ invoicePickerOpen = false; overlay.remove(); resolve(v); };
     document.body.appendChild(overlay);
 
     // Invoices are only pulled when Reports is opened; marking a well on the
@@ -4560,6 +4581,7 @@ function startAutoSync(){
     // typing in any field (search boxes, filters, etc.) - a background
     // re-render would knock focus out mid-stroke and interrupt data entry.
     if(currentTab === 'new') return;
+    if(invoicePickerOpen) return;
     const active = document.activeElement;
     if(active && ['INPUT','SELECT','TEXTAREA'].includes(active.tagName)) return;
     pullFromCloud(true);
@@ -9707,8 +9729,11 @@ function attachHandlers(){
       const priorRig = (pad.billedWells.find(w=>w && w.rig) || {}).rig;
       const w = { date: todayStr(), label: label, rig: priorRig || t.rig || '' };
       if(!applyInvoicePick(w, await pickInvoiceForWell(t, pad, label))) return;
-      pad.billedWells.push(w);
-      t.updatedAt = nowIso();
+      const cur = refindPad(t.id, pad);
+      if(!cur){ alert('That pad changed while the invoice list was open. Please try again.'); render(); return; }
+      if(!Array.isArray(cur.pad.billedWells)) cur.pad.billedWells = [];
+      cur.pad.billedWells.push(w);
+      cur.t.updatedAt = nowIso();
       await saveTickets();
       render();
     };
@@ -9737,8 +9762,11 @@ function attachHandlers(){
         // instead of guessed later by the check. Cancel here cancels the
         // whole marking - there is no half-recorded state.
         if(!applyInvoicePick(w, await pickInvoiceForWell(t, pad, label))) return;
-        pad.billedWells.push(w);
-        t.updatedAt = nowIso();
+        const cur = refindPad(t.id, pad);
+        if(!cur){ alert('That pad changed while the invoice list was open. Please try again.'); render(); return; }
+        if(!Array.isArray(cur.pad.billedWells)) cur.pad.billedWells = [];
+        cur.pad.billedWells.push(w);
+        cur.t.updatedAt = nowIso();
         await saveTickets();
         render();
       };
@@ -9754,8 +9782,12 @@ function attachHandlers(){
         const w = pad.billedWells[parseInt(b.dataset.wellIndex, 10)];
         if(!w) return;
         const pick = await pickInvoiceForWell(t, pad, w.label || '(no name)', { exceptWell: w, allowClear: !!(w.invDoc || w.noInvoice) });
-        if(!applyInvoicePick(w, pick)) return;
-        t.updatedAt = nowIso();
+        if(!pick) return;
+        const cur = refindPad(t.id, pad);
+        const w2 = cur && (cur.pad.billedWells||[]).find(x=>sameWell(x, w));
+        if(!w2){ alert('That well changed while the invoice list was open. Please try again.'); render(); return; }
+        applyInvoicePick(w2, pick);
+        cur.t.updatedAt = nowIso();
         await saveTickets();
         render();
       };
