@@ -924,7 +924,7 @@ function matchInvoiceRule(inv){
 }
 
 let syncStatus = 'idle'; // idle | saving | loading | ok | error
-const APP_BUILD = '167';  // shown in the sync panel - bump on every release
+const APP_BUILD = '168';  // shown in the sync panel - bump on every release
 let pushInProgress = false; // true while a push is in flight — blocks auto-pull to prevent race conditions
 // Bumped by every local save. pullFromCloud captures it before its fetch and
 // re-checks it after: pushInProgress only stops a pull STARTING mid-push, it
@@ -1071,6 +1071,21 @@ function docsLinkedAcrossTracker(exceptWell){
   });
   return used;
 }
+// Invoice numbers are typed as "WTTP 26-30", "wttp-26-30", "WTTP26-30"...
+// so lookups compare bare letters and digits.
+function normDoc(s){ return String(s||'').toLowerCase().replace(/[^a-z0-9]/g,''); }
+// The billed well an invoice number is already tied to, or null.
+function invoiceOwner(doc, exceptWell){
+  const d = normDoc(doc); let hit = null;
+  (tickets||[]).forEach(t=>{
+    (Array.isArray(t.pads)?t.pads:[]).forEach((p, pi)=>{
+      (Array.isArray(p.billedWells)?p.billedWells:[]).forEach((w, wi)=>{
+        if(!hit && w && w !== exceptWell && w.invDoc && normDoc(w.invDoc) === d) hit = { t, pad: p, w, pi, wi };
+      });
+    });
+  });
+  return hit;
+}
 function rankInvoicesForWell(t, pad, label, exceptWell){
   const invoices = (qbRevenueData && Array.isArray(qbRevenueData.invoices)) ? qbRevenueData.invoices : [];
   const used = docsLinkedAcrossTracker(exceptWell);
@@ -1120,6 +1135,7 @@ function pickInvoiceForWell(t, pad, label, opts){
         for(let i = 0; i < 40 && qbRevenueLoading; i++) await new Promise(r=>setTimeout(r, 250));
       }catch(e){}
     }
+    const draw = ()=>{
     const qbOk = !!(qbRevenueData && qbRevenueData.connected && !qbRevenueData.error);
     const rows = qbOk ? rankInvoicesForWell(t, pad, label, opts.exceptWell) : [];
     const likely = rows.filter(r=>r.likely);
@@ -1135,34 +1151,108 @@ function pickInvoiceForWell(t, pad, label, opts){
     } else if(!qbOk){
       listHtml = `<div style="font-size:12px; color:#B5432A; margin-bottom:12px;">QuickBooks couldn't be reached, so no invoices to pick from right now. Choose &ldquo;Not invoiced yet&rdquo; and link it later from the well's chip.</div>`;
     } else if(!rows.length){
-      listHtml = `<div style="font-size:12px; color:#5B6660; margin-bottom:12px;">Every per-well invoice in QuickBooks is already tied to a well. If this one was just invoiced, give the pull a minute and link it from the chip.</div>`;
+      listHtml = `<div style="font-size:12px; color:#5B6660; margin-bottom:12px;">Every per-well invoice in QuickBooks is already tied to a well. Search by number above to find one anyway.</div>`;
     } else {
       listHtml = (likely.length
           ? `<div style="font-size:11px; text-transform:uppercase; letter-spacing:0.5px; color:#5B6660; margin-bottom:6px;">On ${escHtml(t.rig||'this rig')} or naming this well</div>${likely.slice(0,8).map(rowHtml).join('')}`
-          : `<div style="font-size:12px; color:#5B6660; margin-bottom:8px;">Nothing in QuickBooks names this well or sits on ${escHtml(t.rig||'this rig')}.</div>`)
+          : `<div style="font-size:12px; color:#5B6660; margin-bottom:8px;">Nothing in QuickBooks names this well or sits on ${escHtml(t.rig||'this rig')}. Search by invoice number above.</div>`)
         + (rest.length || likely.length > 8
           ? `<details style="margin-bottom:8px;"><summary style="cursor:pointer; font-size:11px; color:#5B6660; text-transform:uppercase; letter-spacing:0.5px;">Show all ${rows.length} unlinked invoices</summary><div style="margin-top:8px;">${likely.slice(8).concat(rest).map(rowHtml).join('')}</div></details>`
           : '');
     }
+    const fetched = qbOk && qbRevenueData.fetchedAt ? new Date(qbRevenueData.fetchedAt).toLocaleTimeString(undefined,{hour:'numeric',minute:'2-digit'}) : '';
+    const searchHtml = (syncUrl && qbOk) ? `
+      <div style="display:flex; gap:6px; margin-bottom:6px;">
+        <input id="inv-pick-q" type="text" placeholder="Find by invoice # (e.g. WTTP-26-30)" autocomplete="off"
+          style="flex:1; min-width:0; padding:9px 10px; border:1.5px solid #C9D3CA; border-radius:6px; font-size:14px; font-family:inherit;">
+        <button id="inv-pick-refresh" title="Pull the latest invoices from QuickBooks" style="background:none; border:1.5px solid #5C6670; color:#5C6670; border-radius:6px; padding:0 10px; font-size:12px; font-family:inherit; cursor:pointer; white-space:nowrap;">&#8635; Refresh</button>
+      </div>
+      <div style="font-size:10px; color:#8A938C; margin:-2px 0 8px 2px;">Invoices dated ${escHtml(fmtDate(qbRevenueData.startDate||''))} onward${fetched?' &middot; pulled '+escHtml(fetched):''}</div>
+      <div id="inv-pick-results"></div>` : '';
     overlay.innerHTML = shell(`
-      ${listHtml}
+      ${searchHtml}
+      <div id="inv-pick-list">${listHtml}</div>
       <div style="display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; margin-top:6px;">
         ${opts.allowClear ? `<button id="inv-pick-clear" style="background:none; border:1.5px solid #E0A9A0; color:#8A3B2A; border-radius:6px; padding:9px 14px; font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; font-size:12px; cursor:pointer; margin-right:auto;">Clear link</button>` : ''}
         <button id="inv-pick-cancel" style="background:none; border:1.5px solid #5C6670; color:#5C6670; border-radius:6px; padding:9px 14px; font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; font-size:12px; cursor:pointer;">Cancel</button>
         <button id="inv-pick-none" style="background:#B5432A; color:#fff; border:none; border-radius:6px; padding:9px 14px; font-family:'Oswald',sans-serif; text-transform:uppercase; letter-spacing:1px; font-size:12px; cursor:pointer;">Not invoiced yet</button>
       </div>
       <div style="font-size:11px; color:#5B6660; margin-top:10px;">&ldquo;Not invoiced yet&rdquo; keeps this well on the Billing Check until an invoice is tied to it &mdash; when one shows up in QuickBooks that names it, you'll be offered the link.</div>`);
-    overlay.querySelectorAll('[data-pick-doc]').forEach(b=>{
-      b.onclick = ()=>{
-        const doc = b.dataset.pickDoc;
-        if(!confirm(`Tie "${label}" to invoice ${doc}?\n\nIt will count as billed and invoiced from now on.`)) return;
-        finish({ kind:'invoice', doc: doc });
+    bind();
+    };
+    /* Search EVERY invoice in the pull by number - including ones the list
+       hides - and say plainly why a hidden one was hidden. The list only
+       offers per-well invoices nobody has claimed, so an invoice with no
+       "Well Name:" line, or one already tied to another well, simply wasn't
+       there and there was no way to tell why. */
+    const runSearch = (q)=>{
+      const box = overlay.querySelector('#inv-pick-results');
+      const list = overlay.querySelector('#inv-pick-list');
+      if(!box) return;
+      const nq = normDoc(q);
+      if(nq.length < 2){ box.innerHTML = ''; if(list) list.style.display = ''; return; }
+      if(list) list.style.display = 'none';
+      const all = (qbRevenueData && Array.isArray(qbRevenueData.invoices)) ? qbRevenueData.invoices : [];
+      const hits = all.filter(inv=>normDoc(inv.docNumber).indexOf(nq) !== -1).slice(0, 12);
+      if(!hits.length){
+        box.innerHTML = `<div style="background:#FCEBEA; border:1px solid #E0A9A0; border-radius:6px; padding:10px; font-size:12px; color:#8A3B2A; margin-bottom:8px;">
+          No invoice matching <strong>${escHtml(q)}</strong> is in the QuickBooks pull. The pull covers invoices dated ${escHtml(fmtDate(qbRevenueData.startDate||''))} onward. If it was created in the last few minutes, tap <strong>Refresh</strong>; if it was voided or deleted in QuickBooks it won't come back.</div>`;
+        return;
+      }
+      box.innerHTML = hits.map(inv=>{
+        const doc = String(inv.docNumber||'');
+        const owner = invoiceOwner(doc, opts.exceptWell);
+        const perWell = isPerWellInvoice(inv);
+        const why = owner
+          ? `<div style="font-size:11px; color:#8A6D10; margin-top:3px;">Already tied to <strong>${escHtml(owner.w.label||'a well')}</strong> on ${escHtml(owner.pad.name||'a pad')} (${escHtml(owner.t.rig||'no rig')}). Picking it moves the link here and flags that well as not invoiced.</div>`
+          : (!perWell ? `<div style="font-size:11px; color:#8A6D10; margin-top:3px;">No &ldquo;Well Name:&rdquo; on this invoice, which is why it wasn't in the list. You can still tie it here.</div>` : '');
+        return `<button data-pick-doc="${escAttr(doc)}" data-owned="${owner?1:0}" style="display:block; width:100%; text-align:left; background:#fff; border:1.5px solid ${owner?'#E6D080':'#1E8A29'}; border-radius:6px; padding:9px 11px; margin-bottom:6px; font-family:inherit; cursor:pointer;">
+          <div style="font-size:13px; font-weight:600;">Invoice ${escHtml(doc)} <span style="font-weight:400; color:#5B6660;">&middot; ${escHtml(fmtDate(inv.date))}${isFinite(Number(inv.amount))?' &middot; $'+Number(inv.amount).toLocaleString(undefined,{maximumFractionDigits:0}):''}</span></div>
+          <div style="font-size:11px; color:#5B6660; margin-top:2px;">${inv.wellName?'billed as &ldquo;'+escHtml(inv.wellName)+'&rdquo;':'no well on invoice'}${inv.rig?' &middot; '+escHtml(inv.rig):''}${inv.customer?' &middot; '+escHtml(inv.customer):''}</div>
+          ${why}
+        </button>`;
+      }).join('');
+      bindPicks(box);
+    };
+    const bindPicks = (root)=>{
+      root.querySelectorAll('[data-pick-doc]').forEach(b=>{
+        b.onclick = ()=>{
+          const doc = b.dataset.pickDoc;
+          const owner = invoiceOwner(doc, opts.exceptWell);
+          const msg = owner
+            ? `Invoice ${doc} is tied to "${owner.w.label||'another well'}" on ${owner.pad.name||'another pad'}.\n\nMove it to "${label}"? "${owner.w.label||'That well'}" will be flagged as not invoiced so it shows up on the Billing Check.`
+            : `Tie "${label}" to invoice ${doc}?\n\nIt will count as billed and invoiced from now on.`;
+          if(!confirm(msg)) return;
+          if(owner){
+            delete owner.w.invDoc; owner.w.noInvoice = true;
+            owner.t.updatedAt = nowIso();
+          }
+          finish({ kind:'invoice', doc: doc });
+        };
+      });
+    };
+    const bind = ()=>{
+      bindPicks(overlay.querySelector('#inv-pick-list') || overlay);
+      const q = overlay.querySelector('#inv-pick-q');
+      if(q){ q.oninput = ()=>runSearch(q.value); }
+      const rf = overlay.querySelector('#inv-pick-refresh');
+      if(rf) rf.onclick = async ()=>{
+        const keep = q ? q.value : '';
+        rf.disabled = true; rf.innerHTML = 'Pulling&hellip;';
+        try{
+          await fetchQuickBooksRevenue(true);
+          for(let i = 0; i < 40 && qbRevenueLoading; i++) await new Promise(r=>setTimeout(r, 250));
+        }catch(e){}
+        draw();
+        const q2 = overlay.querySelector('#inv-pick-q');
+        if(q2 && keep){ q2.value = keep; runSearch(keep); }
       };
-    });
-    overlay.querySelector('#inv-pick-none').onclick = ()=> finish({ kind:'none' });
-    overlay.querySelector('#inv-pick-cancel').onclick = ()=> finish(null);
-    const clr = overlay.querySelector('#inv-pick-clear');
-    if(clr) clr.onclick = ()=> finish({ kind:'clear' });
+      overlay.querySelector('#inv-pick-none').onclick = ()=> finish({ kind:'none' });
+      overlay.querySelector('#inv-pick-cancel').onclick = ()=> finish(null);
+      const clr = overlay.querySelector('#inv-pick-clear');
+      if(clr) clr.onclick = ()=> finish({ kind:'clear' });
+    };
+    draw();
     overlay.onclick = (e)=>{ if(e.target === overlay) finish(null); };
   });
 }
@@ -7116,11 +7206,19 @@ function buildBillingCheck(){
      of evidence here, so it is claimed first and nothing else can take it. */
   marked.forEach((m, mi)=>{
     if(!m.invDoc) return;
-    const li = perWell.findIndex((inv,i)=>!usedInvoices.has(i) && String(inv.docNumber||'') === m.invDoc);
+    const li = perWell.findIndex((inv,i)=>!usedInvoices.has(i) && normDoc(inv.docNumber) === normDoc(m.invDoc));
     if(li !== -1){
       usedInvoices.add(li);
       handled.add(mi);
       linkedByHand.push({ well: m.label, doc: perWell[li].docNumber, invDate: perWell[li].date||'', rig: perWell[li].rig||'' });
+      return;
+    }
+    // Tied by hand to an invoice that has no "Well Name:" line - it isn't in
+    // the per-well pool, but it is in QuickBooks, so the link is good.
+    const any = invoices.find(inv=>inv && normDoc(inv.docNumber) === normDoc(m.invDoc));
+    if(any){
+      handled.add(mi);
+      linkedByHand.push({ well: m.label, doc: any.docNumber, invDate: any.date||'', rig: any.rig||'' });
       return;
     }
     // The link points at an invoice QuickBooks no longer returns - voided,
