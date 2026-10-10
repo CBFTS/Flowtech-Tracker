@@ -3936,6 +3936,9 @@ async function saveAppSettings(){
 // threshold and hasn't been returned yet.
 function isTicketOverdue(t){
   if(!t || t.returnDate) return false;
+  // Iron meant to stay out indefinitely (casing crossovers left on a rig)
+  // is ticked "long-term rental" on the Rig Tracker, and is never overdue.
+  if(t.longTermRental) return false;
   const days = daysBetween(t.deliveryDate, todayStr());
   if(days === null) return false;   // no usable delivery date - not a judgement we can make
   return days > (appSettings.overdueThresholdDays || 30);
@@ -5064,7 +5067,11 @@ function renderActionAlerts(){
     const daysSince = daysSinceLastBilled(pad);
     const padStartDays = daysBetween(pad.startDate, todayStr());
 
-    if(complete){
+    if(complete && t.billsPadUpfront){
+      // Whole pad billed up front when the rig arrives, so 8/8 says nothing
+      // about whether drilling is finished. No move alert; the user presses
+      // Rig Move when the rig actually moves.
+    } else if(complete){
       alerts.push({
         type: 'move',
         rig: t.rig || 'Unassigned',
@@ -5284,7 +5291,7 @@ function renderBillingStatus(){
         </div>
         <div style="width:80px; text-align:right;">
           ${r.complete
-            ? '<span style="font-size:11px; color:var(--green); font-family:\'IBM Plex Mono\',monospace;">PAD DONE</span>'
+            ? '<span style="font-size:11px; color:var(--green); font-family:\'IBM Plex Mono\',monospace;">'+(r.ticket.billsPadUpfront?'BILLED UP FRONT':'PAD DONE')+'</span>'
             : (r.daysSince !== null
                 ? `<span style="font-size:12px; color:${stale?'#B5432A':'var(--ink-soft)'}; font-family:'IBM Plex Mono',monospace;">${escHtml(agoLabel(r.daysSince, {short:true}).toUpperCase())}</span>`
                 : '<span style="font-size:11px; color:var(--ink-soft); font-family:\'IBM Plex Mono\',monospace; white-space:nowrap;">NONE BILLED</span>'
@@ -5744,12 +5751,12 @@ function renderByRig(){
       const pct = total > 0 ? Math.round((billed / total) * 100) : 0;
       const complete = billed >= total && total > 0;
       const daysSince = daysSinceLastBilled(activePad);
-      const staleWarning = daysSince !== null && daysSince > 14;
+      const staleWarning = daysSince !== null && daysSince > 14 && !(complete && primaryTicket.billsPadUpfront);
 
       padHtml += `<div style="background:#FCFAF3; border:1.5px solid var(--line); border-radius:6px; padding:12px; margin:8px 0;">`;
       padHtml += `<div style="display:flex; justify-content:space-between; align-items:center;">`;
       padHtml += `<button data-edit-pad="${escAttr(primaryTicket.id)}" data-pad-index="${primaryTicket.pads.indexOf(activePad)}" title="Edit this pad — name, well count, and the dates the rig arrived and left" style="background:none; border:none; padding:0; margin:0; cursor:pointer; font-weight:600; font-size:14px; font-family:inherit; color:inherit; text-align:left; text-decoration:underline dotted rgba(0,0,0,0.28); text-underline-offset:3px;">${escHtml(activePad.name)}</button>`;
-      padHtml += `<span style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:${complete?'var(--green)':'var(--ink-soft)'};">${billed} of ${total} billed${complete?' ✓':''}</span>`;
+      padHtml += `<span style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:${complete?'var(--green)':'var(--ink-soft)'};">${billed} of ${total} billed${complete?(primaryTicket.billsPadUpfront?' ✓ up front':' ✓'):''}</span>`;
       padHtml += `</div>`;
       padHtml += `<div style="background:var(--paper-2); border-radius:4px; height:6px; margin:6px 0;">`;
       padHtml += `<div style="background:${complete?'var(--green)':'var(--amber)'}; border-radius:4px; height:100%; width:${pct}%; transition:width 0.3s;"></div>`;
@@ -5764,7 +5771,7 @@ function renderByRig(){
       if(!complete){
         padHtml += `<button class="primary-btn" data-well-billed="${primaryTicket.id}" style="font-size:12px; padding:8px 14px;">Well Billed</button>`;
       }
-      padHtml += `<button class="ghost-btn" data-rig-move="${primaryTicket.id}" style="font-size:12px; padding:7px 14px;">${complete?'Pad Complete — Rig Move':'Rig Move'}</button>`;
+      padHtml += `<button class="ghost-btn" data-rig-move="${primaryTicket.id}" style="font-size:12px; padding:7px 14px;">${complete && !primaryTicket.billsPadUpfront?'Pad Complete — Rig Move':'Rig Move'}</button>`;
       padHtml += `</div>`;
 
       padHtml += padHistoryHtml(primaryTicket);
@@ -5825,6 +5832,14 @@ function renderByRig(){
             <span class="rig-equip-meta" style="margin-left:8px;">${escHtml(t.customer||'—')} · ${days === null ? 'Out —' : ('Out '+days+' day'+(days===1?'':'s'))}</span>
             ${overdue?`<span class="status-pill" style="background:#FCEBEA; color:#B5432A; margin-left:auto;">Overdue</span>`:''}
           </label>
+          <div style="display:flex; gap:14px; flex-wrap:wrap; padding:2px 12px 6px; font-size:11px; color:var(--ink-soft);">
+            <label style="display:flex; align-items:center; gap:5px; cursor:pointer;" title="You bill every well on the pad when the rig moves on, so a fully billed pad does not mean the rig is ready to move. Turns off the rig-move alert for this ticket; press Rig Move yourself when it moves.">
+              <input type="checkbox" data-ticket-flag="billsPadUpfront" data-ticket-id="${escAttr(t.id)}" ${t.billsPadUpfront?'checked':''} style="margin:0; cursor:pointer;">Bills whole pad up front
+            </label>
+            <label style="display:flex; align-items:center; gap:5px; cursor:pointer;" title="Iron meant to stay out indefinitely, such as casing crossovers. This ticket will never be flagged overdue.">
+              <input type="checkbox" data-ticket-flag="longTermRental" data-ticket-id="${escAttr(t.id)}" ${t.longTermRental?'checked':''} style="margin:0; cursor:pointer;">Long-term rental &mdash; don't flag overdue
+            </label>
+          </div>
           <details class="equip-collapse">
             <summary style="cursor:pointer; font-family:'IBM Plex Mono',monospace; font-size:11px; text-transform:uppercase; letter-spacing:0.5px; color:var(--ink-soft); padding:6px 12px; list-style:none; display:flex; align-items:center; gap:6px; background:#FFFDF8;">
               <span style="font-size:14px; transition:transform 0.2s;">▸</span> ${t.equipment.length} equipment item${t.equipment.length!==1?'s':''}
@@ -9878,6 +9893,21 @@ function attachHandlers(){
         // or the server's conflict union will put it straight back.
         noteWellRemoved(t.id, pad, w);
         pad.billedWells.splice(i, 1);
+        t.updatedAt = nowIso();
+        await saveTickets();
+        render();
+      };
+    });
+
+    document.querySelectorAll('[data-ticket-flag]').forEach(cb=>{
+      cb.onchange = async ()=>{
+        const t = tickets.find(x=>x.id===cb.dataset.ticketId);
+        if(!t) return;
+        const f = cb.dataset.ticketFlag;
+        if(f !== 'billsPadUpfront' && f !== 'longTermRental') return;
+        t[f] = cb.checked;
+        // Without a fresh stamp the server merge keeps the cloud copy and
+        // the tick silently undoes itself on the next sync.
         t.updatedAt = nowIso();
         await saveTickets();
         render();
