@@ -846,8 +846,36 @@ function knownOperatorNames(){
     const n = (typeof c === 'string') ? c : (c && c.name);
     if(n) set[n] = true;
   });
-  (tickets||[]).forEach(t=>{ if(t.customer) set[t.customer] = true; });
+  (tickets||[]).forEach(t=>{
+    if(t.customer) set[t.customer] = true;
+    // An operator that sold out to another is still the payer on every
+    // invoice raised before the change, so it stays a known operator.
+    previousCustomersOf(t).forEach(p=>{ set[p.customer] = true; });
+  });
   return Object.keys(set).sort();
+}
+
+// When an operator is bought out (Continental bought Firebird), the iron
+// never moves - the ticket just changes hands. previousCustomers keeps who
+// the ticket belonged to before, and through what date, so invoices raised
+// before the change still belong to the old operator.
+function previousCustomersOf(t){
+  return (t && Array.isArray(t.previousCustomers) ? t.previousCustomers : [])
+    .filter(p=>p && p.customer);
+}
+// Every operator this ticket has belonged to: current first, then former.
+function customerLineage(t){
+  return [t && t.customer].concat(previousCustomersOf(t).map(p=>p.customer)).filter(Boolean);
+}
+// Who the ticket belonged to on a given date (YYYY-MM-DD). Falls back to
+// the current customer when the date is unknown or after every change.
+function customerOnDate(t, dateStr){
+  const d = String(dateStr||'').slice(0,10);
+  if(!d) return (t && t.customer) || '';
+  const hit = previousCustomersOf(t)
+    .filter(p=>p.until && d <= String(p.until).slice(0,10))
+    .sort((a,b)=>String(a.until).localeCompare(String(b.until)))[0];
+  return hit ? hit.customer : ((t && t.customer) || '');
 }
 
 // Maps a short label like "Firebird" onto the full name already in use
@@ -1118,7 +1146,7 @@ function rankInvoicesForWell(t, pad, label, exceptWell){
     if(!doc || used.has(doc)) return;
     const name = wellMatchScore(label, inv.wellName);
     const onRig = !!inv.rig && lineage.some(r=>rigsAgree(r, inv.rig));
-    const sameCust = !!(t.customer && inv.customer) && normalizeTight(inv.customer).indexOf(normalizeTight(t.customer)) !== -1;
+    const sameCust = !!inv.customer && customerLineage(t).some(c=>normalizeTight(inv.customer).indexOf(normalizeTight(c)) !== -1);
     // Nothing raised before the rig reached this pad can be for a well on it.
     const beforePad = !!(padStart && inv.date && inv.date < padStart);
     rows.push({ inv, doc, name, onRig, sameCust, beforePad,
@@ -5610,7 +5638,7 @@ function renderTicketsList(){
           </div>
           <span class="status-pill ${overdue?'':(isOut?'status-out':'status-returned')}" ${overdue?'style="background:#FCEBEA; color:#B5432A;"':''}>${overdue?'Overdue':(isOut?'Out':'Returned')}</span>
         </div>
-        <div class="ticket-meta">${escHtml(t.customer||'—')} &nbsp;·&nbsp; Out: ${fmtDate(t.deliveryDate)} &nbsp;·&nbsp; ${isOut?('In: — ('+daysLabel+' so far)'):('In: '+fmtDate(t.returnDate)+' ('+daysLabel+')')}</div>
+        <div class="ticket-meta">${escHtml(t.customer||'—')}${previousCustomersOf(t).length?` <span style="color:#8A9590;">(formerly ${previousCustomersOf(t).map(p=>escHtml(p.customer)+' through '+fmtDate(p.until)).join(', ')})</span>`:''} &nbsp;·&nbsp; Out: ${fmtDate(t.deliveryDate)} &nbsp;·&nbsp; ${isOut?('In: — ('+daysLabel+' so far)'):('In: '+fmtDate(t.returnDate)+' ('+daysLabel+')')}</div>
         ${t.pdfUrl?`<div style="font-size:11px; color:#1E8A29; margin-bottom:6px;">Signed &middot; <a href="${escAttr(t.pdfUrl)}" target="_blank" rel="noopener" style="color:#2E5FA3; text-decoration:underline;">View signed PDF</a></div>`:''}
         <details class="equip-collapse">
           <summary style="cursor:pointer; font-family:'IBM Plex Mono',monospace; font-size:11px; text-transform:uppercase; letter-spacing:0.5px; color:var(--ink-soft); padding:6px 0; list-style:none; display:flex; align-items:center; gap:6px;">
@@ -6392,20 +6420,20 @@ function buildOperatorLookup(){
     if(!operator) return;
     if(t.rig){
       const k = normalizeForMatch(t.rig);
-      if(k.length >= 3) byKey[k] = { key:k, operator, label:t.rig, kind:'rig' };
+      if(k.length >= 3) byKey[k] = { key:k, operator, label:t.rig, kind:'rig', ticket:t };
     }
     // A rig this ticket was on previously belongs to the same operator, so
     // invoices raised under the old rig name still resolve.
     (Array.isArray(t.previousRigs)?t.previousRigs:[]).forEach(p=>{
       if(!p || !p.rig) return;
       const pk = normalizeForMatch(p.rig);
-      if(pk.length >= 3 && !byKey[pk]) byKey[pk] = { key:pk, operator, label:p.rig, kind:'rig' };
+      if(pk.length >= 3 && !byKey[pk]) byKey[pk] = { key:pk, operator, label:p.rig, kind:'rig', ticket:t };
     });
     if(Array.isArray(t.pads)){
       t.pads.forEach(p=>{
         if(!p || !p.name) return;
         const k = normalizeForMatch(p.name);
-        if(k.length >= 3) byKey[k] = { key:k, operator, label:p.name, kind:'pad' };
+        if(k.length >= 3) byKey[k] = { key:k, operator, label:p.name, kind:'pad', ticket:t };
       });
     }
   });
@@ -6560,6 +6588,23 @@ function operatorForRig(rigName, lookup){
   return null;
 }
 
+// A rig whose ticket changed operators (Firebird -> Continental) maps to
+// more than one operator over time. If the payer is one of them, the payer
+// is the operator - a Firebird-paid invoice is Firebird's. Otherwise go by
+// the invoice date against the date the operator changed.
+function operatorForInvoice(entry, inv, payer){
+  if(!entry) return '';
+  const t = entry.ticket;
+  if(!t || previousCustomersOf(t).length === 0) return entry.operator;
+  const p = normalizeForMatch(payer);
+  const own = customerLineage(t).find(c=>{
+    const n = normalizeForMatch(c);
+    return p && (n === p || n.indexOf(p) !== -1 || p.indexOf(n) !== -1);
+  });
+  if(own) return own;
+  return customerOnDate(t, inv && (inv.date || inv.txnDate)) || entry.operator;
+}
+
 function attributeInvoice(inv, lookup){
   const haystack = normalizeForMatch(invoiceSearchText(inv));
   if(!haystack) return null;
@@ -6643,11 +6688,11 @@ function renderRevenueByCustomer(){
       }
       if(!op && inv.rig){
         const byRig = operatorForRig(inv.rig, lookup);
-        if(byRig) op = byRig.operator;
+        if(byRig) op = operatorForInvoice(byRig, inv, payer);
       }
       if(!op){
         const match = attributeInvoice(inv, lookup);
-        op = match ? match.operator : '';
+        op = match ? operatorForInvoice(match, inv, payer) : '';
       }
       if(!op && payerIsOperator(payer)) op = payer;
       const opKey = op || 'Unattributed';
@@ -10344,6 +10389,24 @@ function attachHandlers(){
   }
 }
 
+// Asks for the last day the ticket belonged to the old operator. Returns
+// YYYY-MM-DD, or null when cancelled. Defaults to yesterday.
+function askOperatorChangeDate(from, to){
+  const y = new Date(); y.setDate(y.getDate()-1);
+  const pad = (n)=> String(n).padStart(2,'0');
+  const def = y.getFullYear()+'-'+pad(y.getMonth()+1)+'-'+pad(y.getDate());
+  while(true){
+    const ans = prompt(
+      `Operator change: ${from} \u2192 ${to}.\n\n` +
+      `Last day this ticket was ${from}'s (YYYY-MM-DD)?\n` +
+      `Invoices up to that day stay with ${from}; after it, ${to}.`, def);
+    if(ans === null) return null;
+    const v = String(ans).trim();
+    if(/^\d{4}-\d{2}-\d{2}$/.test(v) && !isNaN(new Date(v+'T00:00:00'))) return v;
+    alert('Please enter the date as YYYY-MM-DD, for example 2026-09-23.');
+  }
+}
+
 async function onSaveTicket(){
   const ticketNumber = (draftTicket.ticketNumber||'').trim();
   const customer = (draftTicket.customer||'').trim();
@@ -10428,7 +10491,17 @@ async function onSaveTicket(){
       if(prior.rig && prior.rig !== rig && !previousRigs.some(p=>p.rig === prior.rig)){
         previousRigs.push({ rig: prior.rig, until: todayStr() });
       }
-      tickets[idx] = {...prior, ticketNumber, customer, rig, previousRigs, deliveryDate, returnDate, notes, photo, signatureDelivered, signatureReceived, wellCharges, equipment, updatedAt: nowIso()};
+      // Same idea for the operator: a buyout hands the ticket to a new
+      // operator without the iron moving. Remember the old one and the last
+      // day it was theirs, so earlier invoices still belong to them.
+      let previousCustomers = previousCustomersOf(prior).slice();
+      if(prior.customer && customer && normalizeForMatch(prior.customer) !== normalizeForMatch(customer)){
+        const lastDay = askOperatorChangeDate(prior.customer, customer);
+        if(lastDay === null) return; // cancelled - nothing saved
+        previousCustomers = previousCustomers.filter(p=>normalizeForMatch(p.customer) !== normalizeForMatch(prior.customer));
+        previousCustomers.push({ customer: prior.customer, until: lastDay });
+      }
+      tickets[idx] = {...prior, ticketNumber, customer, rig, previousRigs, previousCustomers, deliveryDate, returnDate, notes, photo, signatureDelivered, signatureReceived, wellCharges, equipment, updatedAt: nowIso()};
     }
     editingId = null;
   }else{
